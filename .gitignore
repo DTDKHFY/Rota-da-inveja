@@ -1,0 +1,18 @@
+# Segredos — NUNCA versionar
+.env
+*.env
+!.env.example
+config.yaml
+
+# Dados locais do orquestrador
+orquestrador/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/

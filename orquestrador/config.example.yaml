@@ -1,0 +1,92 @@
+# Copia para config.yaml e ajusta. O config.yaml esta no .gitignore.
+# Segredos NAO entram aqui — o token do Telegram vem de TELEGRAM_BOT_TOKEN (.env).
+
+telegram:
+  # So estes chat_ids podem dar ordens ao orquestrador. Qualquer outro e ignorado
+  # em silencio e registado. Descobre o teu falando com @userinfobot no Telegram.
+  allowed_chat_ids:
+    - 000000000
+  poll_timeout_sec: 30
+
+llm:
+  provider: ollama          # ollama | fake (fake = para testes, nao chama modelo)
+  base_url: http://localhost:11434
+  request_timeout_sec: 300
+  temperature: 0.2
+  num_ctx: 8192
+  max_json_retries: 3       # tentativas de reparar JSON invalido antes de desistir
+  # Um modelo por sub-agente. Ve os nomes exatos com: ollama list
+  models:
+    research: qwen2.5-coder:7b
+    proposer: qwen2.5-coder:7b
+    report: qwen2.5-coder:7b
+
+target:
+  # Onde vive o teu codigo de backtest. NAO e este repositorio.
+  path: /caminho/para/o/teu/backtest
+  # Comando que corre um backtest. Placeholders disponiveis:
+  #   {params_file}  JSON com os parametros do ensaio
+  #   {metrics_file} onde o teu script deve escrever o JSON de metricas
+  #   {start} {end}  limites de data da janela a testar (YYYY-MM-DD)
+  backtest_cmd: "python run_backtest.py --params {params_file} --start {start} --end {end} --out {metrics_file}"
+  # Opcional: testes do projeto-alvo, corridos antes de aceitar um diff no modo `code`
+  test_cmd: "python -m pytest -q"
+  timeout_sec: 1800
+  network: false            # true = deixa o backtest aceder a rede (evita se puderes)
+  # Pastas que o backtest precisa mas que nao estao no git (dados historicos, cache).
+  # Sao ligadas por symlink dentro do worktree em vez de copiadas a cada ensaio.
+  link_paths:
+    - data
+    - cache
+  # Onde vivem os parametros em producao. Uma proposta aprovada e escrita aqui,
+  # num ramo git novo — nunca no ramo ativo. Es tu que fazes o merge.
+  params_file: params.json
+
+experiment:
+  mode: params              # params = LLM so escolhe valores | code = LLM propoe diff
+  # Limites duros. O LLM nao consegue propor nada fora daqui — e validado em codigo.
+  params_schema:
+    sma_fast:
+      type: int
+      min: 2
+      max: 50
+    sma_slow:
+      type: int
+      min: 10
+      max: 300
+    stop_atr:
+      type: float
+      min: 0.5
+      max: 6.0
+    risco_por_trade:
+      type: float
+      min: 0.001
+      max: 0.02
+
+protocol:
+  # Janela onde o agente pode otimizar a vontade.
+  train_start: "2015-01-01"
+  train_end: "2021-12-31"
+  # Janela onde se mede o resultado out-of-sample de cada ensaio.
+  validation_start: "2022-01-01"
+  validation_end: "2023-12-31"
+  # Holdout: o agente NUNCA corre aqui. So tu, manualmente, com /holdout.
+  holdout_start: "2024-01-01"
+  holdout_end: "2025-12-31"
+  # Trava de multiple testing: acima disto o estudo fecha e tens de abrir outro.
+  max_trials_per_study: 200
+
+gate:
+  # Criterios deterministicos. Se falhar qualquer um, nem chega a pedir aprovacao.
+  min_trades: 100
+  min_oos_sharpe: 0.5
+  max_oos_drawdown: 0.25
+  min_dsr: 0.95                    # Deflated Sharpe Ratio (probabilidade)
+  require_oos_improvement_pct: 5.0 # tem de bater a baseline em pelo menos isto
+  # Diferenca maxima tolerada entre in-sample e out-of-sample antes de cheirar a overfit
+  max_is_oos_sharpe_gap: 1.0
+
+storage:
+  db_path: ./data/orq.db
+  worktrees_dir: ./data/worktrees
+  log_dir: ./data/logs
