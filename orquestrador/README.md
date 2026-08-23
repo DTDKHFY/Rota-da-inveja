@@ -83,6 +83,24 @@ o sistema avisa-te em cada relatório que o número é fraco.
 versionamento não há como reverter uma alteração automática, e o sistema
 recusa-se a arrancar.
 
+## Versão de ficheiro único
+
+Se preferires não lidar com pacote, config e `.env`, há uma versão equivalente
+num só ficheiro em [`../ficheiro-unico/orquestrador.py`](../ficheiro-unico/orquestrador.py).
+Toda a configuração são constantes no topo do ficheiro.
+
+```bash
+pip install requests
+python orquestrador.py autoteste    # prova que funciona, sem Ollama nem Telegram
+python orquestrador.py doctor       # verifica a tua configuração
+python orquestrador.py correr
+```
+
+Mesmas guardas: holdout protegido, lista branca de ficheiros editáveis, DSR,
+sem merge automático. O que perde face ao pacote: a suite de 114 testes (tem um
+`autoteste` embutido, mais curto) e a facilidade de manutenção quando o
+ficheiro crescer.
+
 ## Instalação
 
 ```bash
