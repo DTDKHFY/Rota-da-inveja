@@ -122,12 +122,26 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
     )
 
 
-def is_git_repo(path: Path) -> bool:
+def git_root(path: Path) -> Path | None:
+    """A raiz do repositorio a que este caminho pertence, ou None."""
     try:
-        result = _git(path, "rev-parse", "--git-dir", check=False)
+        result = _git(path, "rev-parse", "--show-toplevel", check=False)
     except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
+        return None
+    saida = result.stdout.strip()
+    return Path(saida).resolve() if result.returncode == 0 and saida else None
+
+
+def is_git_repo(path: Path) -> bool:
+    """O caminho e a RAIZ de um repositorio git?
+
+    Pertencer a um nao chega. Se o projeto-alvo estiver dentro de outro
+    repositorio, `git worktree add` cria a arvore do repositorio de fora e o
+    backtest procura os ficheiros um nivel acima de onde eles estao. O erro que
+    dai sai nao aponta para a causa.
+    """
+    root = git_root(path)
+    return root is not None and root == Path(path).resolve()
 
 
 def head_sha(path: Path) -> str:
@@ -165,6 +179,13 @@ class Sandbox:
         if not target.is_dir():
             raise SandboxError(f"target.path nao existe: {target}")
         if not is_git_repo(target):
+            externo = git_root(target)
+            if externo is not None:
+                raise SandboxError(
+                    f"{target} esta dentro do repositorio {externo}, mas nao e a raiz "
+                    f"dele. Precisa de ser um repositorio proprio:\n"
+                    f'    cd {target} && git init && git add -A && git commit -m "inicial"'
+                )
             raise SandboxError(
                 f"{target} nao e um repositorio git. Faz `git init` e um commit inicial: "
                 "sem versionamento nao ha como reverter uma alteracao automatica, "

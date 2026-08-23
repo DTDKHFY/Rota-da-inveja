@@ -83,17 +83,35 @@ o sistema avisa-te em cada relatório que o número é fraco.
 versionamento não há como reverter uma alteração automática, e o sistema
 recusa-se a arrancar.
 
-## Versão de ficheiro único
+## Versão em dois ficheiros
 
 Se preferires não lidar com pacote, config e `.env`, há uma versão equivalente
-num só ficheiro em [`../ficheiro-unico/orquestrador.py`](../ficheiro-unico/orquestrador.py).
-Toda a configuração são constantes no topo do ficheiro.
+em [`../ficheiro-unico/`](../ficheiro-unico/), com a configuração em constantes
+no topo de cada ficheiro. São **dois programas**, e a divisão é a mesma que
+existe no pacote:
+
+| Ficheiro | Responsabilidade |
+|---|---|
+| `programador.py` | Escreve código. Lista branca, edições, agente de desenvolvimento. Não sabe o que é um Sharpe. |
+| `orquestrador.py` | Designa, mede e decide. Telegram, fila, backtests, gate. Não escreve código. |
+
+Quem mede não programa; quem programa não mede. É por isso que o agente não
+consegue melhorar a sua própria nota.
 
 ```bash
 pip install requests
-python orquestrador.py autoteste    # prova que funciona, sem Ollama nem Telegram
-python orquestrador.py doctor       # verifica a tua configuração
+python programador.py autoteste      # cada um verifica-se a si próprio
+python orquestrador.py autoteste
+python programador.py ver --projeto /caminho   # que ficheiros o agente alcança
+python orquestrador.py doctor
 python orquestrador.py correr
+```
+
+O `programador.py` corre sozinho, e vale a pena usá-lo assim quando quiseres
+perceber porque é que o agente propôs o que propôs:
+
+```bash
+python programador.py propor --projeto /caminho --hipotese "filtrar por volatilidade"
 ```
 
 Mesmas guardas: holdout protegido, lista branca de ficheiros editáveis, DSR,

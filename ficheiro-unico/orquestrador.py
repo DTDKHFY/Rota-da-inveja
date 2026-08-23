@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
-"""Orquestrador de backtest via Telegram — ficheiro unico.
+"""O ORQUESTRADOR — designa o trabalho, mede os resultados, pergunta-te.
 
-Dois agentes servidos por Ollama:
-  PESQUISA        decide o que investigar a seguir
-  DESENVOLVIMENTO escreve o codigo (ou os parametros) que testa a hipotese
+Sao dois programas, e a divisao e proposital:
+
+    programador.py    escreve codigo. Nao sabe o que e um Sharpe.
+    orquestrador.py   designa, mede e decide. Nao escreve codigo.  (este)
+
+Quem mede nao programa; quem programa nao mede. E por isso que o agente nao
+consegue melhorar a sua propria nota — nao tem como chegar a regua.
+
+Este programa trata de: receber tarefas no Telegram, gerar hipoteses (Agente
+Pesquisa), pedir ao programador que as implemente, correr os backtests em
+isolamento, aplicar o gate deterministico e pedir-te aprovacao.
+
+O gate NAO e um agente: sao contas. Quem decide se um ensaio prestou tem de ser
+codigo deterministico, senao estamos a pedir a um modelo que julgue um numero
+que ele proprio ajudou a produzir.
 
 E um gate que NAO e um agente: sao contas. Quem decide se um ensaio prestou tem
 de ser codigo deterministico, senao estamos a pedir a um modelo que julgue um
@@ -45,6 +57,18 @@ try:
 except ImportError:
     sys.exit("Falta a biblioteca requests.  Corre:  pip install requests")
 
+# O outro programa. Tem de estar na mesma pasta que este ficheiro.
+try:
+    import programador
+    from programador import (
+        CaminhoProibido, ErroAgente, ErroEdicao, ErroModelo, ModeloFalso, Ollama,
+        aplicar_edicoes, caminho_permitido, correr_agente, exigir_permitido,
+        extrair_json, pre_visualizar, tamanho_edicoes,
+    )
+except ImportError as e:
+    sys.exit(f"Falta o programador.py ao lado deste ficheiro ({e}).\n"
+             "Sao dois programas: o programador escreve codigo, este orquestra.")
+
 
 # ===========================================================================
 #  CONFIGURACAO — e so isto que tens de mexer
@@ -58,9 +82,10 @@ TELEGRAM_TOKEN = ""
 CHAT_ID = 6853762483          # so este chat pode dar ordens
 
 # --- Modelos (ve os nomes exatos com: ollama list) -------------------------
+# Um modelo por agente. MODELO_DESENVOLVIMENTO e passado ao programador.py.
 OLLAMA_URL = "http://localhost:11434"
-MODELO_PESQUISA = "minimax-m3:cloud"
-MODELO_DESENVOLVIMENTO = "dcxglm-5.2:cloud"
+MODELO_PESQUISA = "minimax-m3:cloud"       # decide o que investigar
+MODELO_DESENVOLVIMENTO = "dcxglm-5.2:cloud"  # escreve o codigo (via programador.py)
 MODELO_RELATORIO = "gemma4:26b"
 MODELO_PARAMS = "qwen2.5-coder:7b"      # so usado em MODO = "params"
 TIMEOUT_MODELO = 300
@@ -647,77 +672,15 @@ class Estado:
 
 
 # ===========================================================================
-#  LISTA BRANCA E EDICAO DE FICHEIROS
+#  Tudo o que mexe em codigo vive no programador.py
 # ===========================================================================
-
-def caminho_permitido(rel: str, padroes: Sequence[str]) -> bool:
-    """O ficheiro esta coberto pela lista branca?
-
-    Nao uso fnmatch: la o `*` atravessa `/`, e portanto `*.py` casaria com
-    `qualquer/pasta/run_backtest.py`. Numa lista branca isso e um buraco. Aqui
-    o `*` para no separador; so `**` o atravessa.
-    """
-    if not padroes:
-        return False
-    alvo = str(PurePosixPath(rel))
-    if alvo.startswith("/") or ".." in PurePosixPath(alvo).parts:
-        return False
-    for bruto in padroes:
-        p = str(PurePosixPath(bruto.strip().rstrip("/")))
-        if alvo == p or alvo.startswith(p + "/"):
-            return True
-        regex = (re.escape(p).replace(r"\*\*/", "(?:.*/)?").replace(r"\*\*", ".*")
-                 .replace(r"\*", "[^/]*").replace(r"\?", "[^/]"))
-        if re.fullmatch(regex, alvo):
-            return True
-    return False
-
-
-def exigir_permitido(rel: str, padroes: Sequence[str]):
-    if not caminho_permitido(rel, padroes):
-        raise ValueError(
-            f"`{rel}` nao esta na lista de ficheiros editaveis. So podes alterar: "
-            f"{', '.join(padroes) or '(nada)'}. Os ficheiros que correm e medem o "
-            f"backtest sao intocaveis.")
-
-
-def aplicar_edicoes(conteudo: str, edicoes: list[dict]) -> str:
-    """Aplica blocos procurar/substituir. Cada bloco tem de ser unico.
-
-    Porque nao diff unificado: para produzir um diff valido o modelo tem de
-    acertar em numeros de linha e contagens de contexto, e falha opacamente
-    ("patch does not apply"). Blocos ancorados no conteudo falham de forma
-    diagnosticavel, e essa mensagem volta para o modelo, que corrige.
-    """
-    atual = conteudo
-    for i, e in enumerate(edicoes):
-        for chave in ("procurar", "substituir"):
-            if chave not in e or not isinstance(e[chave], str):
-                raise ValueError(f"edicao {i}: falta `{chave}` ou nao e texto")
-        procurar = e["procurar"]
-        if not procurar.strip():
-            raise ValueError(
-                f"edicao {i}: `procurar` vazio. Para acrescentar codigo, procura "
-                "uma linha vizinha e devolve-a junto com o codigo novo.")
-        n = atual.count(procurar)
-        if n == 0:
-            primeira = procurar.strip().splitlines()[0].strip()
-            pista = (f" A primeira linha (`{primeira[:60]}`) existe, portanto o que "
-                     "difere e a indentacao ou as linhas seguintes.") if primeira in atual else ""
-            raise ValueError(
-                f"edicao {i}: o bloco a procurar nao aparece no ficheiro.{pista} "
-                "Copia o texto exatamente como esta, incluindo indentacao.")
-        if n > 1:
-            raise ValueError(
-                f"edicao {i}: o bloco aparece {n} vezes e nao sei qual queres. "
-                "Inclui mais linhas de contexto para o tornar unico.")
-        atual = atual.replace(procurar, e["substituir"], 1)
-    return atual
-
-
-def tamanho_edicoes(edicoes: list[dict]) -> int:
-    return sum(len(e.get("procurar", "").splitlines()) +
-               len(e.get("substituir", "").splitlines()) for e in edicoes)
+#
+#  A lista branca, as edicoes procurar/substituir e o agente que escreve codigo
+#  estao no outro programa. Aqui so os usamos.
+#
+#  A fronteira e esta: quem mede nao programa, quem programa nao mede. O
+#  programador nunca ve um Sharpe; o orquestrador nunca escreve uma linha de
+#  estrategia. E por isso que o agente nao consegue melhorar a sua propria nota.
 
 
 # ===========================================================================
@@ -801,11 +764,26 @@ def git(repo, *args, check=True):
                           capture_output=True, text=True, check=check, timeout=120)
 
 
-def e_repo_git(caminho) -> bool:
+def raiz_git(caminho) -> Path | None:
+    """A raiz do repositorio a que este caminho pertence, ou None."""
     try:
-        return git(caminho, "rev-parse", "--git-dir", check=False).returncode == 0
+        r = git(caminho, "rev-parse", "--show-toplevel", check=False)
     except (OSError, subprocess.SubprocessError):
-        return False
+        return None
+    return Path(r.stdout.strip()).resolve() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def e_repo_git(caminho) -> bool:
+    """O caminho e a RAIZ de um repositorio git?
+
+    Nao basta pertencer a um. Se o projeto estiver dentro de outro repositorio
+    — o que acontece com facilidade — `git worktree add` cria a arvore do
+    repositorio de fora, e o backtest vai procurar os seus ficheiros num sitio
+    onde eles estao uma pasta mais abaixo. O erro que sai daí ("can't open file
+    run_backtest.py") nao aponta para a causa nenhuma.
+    """
+    raiz = raiz_git(caminho)
+    return raiz is not None and raiz == Path(caminho).resolve()
 
 
 class Sandbox:
@@ -829,6 +807,13 @@ class Sandbox:
         if not self.projeto.is_dir():
             raise ErroSandbox(f"PROJETO nao existe: {self.projeto}")
         if not e_repo_git(self.projeto):
+            externa = raiz_git(self.projeto)
+            if externa is not None:
+                raise ErroSandbox(
+                    f"{self.projeto} esta dentro do repositorio {externa}, mas nao e a "
+                    f"raiz dele. Precisa de ser um repositorio proprio:\n"
+                    f"    cd {self.projeto} && git init && git add -A && "
+                    f'git commit -m "inicial"')
             raise ErroSandbox(
                 f"{self.projeto} nao e um repositorio git. Faz `git init` e um commit: "
                 "sem versionamento nao ha como reverter uma alteracao automatica, e "
@@ -978,119 +963,12 @@ class Sandbox:
 
 
 # ===========================================================================
-#  MODELOS (Ollama)
+#  Os modelos tambem vem do programador.py
 # ===========================================================================
-
-class ErroModelo(Exception):
-    pass
-
-
-_CERCA = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
-
-
-def extrair_json(texto: str):
-    """Tira o JSON de uma resposta que pode vir suja.
-
-    Um modelo raramente devolve so o JSON: vem com "Claro! Aqui esta:" antes,
-    explicacao depois, cercas de markdown a volta, ou tudo junto. Em vez de
-    exigir limpeza ao modelo, limpo eu.
-    """
-    texto = (texto or "").strip()
-    if not texto:
-        raise ErroModelo("resposta vazia do modelo")
-    for cand in _candidatos_json(texto):
-        try:
-            return json.loads(cand)
-        except json.JSONDecodeError:
-            continue
-    raise ErroModelo(f"nao encontrei JSON valido na resposta: {texto[:300]}")
-
-
-def _candidatos_json(texto: str):
-    yield texto
-    for bloco in _CERCA.findall(texto):
-        yield bloco.strip()
-    for abre, fecha in (("{", "}"), ("[", "]")):
-        ini = texto.find(abre)
-        if ini == -1:
-            continue
-        prof, em_texto, escapou = 0, False, False
-        for i in range(ini, len(texto)):
-            ch = texto[i]
-            if em_texto:
-                if escapou:
-                    escapou = False
-                elif ch == "\\":
-                    escapou = True
-                elif ch == '"':
-                    em_texto = False
-                continue
-            if ch == '"':
-                em_texto = True
-            elif ch == abre:
-                prof += 1
-            elif ch == fecha:
-                prof -= 1
-                if prof == 0:
-                    yield texto[ini:i + 1]
-                    break
-
-
-class Ollama:
-    def __init__(self, url=None, timeout=None):
-        self.url = (url or OLLAMA_URL).rstrip("/")
-        self.timeout = timeout or TIMEOUT_MODELO
-
-    def conversar(self, sistema: str, utilizador: str, *, modelo: str, json_mode=True) -> str:
-        carga = {
-            "model": modelo,
-            "messages": [{"role": "system", "content": sistema},
-                         {"role": "user", "content": utilizador}],
-            "stream": False,
-            "options": {"temperature": 0.2, "num_ctx": 8192},
-        }
-        if json_mode:
-            carga["format"] = "json"
-        try:
-            r = requests.post(f"{self.url}/api/chat", json=carga, timeout=self.timeout)
-        except requests.exceptions.ConnectionError as e:
-            raise ErroModelo(
-                f"nao consegui falar com o Ollama em {self.url}. Esta a correr? "
-                "Testa com `ollama list`.") from e
-        except requests.exceptions.Timeout as e:
-            raise ErroModelo(
-                f"o modelo {modelo} nao respondeu em {self.timeout}s. Se for grande "
-                "em CPU, sobe TIMEOUT_MODELO.") from e
-        if r.status_code == 404:
-            raise ErroModelo(f"o Ollama nao conhece {modelo!r}. Corre `ollama pull {modelo}`.")
-        if not r.ok:
-            raise ErroModelo(f"Ollama devolveu {r.status_code}: {r.text[:300]}")
-        try:
-            return r.json()["message"]["content"]
-        except (ValueError, KeyError) as e:
-            raise ErroModelo(f"resposta do Ollama inesperada: {r.text[:300]}") from e
-
-    def modelos(self) -> list[str]:
-        try:
-            r = requests.get(f"{self.url}/api/tags", timeout=15)
-            r.raise_for_status()
-            return [m["name"] for m in r.json().get("models", [])]
-        except (requests.RequestException, ValueError, KeyError):
-            return []
-
-
-class ModeloFalso:
-    """Respostas guionadas, para o autoteste correr sem Ollama nem GPU."""
-
-    def __init__(self, respostas: list[str]):
-        self.respostas = list(respostas)
-        self.chamadas: list[dict] = []
-
-    def conversar(self, sistema, utilizador, *, modelo, json_mode=True) -> str:
-        self.chamadas.append({"utilizador": utilizador, "modelo": modelo})
-        if not self.respostas:
-            raise ErroModelo("ModeloFalso ficou sem respostas")
-        return self.respostas.pop(0)
+#
+#  O cliente do Ollama, o extractor de JSON tolerante e o ciclo de correcao sao
+#  partilhados. Ficam la porque e la que a conversa com o modelo e mais
+#  exigente; aqui so o agente de pesquisa precisa deles.
 
 
 # ===========================================================================
@@ -1104,24 +982,6 @@ class ModeloFalso:
 
 class ErroAgente(Exception):
     pass
-
-
-def _correr_agente(modelo_llm, *, papel: str, modelo: str, sistema: str, prompt: str,
-                   validar, tentativas: int, json_mode=True):
-    ultimo = None
-    for _ in range(max(1, tentativas)):
-        msg = prompt if ultimo is None else (
-            f"{prompt}\n\n--- A TUA RESPOSTA ANTERIOR FOI REJEITADA ---\n"
-            f"Motivo: {ultimo}\n"
-            f"Corrige e devolve APENAS o JSON no formato pedido, sem texto a volta.")
-        try:
-            bruto = modelo_llm.conversar(sistema, msg, modelo=modelo, json_mode=json_mode)
-            dados = extrair_json(bruto) if json_mode else bruto
-            return validar(dados)
-        except (ErroModelo, ValueError) as e:
-            ultimo = str(e)
-    raise ErroAgente(f"[{papel}] o modelo {modelo} falhou {tentativas} tentativas. "
-                     f"Ultimo erro: {ultimo}")
 
 
 SISTEMA_PESQUISA = """Es um analista quantitativo.
@@ -1139,28 +999,6 @@ Formato exato:
 {"hipoteses": [{"nome": "...", "raciocinio": "...", "direcao": "aumentar"}]}
 
 "direcao" so pode ser: "aumentar", "diminuir" ou "explorar".
-"""
-
-SISTEMA_DESENVOLVIMENTO = """Es um programador a trabalhar numa estrategia de trading.
-
-Recebes uma hipotese e o conteudo de ficheiros. Devolves alteracoes a UM
-ficheiro, em blocos procurar/substituir.
-
-Regras absolutas:
-- Responde SO com JSON. Sem texto antes ou depois.
-- O bloco "procurar" tem de ser copiado EXATAMENTE do ficheiro, com a mesma
-  indentacao. E procurado como texto literal.
-- O bloco "procurar" tem de ser unico no ficheiro. Se o trecho se repetir,
-  inclui linhas de contexto a volta ate ser unico.
-- Altera o minimo necessario. Nao reformates nem reorganizes codigo que nao faz
-  parte da hipotese.
-- So podes alterar os ficheiros que te forem mostrados.
-- Nao alteres nada que calcule ou registe metricas.
-
-Formato exato:
-{"ficheiro": "caminho/relativo.py",
- "edicoes": [{"procurar": "texto exato", "substituir": "texto novo"}],
- "justificacao": "uma ou duas frases"}
 """
 
 SISTEMA_PARAMS = """Escolhes valores de parametros para um backtest.
@@ -1259,57 +1097,26 @@ class Agentes:
                               "raciocinio": str(h["raciocinio"])[:600], "direcao": d})
             return saida
 
-        return _correr_agente(self.llm, papel="pesquisa", modelo=MODELO_PESQUISA,
+        return correr_agente(self.llm, papel="pesquisa", modelo=MODELO_PESQUISA,
                               sistema=SISTEMA_PESQUISA, prompt=prompt, validar=validar,
                               tentativas=TENTATIVAS_JSON)
 
-    # -- Agente Desenvolvimento (modo code) ------------------------------
+    # -- Agente Desenvolvimento: delegado ao programador.py --------------
     def desenvolver(self, hipotese: dict, ficheiros: dict[str, str]) -> dict:
-        corpo, gasto = [], 0
-        for cam, cont in sorted(ficheiros.items()):
-            num = "\n".join(f"{n:>4} | {l}" for n, l in enumerate(cont.splitlines(), 1))
-            bloco = f"===== {cam} =====\n{num}\n"
-            if gasto + len(bloco) > 60000:
-                corpo.append(f"===== {cam} =====\n[omitido: contexto esgotado. "
-                             "Restringe FICHEIROS_EDITAVEIS.]\n")
-                continue
-            gasto += len(bloco)
-            corpo.append(bloco)
+        """Passa a hipotese ao outro programa e recebe a alteracao ja validada.
 
-        prompt = (f"HIPOTESE A IMPLEMENTAR:\n{hipotese['nome']} — {hipotese['raciocinio']}\n\n"
-                  f"CONTEUDO (os numeros de linha sao so para te orientares — nao os "
-                  f"incluas nos blocos):\n" + "\n".join(corpo) + "\n\n"
-                  f"Limite: no maximo {MAX_LINHAS_EDICAO} linhas tocadas no total.\n\n"
-                  f"Devolve as edicoes.")
-
-        def validar(dados):
-            if not isinstance(dados, dict):
-                raise ValueError("a resposta tem de ser um objeto JSON")
-            for c in ("ficheiro", "edicoes"):
-                if c not in dados:
-                    raise ValueError(f"falta a chave `{c}`")
-            ficheiro = str(dados["ficheiro"]).strip().lstrip("./")
-            exigir_permitido(ficheiro, FICHEIROS_EDITAVEIS)   # a guarda que importa
-            if ficheiro not in ficheiros:
-                raise ValueError(f"`{ficheiro}` nao esta entre os ficheiros que te mostrei. "
-                                 f"Escolhe um de: {', '.join(sorted(ficheiros))}")
-            edicoes = dados["edicoes"]
-            if not isinstance(edicoes, list) or not edicoes:
-                raise ValueError("`edicoes` tem de ser uma lista nao vazia")
-            tam = tamanho_edicoes(edicoes)
-            if tam > MAX_LINHAS_EDICAO:
-                raise ValueError(f"a proposta toca {tam} linhas, o maximo e "
-                                 f"{MAX_LINHAS_EDICAO}. Reduz ao minimo que testa a hipotese.")
-            # Experimenta em memoria: se nao aplica, o modelo fica a saber porque.
-            novo = aplicar_edicoes(ficheiros[ficheiro], edicoes)
-            if novo == ficheiros[ficheiro]:
-                raise ValueError("as edicoes nao mudam nada no ficheiro")
-            return {"ficheiro": ficheiro, "edicoes": edicoes, "linhas": tam,
-                    "justificacao": str(dados.get("justificacao", ""))[:400]}
-
-        return _correr_agente(self.llm, papel="desenvolvimento",
-                              modelo=MODELO_DESENVOLVIMENTO, sistema=SISTEMA_DESENVOLVIMENTO,
-                              prompt=prompt, validar=validar, tentativas=TENTATIVAS_JSON)
+        Nao ha logica de edicao aqui de proposito. Este ficheiro nao sabe
+        escrever codigo, e nao deve aprender: a separacao e o que garante que
+        quem produz a alteracao nunca toca no que a avalia.
+        """
+        return programador.propor_alteracao(
+            ficheiros, hipotese,
+            editaveis=tuple(FICHEIROS_EDITAVEIS),
+            max_linhas=MAX_LINHAS_EDICAO,
+            modelo=MODELO_DESENVOLVIMENTO,
+            llm=self.llm,
+            tentativas=TENTATIVAS_JSON,
+        )
 
     # -- Agente Desenvolvimento (modo params) ----------------------------
     def propor_params(self, hipotese: dict, atuais: dict, historico: list[dict],
@@ -1329,7 +1136,7 @@ class Agentes:
                     "justificacao": str(dados.get("justificacao", ""))[:400]}
 
         try:
-            return _correr_agente(self.llm, papel="params", modelo=MODELO_PARAMS,
+            return correr_agente(self.llm, papel="params", modelo=MODELO_PARAMS,
                                   sistema=SISTEMA_PARAMS, prompt=prompt, validar=validar,
                                   tentativas=TENTATIVAS_JSON)
         except ErroAgente:
@@ -1352,7 +1159,7 @@ class Agentes:
                   f"{veredito.n_ensaios} ensaios.\nCriterios falhados: {falhas}\n"
                   f"Deflated Sharpe: {veredito.dsr:.3f}\n\nEscreve a tua frase.")
         try:
-            return _correr_agente(
+            return correr_agente(
                 self.llm, papel="relatorio", modelo=MODELO_RELATORIO, sistema=sistema,
                 prompt=prompt, validar=lambda t: str(t).strip().strip('"')[:400] or
                 (_ for _ in ()).throw(ValueError("vazio")),
@@ -2138,6 +1945,11 @@ def doctor() -> int:
 
     def aviso(m):
         print(f"  ⚠️  {m}")
+
+    print("Programas")
+    ok(f"orquestrador.py — designa, mede e decide (este)")
+    ok(f"programador.py  — escreve codigo ({Path(programador.__file__).name})")
+    aviso("o programador nunca ve metricas; o orquestrador nunca escreve codigo")
 
     print("\nTelegram")
     if not token():

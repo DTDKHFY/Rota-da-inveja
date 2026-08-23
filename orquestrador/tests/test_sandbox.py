@@ -53,6 +53,21 @@ def test_recusa_alvo_sem_git(config, tmp_path):
         Sandbox(alterado, config.storage.worktrees_dir, "exp_c").create()
 
 
+def test_recusa_projeto_dentro_de_outro_repo(config, tmp_path):
+    """Pertencer a um repositorio nao chega: tem de ser a raiz.
+
+    Se o projeto-alvo estiver numa subpasta de outro repositorio, o worktree
+    sai com a arvore do repositorio de fora e o backtest procura os ficheiros
+    um nivel acima de onde eles estao.
+    """
+    interior = config.target.path / "subprojeto"
+    interior.mkdir()
+    (interior / "x.py").write_text("", encoding="utf-8")
+    alterado = type(config.target)(**{**config.target.__dict__, "path": interior})
+    with pytest.raises(SandboxError, match="nao e a raiz"):
+        Sandbox(alterado, config.storage.worktrees_dir, "exp_nested").create()
+
+
 def test_backtest_produz_metricas(config):
     p = config.protocol
     with Sandbox(config.target, config.storage.worktrees_dir, "exp_d") as sb:
