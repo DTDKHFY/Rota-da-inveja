@@ -24,7 +24,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .agents import CommentAgent, ProposerAgent, ResearchAgent, build_approval_message
+from .agents import (
+    CodeAgent, CommentAgent, ProposerAgent, ResearchAgent, build_approval_message,
+)
 from .agents.base import AgentError
 from .config import Config
 from .gate import Verdict, evaluate
@@ -91,6 +93,21 @@ class Orchestrator:
         self.commenter = CommentAgent(
             provider, llm.model_for("report"), max_retries=1, store=store
         )
+        # O Agente de Desenvolvimento so existe no modo `code`. No modo `params`
+        # nao ha codigo a escrever, e ter o agente instanciado seria convidar a
+        # que fosse usado por engano.
+        self.coder = (
+            CodeAgent(
+                provider,
+                llm.model_for("coder"),
+                editable_paths=config.target.editable_paths,
+                max_edit_lines=config.experiment.max_edit_lines,
+                max_retries=llm.max_json_retries,
+                store=store,
+            )
+            if config.experiment.mode == "code"
+            else None
+        )
 
     # ------------------------------------------------------------------
     # Estudos
@@ -136,6 +153,18 @@ class Orchestrator:
             if h["oos_sharpe"] is not None
         ]
 
+    def _params_vivos(self) -> dict:
+        """Os parametros em producao. No modo `code` ficam fixos: a hipotese
+        esta no codigo, e mexer nas duas coisas ao mesmo tempo tornaria
+        impossivel saber qual delas produziu a diferenca."""
+        caminho = self.config.target.path / self.config.target.params_file
+        if not caminho.is_file():
+            return {}
+        try:
+            return json.loads(caminho.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
     def _melhores_params(self, study_id: str) -> dict:
         melhor, melhor_sharpe = {}, float("-inf")
         for h in self._historico(study_id, limite=500):
@@ -178,8 +207,34 @@ class Orchestrator:
             self.notifier.send(f"⚠️ O agente de pesquisa nao produziu hipoteses: {exc}")
             return 0
 
+        if self.config.experiment.mode == "code":
+            enfileirados, nomes = self._enfileirar_codigo(
+                study_id, task, hipoteses, orcamento
+            )
+        else:
+            enfileirados, nomes = self._enfileirar_params(
+                study_id, task, hipoteses, historico, orcamento
+            )
+
+        if enfileirados == 0:
+            self.notifier.send(
+                f"⚠️ Nenhuma das {len(hipoteses)} hipoteses deu uma proposta "
+                f"aplicavel. Nada foi para a fila."
+            )
+            return 0
+
+        self.notifier.send(
+            f"🧪 {enfileirados} ensaios em fila para: _{objetivo}_\n"
+            + "\n".join(f"• {n}" for n in nomes)
+        )
+        return enfileirados
+
+    def _enfileirar_params(
+        self, study_id: str, task: Any, hipoteses: list[dict], historico: list[dict],
+        orcamento: int,
+    ) -> tuple[int, list[str]]:
         params_base = self._melhores_params(study_id)
-        enfileirados = 0
+        enfileirados, nomes = 0, []
         for hipotese in hipoteses:
             if self.store.trial_count(study_id) + enfileirados >= orcamento:
                 break
@@ -196,14 +251,62 @@ class Orchestrator:
                 task_id=task["id"],
             )
             enfileirados += 1
+            nomes.append(hipotese["nome"])
             if proposta.get("fallback"):
                 self.store.log_event("proposer.fallback", exp_id)
+        return enfileirados, nomes
 
-        self.notifier.send(
-            f"🧪 {enfileirados} ensaios em fila para: _{objetivo}_\n"
-            + "\n".join(f"• {h['nome']}" for h in hipoteses[:enfileirados])
-        )
-        return enfileirados
+    def _enfileirar_codigo(
+        self, study_id: str, task: Any, hipoteses: list[dict], orcamento: int
+    ) -> tuple[int, list[str]]:
+        """Pede ao Agente de Desenvolvimento uma alteracao por hipotese.
+
+        Os ficheiros sao lidos uma unica vez: todas as hipoteses partem do mesmo
+        HEAD, e abrir um worktree por hipotese so para ler seria desperdicio.
+        """
+        params = self._params_vivos()
+        enfileirados, nomes = 0, []
+
+        with Sandbox(
+            self.config.target, self.config.storage.worktrees_dir, f"{task['id']}_leitura"
+        ) as sb:
+            ficheiros = sb.read_editable(self.config.target.editable_paths)
+
+        if not ficheiros:
+            self.notifier.send(
+                "⚠️ Nenhum ficheiro versionado corresponde a "
+                f"target.editable_paths ({', '.join(self.config.target.editable_paths)}). "
+                "O agente de desenvolvimento nao tem onde mexer."
+            )
+            return 0, []
+
+        for hipotese in hipoteses:
+            if self.store.trial_count(study_id) + enfileirados >= orcamento:
+                break
+            try:
+                proposta = self.coder.run(
+                    hipotese=hipotese, ficheiros=ficheiros, task_id=task["id"]
+                )
+            except AgentError as exc:
+                # Sem rede de seguranca aqui, ao contrario dos parametros: nao
+                # ha forma sensata de "amostrar" uma alteracao de codigo.
+                self.store.log_event("coder.failed", None, hipotese=hipotese["nome"])
+                self.notifier.send(f"⚠️ Nao consegui implementar _{hipotese['nome']}_: {exc}")
+                continue
+
+            exp_id = self.store.enqueue_experiment(
+                study_id=study_id,
+                params=params,
+                hypothesis=f"{hipotese['nome']} — {hipotese['raciocinio']}",
+                task_id=task["id"],
+                diff=json.dumps(
+                    {"ficheiro": proposta["ficheiro"], "edicoes": proposta["edicoes"]},
+                    ensure_ascii=False,
+                ),
+            )
+            enfileirados += 1
+            nomes.append(f"{hipotese['nome']} ({proposta['linhas_tocadas']} linhas)")
+        return enfileirados, nomes
 
     # ------------------------------------------------------------------
     # Ensaios
@@ -218,9 +321,24 @@ class Orchestrator:
                 self.store.heartbeat_experiment(exp_id)
 
                 if exp["diff"]:
-                    aplicado, detalhe = sb.apply_diff(exp["diff"])
+                    proposta = json.loads(exp["diff"])
+                    aplicado, detalhe = sb.apply_edits(
+                        proposta["ficheiro"],
+                        proposta["edicoes"],
+                        self.config.target.editable_paths,
+                    )
                     if not aplicado:
-                        return self._fail(exp_id, f"diff rejeitado: {detalhe}")
+                        return self._fail(exp_id, f"alteracao rejeitada: {detalhe}")
+
+                    # Os testes do projeto correm antes do backtest: um erro de
+                    # sintaxe apanhado em dois segundos poupa quarenta minutos.
+                    testes = sb.run_tests()
+                    if testes is not None and not testes.ok:
+                        return self._fail(
+                            exp_id,
+                            "os testes do projeto falharam depois da alteracao",
+                            testes.stdout,
+                        )
 
                 train_raw, run_train = sb.run_backtest(
                     params,
@@ -288,6 +406,7 @@ class Orchestrator:
                 validation=validation,
                 verdict=verdict,
                 comentario=comentario,
+                alteracao=json.loads(exp["diff"]) if exp["diff"] else None,
             )
             self.notifier.ask_approval(mensagem, exp_id)
         else:
@@ -395,15 +514,27 @@ class Orchestrator:
         params_path = Path(self.config.target.params_file)
 
         with Sandbox(self.config.target, self.config.storage.worktrees_dir, f"{exp_id}_apply") as sb:
-            destino = sb.root / params_path
-            destino.parent.mkdir(parents=True, exist_ok=True)
-            destino.write_text(
-                json.dumps(params, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            if exp["diff"]:
+                proposta = json.loads(exp["diff"])
+                aplicado, detalhe = sb.apply_edits(
+                    proposta["ficheiro"],
+                    proposta["edicoes"],
+                    self.config.target.editable_paths,
+                )
+                if not aplicado:
+                    raise SandboxError(f"a alteracao ja nao aplica: {detalhe}")
+                alvo_git = proposta["ficheiro"]
+            else:
+                destino = sb.root / params_path
+                destino.parent.mkdir(parents=True, exist_ok=True)
+                destino.write_text(
+                    json.dumps(params, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                alvo_git = str(params_path)
             verdict = json.loads(exp["verdict"]) if exp["verdict"] else {}
             mensagem = (
-                f"params: proposta {exp_id}\n\n"
+                f"{'codigo' if exp['diff'] else 'params'}: proposta {exp_id}\n\n"
                 f"{exp['hypothesis'] or 'sem hipotese registada'}\n\n"
                 f"Sharpe OOS: {self._oos_sharpe(exp):.2f}\n"
                 f"Deflated Sharpe: {verdict.get('dsr', 0):.3f} "
@@ -412,7 +543,7 @@ class Orchestrator:
             )
             for args in (
                 ("checkout", "-b", branch),
-                ("add", str(params_path)),
+                ("add", alvo_git),
                 ("-c", "user.email=orq@local", "-c", "user.name=orquestrador",
                  "commit", "-m", mensagem),
             ):

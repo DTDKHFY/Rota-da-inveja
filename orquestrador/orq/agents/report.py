@@ -43,6 +43,37 @@ def _fmt_janela(nome: str, m: WindowMetrics) -> str:
     return "\n".join(linhas)
 
 
+def _fmt_alteracao(alteracao: dict | None, limite: int = 1200) -> str:
+    """Mostra o codigo que muda.
+
+    Aprovar uma alteracao de codigo sem a ver e pior do que aprovar parametros
+    sem os ver: uma linha muda comportamento de formas que uma metrica agregada
+    nao revela. Se nao couber na mensagem, e dito explicitamente que foi cortada
+    — nunca truncada em silencio.
+    """
+    if not alteracao:
+        return ""
+    linhas = [f"*Codigo* — `{alteracao['ficheiro']}`"]
+    gasto = 0
+    for i, edicao in enumerate(alteracao.get("edicoes", [])):
+        antes = edicao["procurar"].rstrip("\n")
+        depois = edicao["substituir"].rstrip("\n")
+        bloco = "```\n" + "\n".join(
+            [*(f"- {l}" for l in antes.splitlines()),
+             *(f"+ {l}" for l in depois.splitlines())]
+        ) + "\n```"
+        if gasto + len(bloco) > limite:
+            restantes = len(alteracao["edicoes"]) - i
+            linhas.append(
+                f"_(+{restantes} altera\u00e7\u00e3o(oes) n\u00e3o cabem aqui — "
+                f"v\u00ea o ramo git depois de aprovares)_"
+            )
+            break
+        gasto += len(bloco)
+        linhas.append(bloco)
+    return "\n".join(linhas)
+
+
 def _fmt_params(params: dict, anteriores: dict | None) -> str:
     linhas = []
     for chave in sorted(params):
@@ -64,12 +95,14 @@ def build_approval_message(
     validation: WindowMetrics,
     verdict: Verdict,
     comentario: str | None = None,
+    alteracao: dict | None = None,
 ) -> str:
     """Mensagem deterministica de pedido de aprovacao. Todos os numeros vem daqui."""
     cabecalho = "🟢 Proposta passou no gate" if verdict.passed else "🔴 Proposta chumbou no gate"
     partes = [
         f"{cabecalho}\n`{exp_id}`",
         f"\n*Hipotese*\n{hipotese}" if hipotese else "",
+        f"\n{_fmt_alteracao(alteracao)}" if alteracao else
         f"\n*Parametros*\n{_fmt_params(params, params_anteriores)}",
         f"\n{_fmt_janela('Treino (in-sample)', train)}",
         f"\n{_fmt_janela('Validacao (out-of-sample)', validation)}",

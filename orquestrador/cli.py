@@ -94,11 +94,19 @@ def cmd_doctor(config: Config) -> int:
             erro(f"o Ollama nao respondeu em {config.llm.base_url} (esta a correr?)")
         else:
             ok(f"Ollama tem: {', '.join(disponiveis)}")
+            precisos = {"research", "report"} | (
+                {"coder"} if config.experiment.mode == "code" else {"proposer"}
+            )
             for papel, modelo in config.llm.models.items():
+                if papel not in precisos:
+                    continue
                 if modelo in disponiveis or any(m.startswith(modelo) for m in disponiveis):
-                    ok(f"{papel}: {modelo}")
+                    nuvem = " (na nuvem — o teu codigo sai da maquina)" if ":cloud" in modelo else ""
+                    ok(f"{papel}: {modelo}{nuvem}")
                 else:
                     erro(f"{papel}: {modelo} nao esta instalado (`ollama pull {modelo}`)")
+            for papel in sorted(precisos - set(config.llm.models)):
+                erro(f"falta llm.models.{papel} no config")
     else:
         aviso(f"provider = {config.llm.provider} (nao e o Ollama)")
 
@@ -109,12 +117,43 @@ def cmd_doctor(config: Config) -> int:
     except TelegramError as exc:
         erro(f"{exc}")
 
-    print("\nParametros")
-    if not config.experiment.params_schema:
-        erro("experiment.params_schema esta vazio: nao ha nada para o agente propor")
+    print(f"\nModo: {config.experiment.mode}")
+    if config.experiment.mode == "code":
+        from orq.patching import path_allowed
+        from orq.sandbox import Sandbox
+
+        if not config.target.editable_paths:
+            erro("target.editable_paths vazio: o modo code nao pode arrancar assim")
+        else:
+            ok(f"editaveis: {', '.join(config.target.editable_paths)}")
+            try:
+                with Sandbox(config.target, config.storage.worktrees_dir, "doctor") as sb:
+                    todos = sb.tracked_files()
+                editaveis = [f for f in todos if path_allowed(f, config.target.editable_paths)]
+                protegidos = [f for f in todos if f not in editaveis]
+                if not editaveis:
+                    erro("nenhum ficheiro versionado corresponde a editable_paths")
+                else:
+                    ok(f"{len(editaveis)} ficheiro(s) ao alcance do agente")
+                    for f in editaveis[:8]:
+                        print(f"      ✏️  {f}")
+                    # O que interessa mesmo e confirmar o que fica DE FORA.
+                    print(f"      🔒 {len(protegidos)} ficheiro(s) protegidos, entre eles:")
+                    for f in protegidos[:5]:
+                        print(f"         {f}")
+            except Exception as exc:  # noqa: BLE001
+                erro(f"nao consegui listar os ficheiros do alvo: {exc}")
+        if config.target.test_cmd:
+            ok(f"testes do alvo: {config.target.test_cmd}")
+        else:
+            aviso("sem target.test_cmd: codigo partido so vai ser apanhado pelo backtest")
+        ok(f"limite por proposta: {config.experiment.max_edit_lines} linhas")
     else:
-        for spec in config.experiment.params_schema.values():
-            ok(f"{spec.name}: {spec.type} [{spec.min:g}, {spec.max:g}]")
+        if not config.experiment.params_schema:
+            erro("experiment.params_schema esta vazio: nao ha nada para o agente propor")
+        else:
+            for spec in config.experiment.params_schema.values():
+                ok(f"{spec.name}: {spec.type} [{spec.min:g}, {spec.max:g}]")
 
     print(f"\n{'Tudo pronto.' if problemas == 0 else f'{problemas} problema(s) a resolver.'}\n")
     return 0 if problemas == 0 else 1

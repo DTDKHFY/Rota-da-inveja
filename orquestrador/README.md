@@ -11,14 +11,14 @@ Modelos locais via **Ollama**. Sem serviços externos, sem chaves de API.
 Telegram (tu)
     │  "reduzir o drawdown sem perder retorno"
     ▼
-Orquestrador ──► Agente Pesquisa    (Llama: que hipótese testar a seguir?)
-    │        └─► Agente Proponente  (Llama: que valores concretos?)
-    │                                     │ validado contra limites duros
+Orquestrador ──► Agente Pesquisa        que hipótese testar a seguir?
+    │        └─► Agente Desenvolvimento escreve o código que a testa
+    │                                     │ lista branca + limite de tamanho
     ▼                                     ▼
 Fila SQLite ──► Sandbox (git worktree, sem rede, sem segredos)
-                     │  backtest em TREINO e em VALIDAÇÃO
+                     │  testes do projeto → backtest em TREINO e VALIDAÇÃO
                      ▼
-              Gate determinístico  ◄── isto NÃO é um LLM
+              Gate determinístico  ◄── isto NÃO é um agente
                      │
           chumbou ───┴─── passou ──► Telegram: pede-te aprovação
              │                              │
@@ -26,12 +26,24 @@ Fila SQLite ──► Sandbox (git worktree, sem rede, sem segredos)
                                                      (tu é que fazes merge)
 ```
 
+## Os dois agentes
+
+| Agente | Função | O que devolve |
+|---|---|---|
+| **Pesquisa** | Lê o histórico de ensaios e decide *o que* investigar | Hipóteses: que parâmetro/mecanismo mexer e porquê |
+| **Desenvolvimento** | Transforma a hipótese numa alteração concreta | Blocos procurar/substituir no código, ou valores de parâmetros |
+
+O **gate** não é um agente — é aritmética (`gate.py` não importa nada da camada
+de modelos). O comentário de uma linha no Telegram é um utilitário opcional: se
+o modelo falhar, a mensagem sai na mesma, porque os números nunca vêm dele.
+
 ## O que este sistema recusa fazer
 
 Estas não são limitações por falta de tempo — são o desenho.
 
 | Recusa | Porquê |
 |---|---|
+| Deixar o agente tocar no arnês de métricas | O caminho mais curto para "melhorar o Sharpe" é reescrever a função que o calcula. Lista branca verificada em Python, duas vezes. |
 | Fazer merge automático | Uma métrica que melhorou pode ser ruído. A decisão é tua, com o diff à frente. |
 | Escrever no teu ramo ativo | Cada ensaio corre num `git worktree` descartável. Uma proposta aprovada vai para um ramo novo. |
 | Tocar no holdout | Ensaios automáticos param antes de `holdout_start`. Só uma ordem tua expressa o corre, e só uma vez. |
@@ -96,13 +108,67 @@ models:
   report:   gemma3:4b           # escreve uma frase de leitura
 ```
 
-Com um modelo de 7B, mantém `experiment.mode: params` — o agente escolhe
-valores dentro de limites que tu defines e nunca escreve código. O modo `code`
-(o agente propõe um diff, validado com `git apply --check` e pelos testes do
-projeto) existe para quando tiveres um modelo maior.
+### Modelos `:cloud`
+
+`glm` e `minimax` com sufixo `:cloud` **não correm na tua máquina** — são
+servidos pela infraestrutura do Ollama. Na prática: precisas de `ollama signin`,
+deixas de funcionar offline, e **o teu código de estratégia sai da máquina a
+cada chamada**. Não é impedimento; é uma escolha a fazer com consciência, porque
+a estratégia é o ativo. O roteamento é por agente, portanto podes manter o
+Desenvolvimento num modelo local e usar os grandes só na Pesquisa.
+
+### `params` ou `code`
+
+- **`mode: params`** — o agente só escolhe valores dentro dos limites de
+  `params_schema`. Nunca escreve código. Funciona bem com um 7B.
+- **`mode: code`** — o Agente de Desenvolvimento altera ficheiros de estratégia
+  por blocos procurar/substituir, validados antes de qualquer coisa correr.
+  Precisa de um modelo capaz.
 
 Se o modelo falhar todas as tentativas, o proponente cai numa amostragem dentro
 dos limites em vez de parar o estudo. Um mau dia do Llama não trava a fila.
+
+## A guarda do modo `code`
+
+Um agente cuja tarefa é melhorar uma métrica tem um atalho óbvio: reescrever o
+código que a calcula. Não é hipotético — é o caminho de menor resistência, e um
+modelo capaz encontra-o.
+
+```yaml
+target:
+  editable_paths:
+    - estrategia        # ← só isto. Nunca run_backtest.py, nunca os dados.
+```
+
+Como é aplicado:
+
+1. O agente **só vê** os ficheiros da lista branca (`read_editable` filtra
+   antes de montar o prompt) — não pode editar o que não conhece.
+2. A proposta é verificada em Python contra a lista antes de ser aceite.
+3. É verificada **outra vez** no momento de aplicar. Pelo meio a proposta passou
+   por SQLite, e reverificar não custa nada comparado com deixar passar.
+4. Os `*` da lista branca **não atravessam `/`**: `*.py` cobre a raiz, não
+   `qualquer/pasta/run_backtest.py`.
+5. Um travão de tamanho (`max_edit_lines`) rejeita reescritas — o que não se
+   consegue rever pelo Telegram não deve chegar ao Telegram.
+
+Confirma o que ficou de cada lado antes de arrancar:
+
+```
+$ python cli.py doctor
+Modo: code
+  ✅ 1 ficheiro(s) ao alcance do agente
+      ✏️  estrategia/sinal.py
+      🔒 3 ficheiro(s) protegidos, entre eles:
+         run_backtest.py
+         params.json
+```
+
+E porque blocos procurar/substituir em vez de diff unificado: para produzir um
+diff válido o modelo tem de acertar em números de linha e contagens de contexto,
+e erra isso com frequência. Blocos ancorados no conteúdo falham de forma
+diagnosticável — *"este bloco não aparece"*, *"aparece 3 vezes, dá mais
+contexto"* — e essas mensagens voltam para o modelo, que corrige.
 
 ## Comandos do Telegram
 
@@ -188,7 +254,7 @@ cli.py              doctor | run | bot | worker | estado
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/ -q     # 81 testes
+python -m pytest tests/ -q     # 114 testes
 ```
 
 Correm sem Ollama e sem GPU: o LLM é substituído por um provider guionado. O

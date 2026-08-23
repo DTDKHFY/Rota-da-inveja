@@ -15,11 +15,16 @@ llm:
   temperature: 0.2
   num_ctx: 8192
   max_json_retries: 3       # tentativas de reparar JSON invalido antes de desistir
-  # Um modelo por sub-agente. Ve os nomes exatos com: ollama list
+  # Um modelo por agente. Ve os nomes EXATOS com: ollama list
+  #
+  # Atencao aos modelos com sufixo `:cloud`: nao correm na tua maquina. O
+  # conteudo que lhes mandas — incluindo o teu codigo de estrategia — sai daqui.
+  # Se isso te incomodar, poe o agente de desenvolvimento num modelo local.
   models:
-    research: qwen2.5-coder:7b
-    proposer: qwen2.5-coder:7b
-    report: qwen2.5-coder:7b
+    research: minimax-m3:cloud      # Agente Pesquisa: decide o que investigar
+    coder: dcxglm-5.2:cloud         # Agente Desenvolvimento: escreve o codigo
+    proposer: qwen2.5-coder:7b      # so usado no modo `params`
+    report: gemma4:26b              # frase de leitura no Telegram (opcional)
 
 target:
   # Onde vive o teu codigo de backtest. NAO e este repositorio.
@@ -29,8 +34,6 @@ target:
   #   {metrics_file} onde o teu script deve escrever o JSON de metricas
   #   {start} {end}  limites de data da janela a testar (YYYY-MM-DD)
   backtest_cmd: "python run_backtest.py --params {params_file} --start {start} --end {end} --out {metrics_file}"
-  # Opcional: testes do projeto-alvo, corridos antes de aceitar um diff no modo `code`
-  test_cmd: "python -m pytest -q"
   timeout_sec: 1800
   network: false            # true = deixa o backtest aceder a rede (evita se puderes)
   # Pastas que o backtest precisa mas que nao estao no git (dados historicos, cache).
@@ -41,9 +44,28 @@ target:
   # Onde vivem os parametros em producao. Uma proposta aprovada e escrita aqui,
   # num ramo git novo — nunca no ramo ativo. Es tu que fazes o merge.
   params_file: params.json
+  # === A guarda mais importante do modo `code` ===
+  # Os UNICOS ficheiros que o Agente de Desenvolvimento pode alterar.
+  #
+  # Deixa de fora tudo o que corre e mede o backtest. Um agente cuja tarefa e
+  # melhorar o Sharpe tem um atalho obvio: reescrever a funcao que o calcula.
+  # Nao e um cenario rebuscado — e o caminho de menor resistencia.
+  #
+  # Regra pratica: so a estrategia. Nunca o arnes, nunca os dados, nunca os
+  # testes que a validam.
+  editable_paths:
+    - estrategia
+  # Testes do projeto-alvo. Correm depois de aplicar a alteracao e ANTES do
+  # backtest: um erro de sintaxe apanhado em 2s poupa 40 minutos.
+  test_cmd: "python -m pytest testes -q"
 
 experiment:
-  mode: params              # params = LLM so escolhe valores | code = LLM propoe diff
+  # params = o agente so escolhe valores dentro dos limites abaixo
+  # code   = o Agente de Desenvolvimento altera o codigo da estrategia
+  mode: code
+  # Travao de tamanho no modo `code`. Uma proposta que toca 300 linhas nao e uma
+  # hipotese testavel — e uma reescrita, e nao ha como rever isso pelo Telegram.
+  max_edit_lines: 120
   # Limites duros. O LLM nao consegue propor nada fora daqui — e validado em codigo.
   params_schema:
     sma_fast:

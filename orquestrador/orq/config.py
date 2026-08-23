@@ -90,6 +90,10 @@ class TargetConfig:
     # Ficheiro (relativo ao target) onde vivem os parametros em producao.
     # Uma proposta aprovada e escrita aqui, num ramo novo — nunca no ramo ativo.
     params_file: str = "params.json"
+    # Modo `code`: os UNICOS ficheiros que o agente de desenvolvimento pode
+    # alterar. Tudo o resto — em especial o que corre e mede o backtest — fica
+    # fora do alcance dele.
+    editable_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,6 +122,10 @@ class ParamSpec:
 class ExperimentConfig:
     mode: str = "params"
     params_schema: dict[str, ParamSpec] = field(default_factory=dict)
+    # Travao de tamanho no modo `code`. Uma proposta que toca 400 linhas nao e
+    # uma hipotese testavel — e uma reescrita, e ninguem consegue rever isso a
+    # partir do Telegram.
+    max_edit_lines: int = 120
 
     def coerce_params(self, proposed: dict[str, Any]) -> dict[str, int | float]:
         """Valida um conjunto completo de parametros vindo do LLM.
@@ -250,6 +258,14 @@ def load_config(path: str | Path | None = None, *, env_path: str | Path | None =
     mode = exp_raw.get("mode", "params")
     if mode not in ("params", "code"):
         raise ConfigError(f"experiment.mode: esperado 'params' ou 'code', veio {mode!r}")
+    if mode == "code" and not (target_raw.get("editable_paths") or []):
+        raise ConfigError(
+            "experiment.mode: 'code' exige target.editable_paths preenchido. "
+            "Sem lista branca, o agente pode editar o proprio codigo que calcula "
+            "as metricas — e a forma mais rapida de 'melhorar' um Sharpe e "
+            "reescrever a funcao que o calcula. Indica so os ficheiros de "
+            "estrategia."
+        )
 
     def _store_path(key: str, default: str) -> Path:
         value = Path(store_raw.get(key, default))
@@ -294,10 +310,12 @@ def load_config(path: str | Path | None = None, *, env_path: str | Path | None =
             test_cmd=target_raw.get("test_cmd") or None,
             link_paths=tuple(target_raw.get("link_paths", []) or []),
             params_file=str(target_raw.get("params_file", "params.json")),
+            editable_paths=tuple(target_raw.get("editable_paths", []) or []),
         ),
         experiment=ExperimentConfig(
             mode=mode,
             params_schema=_parse_params_schema(exp_raw.get("params_schema", {})),
+            max_edit_lines=int(exp_raw.get("max_edit_lines", 120)),
         ),
         protocol=protocol,
         gate=GateConfig(

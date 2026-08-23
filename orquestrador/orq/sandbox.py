@@ -23,6 +23,9 @@ from functools import lru_cache
 from pathlib import Path
 
 from .config import TargetConfig
+from .patching import (
+    Edit, PatchError, apply_edits, ensure_path_allowed, path_allowed,
+)
 
 STDOUT_HEAD = 2000
 STDOUT_TAIL = 4000
@@ -327,6 +330,64 @@ class Sandbox:
                 duration_sec=result.duration_sec,
             )
         return metrics, result
+
+    def tracked_files(self) -> list[str]:
+        """Ficheiros versionados, caminhos relativos. Base para a lista branca."""
+        saida = _git(self.root, "ls-files", check=False)
+        if saida.returncode != 0:
+            return []
+        return [linha for linha in saida.stdout.splitlines() if linha]
+
+    def read_editable(self, patterns: tuple[str, ...]) -> dict[str, str]:
+        """Le os ficheiros que o agente de desenvolvimento pode alterar.
+
+        Le de dentro do worktree e nao do projeto original: e sobre esta copia
+        que ele vai trabalhar, e sao estes os bytes que os blocos
+        procurar/substituir tem de encontrar.
+        """
+        ficheiros: dict[str, str] = {}
+        for rel in self.tracked_files():
+            if not path_allowed(rel, patterns):
+                continue
+            caminho = self.root / rel
+            try:
+                ficheiros[rel] = caminho.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue  # binarios e afins nao interessam ao agente
+        return ficheiros
+
+    def apply_edits(
+        self, ficheiro: str, edicoes: list[dict], patterns: tuple[str, ...]
+    ) -> tuple[bool, str]:
+        """Aplica as edicoes propostas, revalidando a lista branca.
+
+        A lista branca ja foi verificada quando a proposta foi aceite. E
+        verificada outra vez aqui de proposito: entre uma coisa e outra a
+        proposta passou por SQLite, e o custo de reverificar e nenhum comparado
+        com o de deixar passar uma edicao ao arnes de metricas.
+        """
+        try:
+            ensure_path_allowed(ficheiro, patterns)
+            blocos = [Edit(e["procurar"], e["substituir"]) for e in edicoes]
+            alvo = self.root / ficheiro
+            if not alvo.is_file():
+                return False, f"`{ficheiro}` nao existe no worktree"
+            novo = apply_edits(alvo.read_text(encoding="utf-8"), blocos)
+        except (PatchError, KeyError, TypeError) as exc:
+            return False, str(exc)
+        alvo.write_text(novo, encoding="utf-8")
+        return True, f"{ficheiro} alterado"
+
+    def run_tests(self) -> RunResult | None:
+        """Corre os testes do projeto-alvo, se estiverem configurados.
+
+        Corre depois de aplicar a alteracao e antes do backtest: um erro de
+        sintaxe descoberto em dois segundos vale mais do que o mesmo erro
+        descoberto ao fim de quarenta minutos de backtest.
+        """
+        if not self.target.test_cmd:
+            return None
+        return self.run(self.target.test_cmd, timeout=min(self.target.timeout_sec, 600))
 
     def apply_diff(self, diff: str) -> tuple[bool, str]:
         """Tenta aplicar um patch proposto pelo LLM. Valida antes de aplicar.
