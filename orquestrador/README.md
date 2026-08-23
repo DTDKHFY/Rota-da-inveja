@@ -83,41 +83,24 @@ o sistema avisa-te em cada relatório que o número é fraco.
 versionamento não há como reverter uma alteração automática, e o sistema
 recusa-se a arrancar.
 
-## Versão em dois ficheiros
+## Versão de ficheiro único
 
 Se preferires não lidar com pacote, config e `.env`, há uma versão equivalente
-em [`../ficheiro-unico/`](../ficheiro-unico/), com a configuração em constantes
-no topo de cada ficheiro. São **dois programas**, e a divisão é a mesma que
-existe no pacote:
-
-| Ficheiro | Responsabilidade |
-|---|---|
-| `programador.py` | Escreve código. Lista branca, edições, agente de desenvolvimento. Não sabe o que é um Sharpe. |
-| `orquestrador.py` | Designa, mede e decide. Telegram, fila, backtests, gate. Não escreve código. |
-
-Quem mede não programa; quem programa não mede. É por isso que o agente não
-consegue melhorar a sua própria nota.
+num só ficheiro: [`../ficheiro-unico/orquestrador.py`](../ficheiro-unico/orquestrador.py).
+Toda a configuração são constantes no topo. Sem pastas, sem `.env`, sem YAML.
 
 ```bash
 pip install requests
-python programador.py autoteste      # cada um verifica-se a si próprio
-python orquestrador.py autoteste
-python programador.py ver --projeto /caminho   # que ficheiros o agente alcança
-python orquestrador.py doctor
-python orquestrador.py correr
+python orquestrador.py teste      # verifica que funciona, sem Ollama nem Telegram
+python orquestrador.py doctor     # verifica a tua configuração
+python orquestrador.py            # arranca
 ```
 
-O `programador.py` corre sozinho, e vale a pena usá-lo assim quando quiseres
-perceber porque é que o agente propôs o que propôs:
+Correr sem argumentos arranca. Se faltar configuração, diz-te exatamente o quê.
 
-```bash
-python programador.py propor --projeto /caminho --hipotese "filtrar por volatilidade"
-```
-
-Mesmas guardas: holdout protegido, lista branca de ficheiros editáveis, DSR,
-sem merge automático. O que perde face ao pacote: a suite de 114 testes (tem um
-`autoteste` embutido, mais curto) e a facilidade de manutenção quando o
-ficheiro crescer.
+Mesmas guardas: holdout protegido, lista branca de ficheiros editáveis, DSR, sem
+merge automático. O que perde face ao pacote: a suite de 120 testes (tem um
+`teste` embutido, mais curto) e a facilidade de manutenção quando crescer.
 
 ## Instalação
 
