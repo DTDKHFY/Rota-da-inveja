@@ -112,6 +112,63 @@ def _clean_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def quote_path(path: str) -> str:
+    """Cita um caminho para entrar num comando, conforme o sistema.
+
+    `shlex.quote` usa aspas simples, que no Windows nao sao aspas — sao
+    caracteres normais que iriam parar ao nome do ficheiro.
+    """
+    if os.name == "nt":
+        return f'"{path}"' if (" " in path or not path) else path
+    return shlex.quote(path)
+
+
+def split_command(command: str) -> list[str]:
+    """Parte um comando em argumentos, conforme o sistema.
+
+    No modo POSIX o `shlex` trata `\\` como escape, e portanto
+    `C:\\Python310\\python.exe` chega ao subprocesso como
+    `C:Python310python.exe` — um caminho inexistente, com um erro que nao
+    explica nada. No Windows uso o modo nao-POSIX, que preserva as barras.
+    """
+    if os.name == "nt":
+        return [t[1:-1] if len(t) > 1 and t[0] == t[-1] == '"' else t
+                for t in shlex.split(command, posix=False)]
+    return shlex.split(command)
+
+
+def link_into(source: Path, destination: Path) -> None:
+    """Liga um ficheiro ou pasta para dentro do worktree, sem copiar.
+
+    No Windows, criar um symlink exige Modo Programador ou privilegios de
+    administrador — a maioria das pessoas nao tem nenhum. Para pastas ha
+    alternativa: uma junction (`mklink /J`), que nao precisa de privilegios e
+    serve o mesmo proposito aqui.
+    """
+    try:
+        destination.symlink_to(source, target_is_directory=source.is_dir())
+        return
+    except OSError as exc:
+        if os.name != "nt":
+            raise SandboxError(f"nao consegui ligar {source} para {destination}: {exc}") from exc
+
+    if source.is_dir():
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(destination), str(source)],
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        if result.returncode == 0:
+            return
+    raise SandboxError(
+        f"nao consegui ligar {source} para dentro do worktree.\n"
+        "No Windows resolve-se de uma destas formas:\n"
+        "  1. Definicoes -> Privacidade e seguranca -> Para programadores -> "
+        "ligar o Modo Programador\n"
+        "  2. tirar essa pasta de target.link_paths e usar no backtest o caminho "
+        "absoluto dos dados"
+    )
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -216,7 +273,7 @@ class Sandbox:
             destination = self.root / rel
             if not destination.exists() and not destination.is_symlink():
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.symlink_to(source, target_is_directory=source.is_dir())
+                link_into(source, destination)
             elif destination.is_dir() and source.is_dir():
                 # A pasta ja existe no worktree — o caso comum, versionada com um
                 # .gitkeep e o conteudo no .gitignore. Ligar a pasta inteira e
@@ -225,7 +282,7 @@ class Sandbox:
                 for child in source.iterdir():
                     target = destination / child.name
                     if not target.exists() and not target.is_symlink():
-                        target.symlink_to(child, target_is_directory=child.is_dir())
+                        link_into(child, target)
 
     def cleanup(self) -> None:
         if not self.root.exists() and not self.created:
@@ -252,7 +309,7 @@ class Sandbox:
         """
         if not self.created:
             raise SandboxError("sandbox nao foi criado; usa `with Sandbox(...)`")
-        argv = shlex.split(command)
+        argv = split_command(command)
         if not argv:
             raise SandboxError("comando vazio")
         prefix: tuple[str, ...] = ()
@@ -328,11 +385,11 @@ class Sandbox:
             metrics_file.unlink()
 
         command = self.target.backtest_cmd.format(
-            params_file=shlex.quote(str(params_file)),
-            metrics_file=shlex.quote(str(metrics_file)),
+            params_file=quote_path(str(params_file)),
+            metrics_file=quote_path(str(metrics_file)),
             start=start,
             end=end,
-            workdir=shlex.quote(str(self.root)),
+            workdir=quote_path(str(self.root)),
         )
         result = self.run(command)
         if not result.ok:

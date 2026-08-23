@@ -759,6 +759,32 @@ def ambiente_limpo() -> dict:
     }
 
 
+def citar(caminho: str) -> str:
+    """Cita um caminho para entrar num comando, conforme o sistema.
+
+    `shlex.quote` usa aspas simples, que no Windows nao sao aspas — sao
+    caracteres normais que iriam parar ao nome do ficheiro.
+    """
+    if os.name == "nt":
+        return f'"{caminho}"' if (" " in caminho or not caminho) else caminho
+    return shlex.quote(caminho)
+
+
+def dividir_comando(comando: str) -> list[str]:
+    """Parte um comando em argumentos, conforme o sistema.
+
+    No modo POSIX o `shlex` trata `\\` como escape, e portanto
+    `C:\\Python310\\python.exe` chega ao subprocesso como
+    `C:Python310python.exe` — um caminho que nao existe, com um erro que nao
+    explica nada. No Windows uso o modo nao-POSIX, que preserva as barras, e
+    tiro as aspas a mao.
+    """
+    if os.name == "nt":
+        return [t[1:-1] if len(t) > 1 and t[0] == t[-1] == '"' else t
+                for t in shlex.split(comando, posix=False)]
+    return shlex.split(comando)
+
+
 def git(repo, *args, check=True):
     return subprocess.run(["git", "-C", str(repo), *args],
                           capture_output=True, text=True, check=check, timeout=120)
@@ -784,6 +810,39 @@ def e_repo_git(caminho) -> bool:
     """
     raiz = raiz_git(caminho)
     return raiz is not None and raiz == Path(caminho).resolve()
+
+
+def ligar(origem: Path, destino: Path) -> None:
+    """Liga um ficheiro ou pasta para dentro do worktree, sem copiar.
+
+    No Windows, criar um symlink exige Modo Programador ligado ou privilegios de
+    administrador — a maioria das pessoas nao tem nenhum dos dois. Para pastas ha
+    alternativa: uma junction (`mklink /J`), que nao precisa de privilegios
+    nenhuns e serve exatamente o mesmo proposito aqui.
+
+    Copiar nao e alternativa: um worktree por ensaio a copiar quatro gigabytes de
+    candles enche o disco ao decimo ensaio.
+    """
+    try:
+        destino.symlink_to(origem, target_is_directory=origem.is_dir())
+        return
+    except OSError as erro_symlink:
+        if os.name != "nt":
+            raise ErroSandbox(
+                f"nao consegui ligar {origem} para {destino}: {erro_symlink}") from erro_symlink
+
+    if origem.is_dir():
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(destino), str(origem)],
+                           capture_output=True, text=True, check=False, timeout=60)
+        if r.returncode == 0:
+            return
+    raise ErroSandbox(
+        f"nao consegui ligar {origem} para dentro do worktree.\n"
+        "No Windows isto costuma resolver-se de uma destas formas:\n"
+        "  1. Definicoes -> Privacidade e seguranca -> Para programadores -> "
+        "ligar o Modo Programador\n"
+        "  2. tirar essa pasta de PASTAS_LIGADAS e por no teu backtest o caminho "
+        "absoluto dos dados")
 
 
 class Sandbox:
@@ -840,12 +899,12 @@ class Sandbox:
                 continue
             if not destino.exists() and not destino.is_symlink():
                 destino.parent.mkdir(parents=True, exist_ok=True)
-                destino.symlink_to(origem, target_is_directory=origem.is_dir())
+                ligar(origem, destino)
             elif destino.is_dir() and origem.is_dir():
                 for filho in origem.iterdir():
                     alvo = destino / filho.name
                     if not alvo.exists() and not alvo.is_symlink():
-                        alvo.symlink_to(filho, target_is_directory=filho.is_dir())
+                        ligar(filho, alvo)
         return self.raiz
 
     def limpar(self):
@@ -867,7 +926,7 @@ class Sandbox:
         """Sem shell, de proposito: `&&` e `|` nao funcionam. Usa um script."""
         if not self.criado:
             raise ErroSandbox("sandbox nao criado")
-        argv = shlex.split(comando)
+        argv = dividir_comando(comando)
         if not argv:
             raise ErroSandbox("comando vazio")
         prefixo = () if BACKTEST_COM_REDE else _prefixo_sem_rede()
@@ -945,7 +1004,7 @@ class Sandbox:
                             encoding="utf-8")
         f_saida.unlink(missing_ok=True)
         r = self.correr(COMANDO_BACKTEST.format(
-            params=shlex.quote(str(f_params)), saida=shlex.quote(str(f_saida)),
+            params=citar(str(f_params)), saida=citar(str(f_saida)),
             inicio=inicio, fim=fim))
         if not r.ok:
             return None, r
@@ -2284,12 +2343,52 @@ def estado_cli() -> int:
     return 0
 
 
+def painel_inicial() -> int:
+    """O que aparece quando corres o ficheiro sem argumentos.
+
+    E o caso mais provavel de todos: carregar em Run no editor. Despejar um erro
+    de argparse aqui e mau acolhimento — a pessoa nao fez nada de errado.
+    """
+    print(f"""
+╭─────────────────────────────────────────────────────────────╮
+│  ORQUESTRADOR — designa o trabalho, mede, e pergunta-te      │
+╰─────────────────────────────────────────────────────────────╯
+
+Correste sem argumentos (foi o botao Run do editor, provavelmente).
+Precisas de dizer o que queres fazer:
+
+  python orquestrador.py autoteste   verifica que tudo funciona.
+                                     Nao precisa de Ollama nem Telegram.
+                                     👉 COMECA POR AQUI
+
+  python orquestrador.py doctor      verifica a TUA configuracao:
+                                     token, projeto, modelos, lista branca
+
+  python orquestrador.py correr      arranca a serio (bot + worker)
+
+  python orquestrador.py estado      o que esta em curso, sem Telegram
+
+O outro programa corre-se da mesma maneira:
+
+  python programador.py autoteste
+  python programador.py ver --projeto {PROJETO}
+
+No VS Code: usa o terminal (Ctrl+') e escreve o comando. O botao Run
+nao sabe que argumento passar. Se quiseres que saiba, ha um
+.vscode/launch.json ao lado deste ficheiro.
+""")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="orquestrador", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("comando", choices=["autoteste", "doctor", "correr", "bot", "worker", "estado"])
+    ap.add_argument("comando", nargs="?",
+                    choices=["autoteste", "doctor", "correr", "bot", "worker", "estado"])
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
+    if a.comando is None:
+        return painel_inicial()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -2310,4 +2409,9 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # `sys.exit(0)` levanta SystemExit, e o depurador do VS Code mostra isso como
+    # "Exception has occurred" mesmo quando correu tudo bem. So saio com codigo
+    # quando ha mesmo um erro.
+    _codigo = main()
+    if _codigo:
+        sys.exit(_codigo)

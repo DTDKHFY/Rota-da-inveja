@@ -691,11 +691,39 @@ def autoteste() -> int:
     return 0
 
 
+def painel_inicial() -> int:
+    """Sem argumentos: explicar, em vez de despejar um erro de argparse."""
+    print(f"""
+╭─────────────────────────────────────────────────────────────╮
+│  PROGRAMADOR — o agente que escreve codigo                   │
+╰─────────────────────────────────────────────────────────────╯
+
+Correste sem argumentos (foi o botao Run do editor, provavelmente).
+
+  python programador.py autoteste          verifica que funciona,
+                                           sem Ollama nem GPU
+                                           👉 COMECA POR AQUI
+
+  python programador.py ver     --projeto C:\\caminho
+                                           que ficheiros o agente
+                                           alcanca e quais estao
+                                           protegidos
+
+  python programador.py propor  --projeto C:\\caminho --hipotese "..."
+                                           pedir uma alteracao e ver
+                                           o diff, sem gravar nada
+
+Este programa escreve codigo e nao sabe o que e um Sharpe. Quem mede
+e o orquestrador.py, ao lado.
+""")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="programador", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="comando", required=True)
+    sub = ap.add_subparsers(dest="comando")
 
     sub.add_parser("autoteste", help="verifica que este programa funciona, sem Ollama")
 
@@ -712,6 +740,8 @@ def main(argv=None) -> int:
     p_prop.add_argument("--json", action="store_true", help="saida em JSON")
 
     a = ap.parse_args(argv)
+    if a.comando is None:
+        return painel_inicial()
     if a.comando == "autoteste":
         return autoteste()
     projeto = Path(a.projeto).expanduser().resolve()
@@ -726,4 +756,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Ver a nota no orquestrador.py: sair com 0 faria o depurador do VS Code
+    # anunciar uma excecao onde nao ha nenhuma.
+    _codigo = main()
+    if _codigo:
+        sys.exit(_codigo)

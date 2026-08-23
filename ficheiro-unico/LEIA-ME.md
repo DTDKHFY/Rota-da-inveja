@@ -28,6 +28,29 @@ python programador.py autoteste     # cada um verifica-se a si próprio
 python orquestrador.py autoteste    # sem Ollama, sem Telegram, sem GPU
 ```
 
+**Estes programas precisam de um argumento.** Correr sem nenhum — o que o botão
+Run do VS Code faz — mostra-te um painel com as opções, não um erro.
+
+### No VS Code
+
+O botão Run não sabe que argumento passar. Duas saídas:
+
+1. **Terminal** (`Ctrl+'`) e escreves o comando. É o mais simples.
+2. **F5** com o `.vscode/launch.json` que vem nesta pasta: dá-te as opções já
+   configuradas no menu de depuração ("1. Autoteste", "2. Doctor", ...).
+
+### Windows
+
+Testado com Python 3.10. Três coisas que o sistema trata por ti:
+
+- **Caminhos com `\`** — os comandos são partidos com regras do Windows, senão
+  `C:\Python310\python.exe` chegaria ao subprocesso como `C:Python310python.exe`.
+- **Symlinks** — criar um exige Modo Programador ou administrador. Para as
+  pastas de `PASTAS_LIGADAS` o sistema usa uma *junction* (`mklink /J`), que não
+  precisa de privilégios. Se mesmo assim falhar, a mensagem diz-te o que fazer.
+- **Isolamento de rede** — o `unshare` é do Linux e não existe aqui. O `doctor`
+  avisa-te: no Windows o backtest corre com acesso à rede.
+
 Se os dois passarem, a maquinaria está sã e o que faltar é configuração.
 
 ## Configurar

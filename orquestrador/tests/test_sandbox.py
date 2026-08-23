@@ -5,7 +5,8 @@ import subprocess
 import pytest
 
 from orq.sandbox import (
-    HoldoutViolation, Sandbox, SandboxError, is_git_repo, truncate_output,
+    HoldoutViolation, Sandbox, SandboxError, is_git_repo, quote_path,
+    split_command, truncate_output,
 )
 
 
@@ -169,3 +170,35 @@ def test_truncagem_guarda_inicio_e_fim():
     assert saida.endswith("Z" * 10)
     assert "omitidos" in saida
     assert truncate_output("curto", head=10, tail=10) == "curto"
+
+
+# --- compatibilidade com Windows ------------------------------------------
+
+def test_divide_comando_posix():
+    assert split_command('py run.py --params "/tmp/a b/p.json"') == \
+        ["py", "run.py", "--params", "/tmp/a b/p.json"]
+
+
+def test_divide_comando_windows_preserva_barras(monkeypatch):
+    """No modo POSIX o shlex come as barras invertidas.
+
+    `C:\\Python310\\python.exe` chegaria ao subprocesso como
+    `C:Python310python.exe`, com um erro que nao aponta para a causa.
+    """
+    monkeypatch.setattr("orq.sandbox.os.name", "nt")
+    assert split_command(r'C:\Python310\python.exe run.py --params "C:\a b\p.json"') == \
+        [r"C:\Python310\python.exe", "run.py", "--params", r"C:\a b\p.json"]
+
+
+def test_cita_caminho_por_sistema(monkeypatch):
+    assert quote_path("/tmp/a b") == "'/tmp/a b'"
+    monkeypatch.setattr("orq.sandbox.os.name", "nt")
+    assert quote_path(r"C:\a b\p.json") == r'"C:\a b\p.json"'
+    assert quote_path(r"C:\ab\p.json") == r"C:\ab\p.json"
+
+
+def test_round_trip_citar_dividir(monkeypatch):
+    """O que interessa: o caminho chega inteiro ao outro lado."""
+    for sistema, caminho in (("posix", "/tmp/a b/p.json"), ("nt", r"C:\a b\p.json")):
+        monkeypatch.setattr("orq.sandbox.os.name", sistema)
+        assert split_command(f"prog --params {quote_path(caminho)}")[2] == caminho
