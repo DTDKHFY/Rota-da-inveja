@@ -1,0 +1,8 @@
+{
+  "sma_fast": 20,
+  "sma_slow": 60,
+  "filtro_volatilidade": 0.0,
+  "risco_por_trade": 0.01,
+  "custo_por_trade": 0.0005,
+  "slippage": 0.0002
+}

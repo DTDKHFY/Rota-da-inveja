@@ -25,6 +25,26 @@ def test_dados_nao_versionados_ficam_acessiveis(config):
         assert (sb.root / "data" / "candles.csv").is_file()
 
 
+def test_liga_conteudo_quando_a_pasta_ja_existe(config, tmp_path):
+    """O caso comum: pasta de dados versionada com .gitkeep, conteudo no gitignore.
+
+    O worktree ja traz a pasta (por causa do .gitkeep), portanto nao da para
+    ligar a pasta inteira. Se nao ligarmos o conteudo, o backtest recebe uma
+    pasta vazia e nao encontra os dados.
+    """
+    (config.target.path / "data" / ".gitkeep").write_text("", encoding="utf-8")
+    subprocess.run(["git", "-C", str(config.target.path), "add", "-f", "data/.gitkeep"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(config.target.path), "-c", "user.email=t@t",
+                    "-c", "user.name=t", "commit", "-qm", "gitkeep"],
+                   check=True, capture_output=True)
+
+    with Sandbox(config.target, config.storage.worktrees_dir, "exp_link") as sb:
+        assert (sb.root / "data").is_dir()
+        assert (sb.root / "data" / "candles.csv").is_file(), \
+            "os dados nao versionados tem de chegar ao worktree"
+
+
 def test_recusa_alvo_sem_git(config, tmp_path):
     sem_git = tmp_path / "sem_git"
     sem_git.mkdir()

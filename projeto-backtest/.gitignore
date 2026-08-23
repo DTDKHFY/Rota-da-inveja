@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# Os dados sao teus e podem ser grandes. A serie de exemplo e reproduzivel
+# com `python3 gerar_dados_exemplo.py`, portanto nao vale a pena versiona-la.
+dados/*.csv

@@ -193,10 +193,18 @@ class Sandbox:
             if not source.exists():
                 continue
             destination = self.root / rel
-            if destination.exists() or destination.is_symlink():
-                continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.symlink_to(source, target_is_directory=source.is_dir())
+            if not destination.exists() and not destination.is_symlink():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.symlink_to(source, target_is_directory=source.is_dir())
+            elif destination.is_dir() and source.is_dir():
+                # A pasta ja existe no worktree — o caso comum, versionada com um
+                # .gitkeep e o conteudo no .gitignore. Ligar a pasta inteira e
+                # impossivel, portanto ligo o conteudo. Sem isto a pasta chega
+                # vazia ao backtest e ele nao encontra os dados.
+                for child in source.iterdir():
+                    target = destination / child.name
+                    if not target.exists() and not target.is_symlink():
+                        target.symlink_to(child, target_is_directory=child.is_dir())
 
     def cleanup(self) -> None:
         if not self.root.exists() and not self.created:

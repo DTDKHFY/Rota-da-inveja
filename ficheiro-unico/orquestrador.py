@@ -67,17 +67,19 @@ TIMEOUT_MODELO = 300
 TENTATIVAS_JSON = 3
 
 # --- O teu projeto de backtest --------------------------------------------
-PROJETO = "/caminho/para/o/teu/backtest"   # tem de ser um repositorio git
+# Tem de ser um repositorio git. Ha um projeto de exemplo pronto a usar, com a
+# separacao arnes/estrategia ja feita, em ../projeto-backtest/
+PROJETO = "/caminho/para/o/teu/backtest"
 
 # Placeholders disponiveis: {params} {saida} {inicio} {fim}
 COMANDO_BACKTEST = "python3 run_backtest.py --params {params} --start {inicio} --end {fim} --out {saida}"
 
 # Testes do teu projeto. Correm depois de alterar o codigo e ANTES do backtest:
 # um erro de sintaxe apanhado em 2s poupa 40 minutos. Poe "" se nao tiveres.
-COMANDO_TESTES = ""
+COMANDO_TESTES = ""      # exemplo: "python3 -m unittest discover -s testes -t ."
 
 FICHEIRO_PARAMS = "params.json"      # onde vivem os parametros em producao
-PASTAS_LIGADAS = ["data"]            # dados fora do git, ligados por symlink
+PASTAS_LIGADAS = ["dados"]           # dados fora do git, ligados por symlink
 BACKTEST_COM_REDE = False            # True so se o teu backtest precisar mesmo
 
 # --- Modo de trabalho ------------------------------------------------------
@@ -88,7 +90,7 @@ MODO = "code"        # "code" = o agente altera codigo | "params" = so valores
 # Deixa de fora tudo o que corre e mede o backtest: um agente cuja tarefa e
 # melhorar o Sharpe tem um atalho obvio, que e reescrever a funcao que o
 # calcula. Nao e rebuscado — e o caminho de menor resistencia.
-FICHEIROS_EDITAVEIS = ["estrategia"]
+FICHEIROS_EDITAVEIS = ["estrategia"]   # nunca run_backtest.py nem metricas.py
 MAX_LINHAS_EDICAO = 120              # travao contra reescritas
 
 # Limites dos parametros (usados em MODO="params"; o agente nunca sai daqui)
@@ -841,12 +843,24 @@ class Sandbox:
         self.criado = True
         # Symlink e nao copia: um worktree por ensaio a copiar 4 GB de candles
         # enche o disco ao decimo ensaio.
+        #
+        # Se a pasta ja existe no worktree — o caso comum, uma pasta versionada
+        # com um .gitkeep e o conteudo no .gitignore — ligar a pasta inteira e
+        # impossivel. Nesse caso ligo o conteudo, ficheiro a ficheiro. Sem isto
+        # a pasta chega vazia ao backtest e ele nao encontra os dados.
         for rel in PASTAS_LIGADAS:
             origem = (self.projeto / rel).resolve()
             destino = self.raiz / rel
-            if origem.exists() and not destino.exists():
+            if not origem.exists():
+                continue
+            if not destino.exists() and not destino.is_symlink():
                 destino.parent.mkdir(parents=True, exist_ok=True)
                 destino.symlink_to(origem, target_is_directory=origem.is_dir())
+            elif destino.is_dir() and origem.is_dir():
+                for filho in origem.iterdir():
+                    alvo = destino / filho.name
+                    if not alvo.exists() and not alvo.is_symlink():
+                        alvo.symlink_to(filho, target_is_directory=filho.is_dir())
         return self.raiz
 
     def limpar(self):
@@ -2286,7 +2300,7 @@ def autoteste() -> int:
     BD = tmp / "orq.db"
     COMANDO_BACKTEST = ("python3 run_backtest.py --params {params} --start {inicio} "
                         "--end {fim} --out {saida}")
-    COMANDO_TESTES = ""
+    COMANDO_TESTES = ""      # exemplo: "python3 -m unittest discover -s testes -t ."
     FICHEIROS_EDITAVEIS = ["estrategia"]
     PASTAS_LIGADAS = ["data"]
     MODO = "code"
