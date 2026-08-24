@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Orquestrador de backtest via Telegram. Um ficheiro, sem dependencias alem de requests.
 
-    python orquestrador.py            arranca (bot + worker)
-    python orquestrador.py teste      verifica que funciona, sem Ollama nem Telegram
-    python orquestrador.py doctor     verifica a TUA configuracao
-    python orquestrador.py ver        que ficheiros o agente pode e nao pode tocar
+    python orquestrador.py             arranca (bot + worker)
+    python orquestrador.py teste       verifica que funciona, sem Ollama nem Telegram
+    python orquestrador.py configurar  olha para o teu projeto e propoe as definicoes
+    python orquestrador.py doctor      verifica a TUA configuracao
+    python orquestrador.py ver         que ficheiros o agente pode e nao pode tocar
 
 Dois agentes servidos por Ollama:
 
@@ -2485,6 +2486,191 @@ def doctor() -> int:
 
 
 # ===========================================================================
+#  CONFIGURAR — olha para o teu projeto e preenche-se a si proprio
+# ===========================================================================
+
+# Nomes que denunciam o que cada ficheiro faz. Nao e adivinhacao cega: e uma
+# proposta que tu confirmas, e o programa diz sempre no que nao teve certeza.
+PISTAS_ARNES = ("metric", "backtest", "resultado", "score", "avalia", "engine",
+                "simula", "executa", "dados", "data", "loader", "carrega", "test")
+PISTAS_ESTRATEGIA = ("estrateg", "strateg", "sinal", "signal", "indicador",
+                     "indicator", "regra", "rule", "entrada", "entry", "setup",
+                     "risco", "risk", "filtro", "filter")
+
+# Como os argumentos do teu script se mapeiam nos meus marcadores.
+MAPA_ARGUMENTOS = {
+    "{params}": ("params", "parametros", "config", "cfg", "parameters"),
+    "{inicio}": ("start", "inicio", "start-date", "data-inicio", "from", "de"),
+    "{fim}": ("end", "fim", "end-date", "data-fim", "to", "ate"),
+    "{saida}": ("out", "output", "saida", "resultado", "metrics", "metricas", "o"),
+}
+
+
+def _ficheiros_python(projeto: Path) -> list[Path]:
+    return [c for c in sorted(projeto.rglob("*.py"))
+            if not any(parte in (".git", "__pycache__", ".venv", "venv", "worktrees",
+                                 "node_modules", ".orq")
+                       for parte in c.parts)
+            and c.name != Path(__file__).name]
+
+
+def _detetar_entrada(projeto: Path) -> tuple[Path | None, str | None]:
+    """Descobre o script que corre o backtest e monta o comando a partir dos
+    argumentos que ele proprio declara."""
+    candidatos = []
+    for caminho in _ficheiros_python(projeto):
+        try:
+            texto = caminho.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "__main__" not in texto or "add_argument" not in texto:
+            continue
+        nome = caminho.stem.lower()
+        pontos = sum(30 for p in ("run_backtest", "backtest", "run", "main") if p in nome)
+        pontos -= 20 * len(caminho.relative_to(projeto).parts[:-1])   # raiz vale mais
+        candidatos.append((pontos, caminho, texto))
+    if not candidatos:
+        return None, None
+
+    _, entrada, texto = max(candidatos, key=lambda c: c[0])
+    flags = re.findall(r"add_argument\(\s*['\"]--([a-zA-Z0-9_-]+)", texto)
+    partes, em_falta = [], []
+    for marcador, alternativas in MAPA_ARGUMENTOS.items():
+        achado = next((f for f in flags
+                       if f.lower().replace("_", "-") in alternativas), None)
+        if achado:
+            partes.append(f"--{achado} {marcador}")
+        else:
+            em_falta.append(marcador)
+
+    rel = entrada.relative_to(projeto).as_posix()
+    comando = f"python {rel} " + " ".join(partes)
+    return entrada, (comando if not em_falta else comando + "   # FALTAM: " + " ".join(em_falta))
+
+
+def _classificar(projeto: Path) -> tuple[list[str], list[str], list[str]]:
+    """Separa estrategia de arnes. Devolve (estrategia, arnes, duvidosos)."""
+    estrategia, arnes, duvidosos = [], [], []
+    for caminho in _ficheiros_python(projeto):
+        rel = caminho.relative_to(projeto).as_posix()
+        alvo = rel.lower()
+        e_estrategia = any(p in alvo for p in PISTAS_ESTRATEGIA)
+        e_arnes = any(p in alvo for p in PISTAS_ARNES)
+        if e_estrategia and not e_arnes:
+            estrategia.append(rel)
+        elif e_arnes:
+            arnes.append(rel)
+        else:
+            duvidosos.append(rel)
+    return estrategia, arnes, duvidosos
+
+
+def _agrupar(caminhos: list[str]) -> list[str]:
+    """Se todos os ficheiros estao na mesma pasta, a lista branca e a pasta."""
+    if not caminhos:
+        return []
+    pastas = {c.rsplit("/", 1)[0] for c in caminhos if "/" in c}
+    if len(pastas) == 1 and all("/" in c for c in caminhos):
+        return sorted(pastas)
+    return sorted(caminhos)
+
+
+def _substituir_constante(texto: str, nome: str, valor: str) -> tuple[str, bool]:
+    padrao = re.compile(rf"^{nome} = .*$", re.MULTILINE)
+    if not padrao.search(texto):
+        return texto, False
+    return padrao.sub(f"{nome} = {valor}", texto, count=1), True
+
+
+def cmd_configurar(escrever: bool) -> int:
+    projeto = Path(PROJETO)
+    problema = diagnosticar_caminho(PROJETO)
+    if problema:
+        print(f"\n❌ PROJETO — {problema}\n")
+        return 1
+    if not projeto.is_dir():
+        print(f"\n❌ A pasta {PROJETO} nao existe.\n"
+              f"   Corrige PROJETO no topo do ficheiro e corre outra vez.\n")
+        return 1
+
+    print(f"\nA olhar para {projeto}\n")
+    entrada, comando = _detetar_entrada(projeto)
+    estrategia, arnes, duvidosos = _classificar(projeto)
+    editaveis = _agrupar(estrategia)
+
+    if entrada:
+        print(f"  Script de backtest : {entrada.relative_to(projeto).as_posix()}")
+    else:
+        print("  Script de backtest : NAO ENCONTRADO")
+        print("     Procurei um .py com `__main__` e `add_argument`. Se o teu")
+        print("     backtest corre de outra maneira, escreve o COMANDO_BACKTEST a mao.")
+
+    print(f"\n  ✏️  Proponho como EDITAVEL ({len(estrategia)} ficheiro(s)):")
+    for f in estrategia or ["   (nenhum — ver abaixo)"]:
+        print(f"        {f}")
+    print(f"\n  🔒 Fica PROTEGIDO ({len(arnes)}):")
+    for f in arnes[:12]:
+        print(f"        {f}")
+    if duvidosos:
+        print(f"\n  ❓ Nao consegui classificar ({len(duvidosos)}):")
+        for f in duvidosos[:12]:
+            print(f"        {f}")
+        print("     Ficam de fora da lista branca. Se algum deles for estrategia,")
+        print("     acrescenta-o a mao a FICHEIROS_EDITAVEIS.")
+
+    if not estrategia:
+        print("\n❌ Nao identifiquei nenhum ficheiro de estrategia pelo nome.")
+        print("   Sem lista branca o modo `code` nao arranca — e ainda bem, porque")
+        print("   um agente sem lista branca pode reescrever o codigo que o avalia.")
+        print("   Escreve tu FICHEIROS_EDITAVEIS com os teus ficheiros de estrategia.")
+
+    pastas_dados = sorted({d.name for d in projeto.iterdir()
+                           if d.is_dir() and d.name.lower() in
+                           ("dados", "data", "csv", "series", "historico", "cache")})
+
+    print("\n" + "─" * 62)
+    print("Proposta de configuracao:\n")
+    linhas = []
+    if comando:
+        linhas.append(f'COMANDO_BACKTEST = "{comando}"')
+    if editaveis:
+        linhas.append(f"FICHEIROS_EDITAVEIS = {editaveis!r}")
+    if pastas_dados:
+        linhas.append(f"PASTAS_LIGADAS = {pastas_dados!r}")
+    for l in linhas:
+        print(f"  {l}")
+
+    if not escrever:
+        print("\nPara eu escrever isto no ficheiro:")
+        print(f"  python {Path(__file__).name} configurar --escrever\n")
+        return 0
+
+    origem = Path(__file__)
+    texto = origem.read_text(encoding="utf-8")
+    copia = origem.with_suffix(".py.bak")
+    copia.write_text(texto, encoding="utf-8")
+
+    aplicadas = []
+    for nome, valor in (("COMANDO_BACKTEST", f'"{comando}"' if comando else None),
+                        ("FICHEIROS_EDITAVEIS", repr(editaveis) if editaveis else None),
+                        ("PASTAS_LIGADAS", repr(pastas_dados) if pastas_dados else None)):
+        if valor is None:
+            continue
+        texto, ok = _substituir_constante(texto, nome, valor)
+        if ok:
+            aplicadas.append(nome)
+    origem.write_text(texto, encoding="utf-8")
+
+    print(f"\n✅ Escrevi {len(aplicadas)} definicao(oes): {', '.join(aplicadas)}")
+    print(f"   Copia do ficheiro anterior em {copia.name}")
+    if comando and "FALTAM" in comando:
+        print("\n⚠️  O COMANDO_BACKTEST ficou incompleto — o teu script nao declara")
+        print("   todos os argumentos de que preciso. Ve a linha e completa-a.")
+    print(f"\nAgora:  python {origem.name} doctor\n")
+    return 0
+
+
+# ===========================================================================
 #  AUTOTESTE — prova que o ficheiro funciona, sem Ollama e sem Telegram
 # ===========================================================================
 
@@ -2871,9 +3057,10 @@ Falta configurar {len(faltas)} coisa(s) no topo deste ficheiro
     for f in faltas:
         print(f"  ❌ {f}")
     print(f"""
-Depois de preencheres:
+Depois de preencheres o PROJETO, eu descubro o resto sozinho:
 
-    python {Path(__file__).name} doctor     verifica tudo
+    python {Path(__file__).name} configurar --escrever
+    python {Path(__file__).name} doctor
     python {Path(__file__).name}            arranca
 
 Entretanto podes ver se a maquinaria esta sa, sem configurar nada:
@@ -2888,9 +3075,12 @@ def main(argv=None) -> int:
         prog="orquestrador", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("comando", nargs="?", default="correr",
-                    choices=["correr", "teste", "doctor", "ver", "estado", "bot", "worker"],
+                    choices=["correr", "teste", "doctor", "configurar", "ver", "estado",
+                             "bot", "worker"],
                     help="sem argumento nenhum: arranca")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--escrever", action="store_true",
+                    help="com `configurar`: grava as definicoes neste ficheiro")
     a = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -2901,6 +3091,8 @@ def main(argv=None) -> int:
         return autoteste()
     if a.comando == "doctor":
         return doctor()
+    if a.comando == "configurar":
+        return cmd_configurar(a.escrever)
     if a.comando == "ver":
         return cmd_ver(Path(PROJETO), FICHEIROS_EDITAVEIS)
     if a.comando == "estado":
