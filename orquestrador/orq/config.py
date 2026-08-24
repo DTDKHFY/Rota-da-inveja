@@ -97,6 +97,10 @@ class TargetConfig:
     # Funcoes congeladas: para quando estrategia e metricas partilham
     # ficheiro e a lista branca de caminhos ja nao protege nada.
     frozen_functions: tuple[str, ...] = ()
+    # Nomes de variaveis de ambiente que o backtest precisa (chaves de API de
+    # dados, por exemplo). So os nomes; os valores vem do ambiente. O que nao
+    # estiver aqui nao passa.
+    env_passthrough: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -315,6 +319,7 @@ def load_config(path: str | Path | None = None, *, env_path: str | Path | None =
             params_file=str(target_raw.get("params_file", "params.json")),
             editable_paths=tuple(target_raw.get("editable_paths", []) or []),
             frozen_functions=tuple(target_raw.get("frozen_functions", []) or []),
+            env_passthrough=tuple(target_raw.get("env_passthrough", []) or []),
         ),
         experiment=ExperimentConfig(
             mode=mode,

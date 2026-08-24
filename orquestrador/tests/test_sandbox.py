@@ -201,3 +201,44 @@ def test_round_trip_citar_dividir(monkeypatch):
     for sistema, caminho in (("posix", "/tmp/a b/p.json"), ("nt", r"C:\a b\p.json")):
         monkeypatch.setattr("orq.sandbox.os.name", sistema)
         assert split_command(f"prog --params {quote_path(caminho)}")[2] == caminho
+
+
+# --- ambiente do subprocesso ----------------------------------------------
+
+def test_ambiente_tem_o_que_o_python_precisa_no_windows(monkeypatch):
+    """Sem SystemRoot o Python nem arranca no Windows.
+
+    Morre com "_Py_HashRandomization_Init: failed to get random numbers" antes
+    de chegar ao codigo do utilizador — e a mensagem nao aponta para a causa.
+    """
+    from orq.sandbox import _clean_env
+
+    monkeypatch.setattr("orq.sandbox.os.name", "nt")
+    monkeypatch.setenv("SystemRoot", r"C:\\Windows")
+    monkeypatch.setenv("TEMP", r"C:\\Temp")
+    env = _clean_env()
+    assert env["SystemRoot"] == r"C:\\Windows"
+    assert env["TEMP"] == r"C:\\Temp"
+
+
+def test_ambiente_deixa_de_fora_o_que_nao_foi_permitido(monkeypatch):
+    """A lista e de permissao: o que nao esta la nao passa."""
+    from orq.sandbox import _clean_env
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:SEGREDO")
+    monkeypatch.setenv("CHAVE_DE_DADOS", "valor-secreto")
+    env = _clean_env()
+    assert "TELEGRAM_BOT_TOKEN" not in env
+    assert "CHAVE_DE_DADOS" not in env
+    assert not any("SEGREDO" in v for v in env.values())
+
+
+def test_variavel_pedida_explicitamente_passa(monkeypatch):
+    """Um backtest que precisa de uma chave de API tem de a poder receber."""
+    from orq.sandbox import _clean_env
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:SEGREDO")
+    monkeypatch.setenv("CHAVE_DE_DADOS", "valor-secreto")
+    env = _clean_env(passthrough=("CHAVE_DE_DADOS",))
+    assert env["CHAVE_DE_DADOS"] == "valor-secreto"
+    assert "TELEGRAM_BOT_TOKEN" not in env, "pedir uma nao abre a porta as outras"

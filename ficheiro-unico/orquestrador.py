@@ -1543,19 +1543,49 @@ def sem_rede_disponivel() -> bool:
     return bool(_prefixo_sem_rede())
 
 
+# Variaveis de sistema que o subprocesso pode receber. E uma lista de permissao,
+# nao de proibicao: tudo o que nao esteja aqui fica de fora, e e assim que o
+# token do Telegram nao chega ao backtest.
+#
+# As do Windows nao sao opcionais. Sem SystemRoot, o Python nem arranca:
+# a inicializacao da aleatoriedade das hashes vai pedir numeros ao sistema, nao
+# encontra a pasta do sistema, e morre com
+# "_Py_HashRandomization_Init: failed to get random numbers" — antes sequer de
+# chegar ao teu codigo.
+VARIAVEIS_SISTEMA_COMUNS = ("PATH", "LANG", "LC_ALL", "TZ", "HOME")
+VARIAVEIS_SISTEMA_WINDOWS = (
+    "SystemRoot", "SystemDrive", "WINDIR", "COMSPEC", "PATHEXT",
+    "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "ProgramData",
+    "ProgramFiles", "ProgramFiles(x86)", "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE", "OS", "USERNAME", "HOMEDRIVE", "HOMEPATH",
+)
+
+# Se o teu backtest precisar de alguma variavel tua — uma chave de API de dados,
+# por exemplo — poe o NOME dela aqui. So os nomes; os valores vem do teu
+# ambiente. Tudo o que nao estiver nesta lista nem nas de cima fica de fora.
+VARIAVEIS_EXTRA: list[str] = []
+
+
 def ambiente_limpo() -> dict:
-    """Construido de raiz, nao herdado.
+    """Construido a partir de uma lista de permissao, nao herdado.
 
     O processo do orquestrador tem o token do Telegram carregado; o backtest nao
-    tem nada que ver com isso.
+    tem nada que ver com isso. Mas "limpo" nao pode significar "vazio": ha
+    variaveis sem as quais o interpretador nao arranca.
     """
-    return {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": os.environ.get("HOME", "/tmp"),
-        "LANG": os.environ.get("LANG", "C.UTF-8"),
-        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
-        "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
-    }
+    nomes = list(VARIAVEIS_SISTEMA_COMUNS)
+    if os.name == "nt":
+        nomes += list(VARIAVEIS_SISTEMA_WINDOWS)
+    nomes += list(VARIAVEIS_EXTRA)
+
+    env = {nome: os.environ[nome] for nome in nomes if nome in os.environ}
+    env.setdefault("PATH", os.defpath)
+    if os.name != "nt":
+        env.setdefault("HOME", "/tmp")
+        env.setdefault("LANG", "C.UTF-8")
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
 
 
 def interpretador() -> str:
@@ -1784,6 +1814,11 @@ class Sandbox:
         except FileNotFoundError as e:
             raise ErroSandbox(f"comando nao encontrado: {argv[0]}") from e
         junto = p.stdout + (("\n[stderr]\n" + p.stderr) if p.stderr else "")
+        if "_Py_HashRandomization_Init" in (p.stderr or ""):
+            junto += (
+                "\n\n[orq] O Python nao chegou a arrancar: faltou-lhe uma variavel de\n"
+                "     ambiente do sistema. Se isto aparecer, e bug meu — a lista\n"
+                "     VARIAVEIS_SISTEMA_WINDOWS no topo do ficheiro esta incompleta.")
         if p.returncode == 9009 or "was not found" in (p.stderr or ""):
             junto += (
                 "\n\n[orq] O codigo 9009 no Windows quer dizer 'comando nao encontrado'.\n"

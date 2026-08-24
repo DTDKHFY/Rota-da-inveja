@@ -94,20 +94,43 @@ def network_isolation_available() -> bool:
     return bool(_network_isolation_prefix())
 
 
-def _clean_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Ambiente construido de raiz.
+# Lista de permissao, nao de proibicao: o que nao esta aqui nao passa, e e assim
+# que o token do Telegram nao chega ao backtest.
+#
+# As do Windows nao sao opcionais. Sem SystemRoot o Python nem arranca: a
+# inicializacao da aleatoriedade das hashes pede numeros ao sistema, nao encontra
+# a pasta do sistema, e morre com "_Py_HashRandomization_Init: failed to get
+# random numbers" antes de chegar ao codigo do utilizador.
+SYSTEM_VARS_COMMON = ("PATH", "LANG", "LC_ALL", "TZ", "HOME")
+SYSTEM_VARS_WINDOWS = (
+    "SystemRoot", "SystemDrive", "WINDIR", "COMSPEC", "PATHEXT",
+    "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "ProgramData",
+    "ProgramFiles", "ProgramFiles(x86)", "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE", "OS", "USERNAME", "HOMEDRIVE", "HOMEPATH",
+)
+
+
+def _clean_env(extra: dict[str, str] | None = None,
+               passthrough: tuple[str, ...] = ()) -> dict[str, str]:
+    """Ambiente construido a partir de uma lista de permissao.
 
     Nao herda `os.environ` de proposito: o processo do orquestrador tem o token
-    do Telegram carregado, e o backtest nao tem nada que ver com isso.
+    do Telegram carregado, e o backtest nao tem nada que ver com isso. Mas
+    "limpo" nao pode significar "vazio" — ha variaveis sem as quais o
+    interpretador nao arranca.
     """
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": os.environ.get("HOME", "/tmp"),
-        "LANG": os.environ.get("LANG", "C.UTF-8"),
-        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
-        "PYTHONUNBUFFERED": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
+    names = list(SYSTEM_VARS_COMMON)
+    if os.name == "nt":
+        names += list(SYSTEM_VARS_WINDOWS)
+    names += list(passthrough)
+
+    env = {name: os.environ[name] for name in names if name in os.environ}
+    env.setdefault("PATH", os.defpath)
+    if os.name != "nt":
+        env.setdefault("HOME", "/tmp")
+        env.setdefault("LANG", "C.UTF-8")
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     if extra:
         env.update(extra)
     return env
@@ -323,7 +346,7 @@ class Sandbox:
             proc = subprocess.run(
                 [*prefix, *argv],
                 cwd=self.root,
-                env=_clean_env(),
+                env=_clean_env(passthrough=self.target.env_passthrough),
                 capture_output=True,
                 text=True,
                 timeout=timeout,

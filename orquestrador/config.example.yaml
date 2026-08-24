@@ -64,6 +64,12 @@ target:
   # comparado com o original, e qualquer diferenca faz a proposta ser recusada,
   # com o motivo devolvido ao modelo.
   frozen_functions: []
+  # Variaveis de ambiente que o teu backtest precisa (uma chave de API de dados,
+  # por exemplo). So os NOMES; os valores vem do teu ambiente. Tudo o que nao
+  # estiver aqui fica de fora — e assim que o token do Telegram nunca chega ao
+  # subprocesso.
+  env_passthrough: []
+  #  - CHAVE_API_DADOS
   #  - calcular_sharpe
   #  - calcular_drawdown
   #  - gravar_resultado
