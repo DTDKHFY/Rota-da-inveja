@@ -455,7 +455,8 @@ CREATE TABLE IF NOT EXISTS estudos (
 CREATE TABLE IF NOT EXISTS tarefas (
     id TEXT PRIMARY KEY, chat INTEGER NOT NULL, texto TEXT NOT NULL,
     estado TEXT NOT NULL DEFAULT 'fila', criado REAL NOT NULL,
-    inicio REAL, fim REAL, pulso REAL, erro TEXT);
+    inicio REAL, fim REAL, pulso REAL, erro TEXT,
+    lote INTEGER NOT NULL DEFAULT 0, silencioso INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS ensaios (
     id TEXT PRIMARY KEY, estudo TEXT NOT NULL, tarefa TEXT, hipotese TEXT,
     params TEXT NOT NULL, alteracao TEXT,
@@ -466,6 +467,17 @@ CREATE TABLE IF NOT EXISTS eventos (
     id INTEGER PRIMARY KEY AUTOINCREMENT, tipo TEXT NOT NULL, ref TEXT,
     dados TEXT, criado REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS kv (chave TEXT PRIMARY KEY, valor TEXT NOT NULL);
+
+-- Memoria que atravessa estudos. Guarda MECANISMOS, nunca valores vencedores:
+-- lembrar "sma_fast=20 deu 1.5" faria a busca continuar entre estudos por
+-- baixo da mesa, e a contagem de ensaios do DSR passaria a mentir.
+CREATE TABLE IF NOT EXISTS licoes (
+    id TEXT PRIMARY KEY, estudo TEXT, ensaio TEXT, hipotese TEXT,
+    licao TEXT NOT NULL, resultado TEXT, criado REAL NOT NULL);
+
+-- O que TU lhe ensinas. Nunca expira, nunca e apagado automaticamente.
+CREATE TABLE IF NOT EXISTS notas (
+    id TEXT PRIMARY KEY, texto TEXT NOT NULL, criado REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS i_ensaios ON ensaios(estado, criado);
 CREATE INDEX IF NOT EXISTS i_tarefas ON tarefas(estado, criado);
 """
@@ -480,6 +492,7 @@ class Estado:
         self.c.execute("PRAGMA journal_mode=WAL")
         self.c.execute("PRAGMA synchronous=NORMAL")
         self.c.executescript(ESQUEMA)
+        self._migrar()
         # Uma ligacao SQLite so pode ser usada na thread que a criou. Guardo
         # quem me criou para poder falhar com uma mensagem util em vez da do
         # sqlite3, que aparece a meio de uma transacao e nao diz o que fazer.
@@ -492,6 +505,19 @@ class Estado:
                 f"{quem} recebeu um Estado aberto noutra thread. Uma ligacao SQLite "
                 "so funciona na thread que a criou: abre o Estado DENTRO da funcao "
                 "que a thread vai correr, em vez de o criar fora e passar.")
+
+    def _migrar(self):
+        """Colunas novas em bases de dados que ja existem.
+
+        `CREATE TABLE IF NOT EXISTS` nao acrescenta colunas a uma tabela ja
+        criada. Quem ja tem ensaios gravados nao pode perde-los por eu ter
+        acrescentado um campo.
+        """
+        colunas = {r["name"] for r in self.c.execute("PRAGMA table_info(tarefas)")}
+        for nome, definicao in (("lote", "INTEGER NOT NULL DEFAULT 0"),
+                                ("silencioso", "INTEGER NOT NULL DEFAULT 0")):
+            if nome not in colunas:
+                self.c.execute(f"ALTER TABLE tarefas ADD COLUMN {nome} {definicao}")
 
     def fechar(self):
         self.c.close()
@@ -547,14 +573,43 @@ class Estado:
             "SELECT COUNT(*) n FROM ensaios WHERE estudo=? AND estado='feito'",
             (eid,)).fetchone()["n"])
 
+    # -- memoria ---------------------------------------------------------
+    def guardar_licao(self, licao: str, *, estudo=None, ensaio=None,
+                      hipotese="", resultado="") -> str:
+        lid = novo_id("lic")
+        self.c.execute("INSERT INTO licoes (id, estudo, ensaio, hipotese, licao, "
+                       "resultado, criado) VALUES (?,?,?,?,?,?,?)",
+                       (lid, estudo, ensaio, hipotese, licao, resultado, time.time()))
+        return lid
+
+    def licoes(self, n=25):
+        """As mais recentes, de todos os estudos."""
+        return list(self.c.execute(
+            "SELECT * FROM licoes ORDER BY criado DESC LIMIT ?", (n,)))
+
+    def guardar_nota(self, texto: str) -> str:
+        nid = novo_id("not")
+        self.c.execute("INSERT INTO notas (id, texto, criado) VALUES (?,?,?)",
+                       (nid, texto, time.time()))
+        return nid
+
+    def notas(self, n=40):
+        return list(self.c.execute(
+            "SELECT * FROM notas ORDER BY criado DESC LIMIT ?", (n,)))
+
+    def apagar_nota(self, nid: str) -> bool:
+        return self.c.execute("DELETE FROM notas WHERE id=?", (nid,)).rowcount > 0
+
     # -- fila ------------------------------------------------------------
     def _tx(self):
         return self.c
 
-    def nova_tarefa(self, chat: int, texto: str) -> str:
+    def nova_tarefa(self, chat: int, texto: str, lote: int = 0,
+                    silencioso: bool = False) -> str:
         tid = novo_id("tar")
-        self.c.execute("INSERT INTO tarefas (id, chat, texto, criado) VALUES (?,?,?,?)",
-                       (tid, chat, texto, time.time()))
+        self.c.execute("INSERT INTO tarefas (id, chat, texto, criado, lote, silencioso) "
+                       "VALUES (?,?,?,?,?,?)",
+                       (tid, chat, texto, time.time(), lote, int(silencioso)))
         self.evento("tarefa.fila", tid, texto=texto)
         return tid
 
@@ -581,8 +636,20 @@ class Estado:
         self.c.execute("UPDATE tarefas SET estado=?, fim=?, erro=? WHERE id=?",
                        (estado, time.time(), erro, tid))
 
+    def tarefa(self, tid: str):
+        return self.c.execute("SELECT * FROM tarefas WHERE id=?", (tid,)).fetchone()
+
     def tarefas(self, n=10):
         return list(self.c.execute("SELECT * FROM tarefas ORDER BY criado DESC LIMIT ?", (n,)))
+
+    def ensaios_da_tarefa(self, tid: str):
+        return list(self.c.execute(
+            "SELECT * FROM ensaios WHERE tarefa=? ORDER BY criado", (tid,)))
+
+    def lote_por_terminar(self, tid: str) -> int:
+        r = self.c.execute("SELECT COUNT(*) n FROM ensaios WHERE tarefa=? AND "
+                           "estado IN ('fila','a_correr')", (tid,)).fetchone()
+        return int(r["n"])
 
     def cancelar_fila(self) -> int:
         cur = self.c.execute("UPDATE tarefas SET estado='cancelada', fim=? WHERE estado='fila'",
@@ -1549,11 +1616,33 @@ Regras absolutas:
 - Responde SO com JSON. Sem texto antes ou depois.
 - Se o historico mostrar que uma direcao ja foi tentada e piorou, nao a repitas.
 - Se nao tiveres base para uma hipotese, diz "explorar" em vez de inventar.
+- Podes receber LICOES de estudos anteriores e NOTAS escritas pelo dono da
+  estrategia. Usa-as para nao repetir becos sem saida. As licoes falam de
+  mecanismos, nao de valores — se alguma sugerir um valor concreto, ignora esse
+  valor: ele veio de outro estudo e nao vale aqui.
 
 Formato exato:
 {"hipoteses": [{"nome": "...", "raciocinio": "...", "direcao": "aumentar"}]}
 
 "direcao" so pode ser: "aumentar", "diminuir" ou "explorar".
+"""
+
+SISTEMA_LICAO = """Destilas o que se aprendeu com um ensaio de backtest, para
+memoria de longo prazo.
+
+REGRA QUE NAO PODES QUEBRAR: nunca guardes VALORES de parametros. Nada de
+"sma_fast=20 funcionou", nada de "o melhor stop foi 3.5". Guardas o MECANISMO:
+o que aconteceu e porque e que parece ter acontecido.
+
+Guardar valores faria a busca continuar entre estudos por baixo da mesa, e a
+contagem de ensaios — que e o que corrige o excesso de tentativas — passaria a
+mentir. Um numero decorado de um estudo antigo e overfit disfarcado de memoria.
+
+Uma frase, no maximo duas. Se o ensaio nao ensinou nada que valha a pena guardar
+(falhou por erro tecnico, ou repetiu o que ja se sabia), poe lembrar: false.
+
+Formato exato:
+{"licao": "stops apertados reduziram o drawdown mas cortaram o retorno, porque saiam antes do movimento", "lembrar": true}
 """
 
 SISTEMA_CONVERSA = """Es o assistente de um sistema de backtest, a falar com o
@@ -1646,11 +1735,13 @@ class Agentes:
         self.estado = estado
 
     # -- Agente Pesquisa -------------------------------------------------
-    def pesquisar(self, objetivo: str, historico: list[dict], n=3) -> list[dict]:
+    def pesquisar(self, objetivo: str, historico: list[dict], n=3,
+                  memoria: str = "") -> list[dict]:
         contexto = (f"PARAMETROS DISPONIVEIS:\n{descrever_limites()}\n\n"
                     if MODO == "params" else "")
         prompt = (f"OBJETIVO DO ESTUDO:\n{objetivo}\n\n{contexto}"
-                  f"ENSAIOS JA FEITOS:\n{descrever_historico(historico)}\n\n"
+                  f"{memoria}"
+                  f"ENSAIOS JA FEITOS NESTE ESTUDO:\n{descrever_historico(historico)}\n\n"
                   f"Propoe exatamente {n} hipoteses distintas para o proximo ensaio.")
 
         def validar(dados):
@@ -1723,6 +1814,37 @@ class Agentes:
             return {"params": params_aleatorios(rng), "justificacao":
                     "o modelo nao devolveu proposta valida; usei amostragem nos limites",
                     "recurso": True}
+
+    # -- destilar licoes ---------------------------------------------------
+    def destilar_licao(self, hipotese: str, veredito, treino, validacao) -> str | None:
+        """O que este ensaio ensinou, se ensinou alguma coisa."""
+        estado = "passou" if veredito.passou else "chumbou"
+        falhas = ", ".join(c.nome for c in veredito.falhas) or "nenhum"
+        prompt = (f"HIPOTESE TESTADA:\n{hipotese or '(nao registada)'}\n\n"
+                  f"RESULTADO:\n"
+                  f"  {estado} no gate (criterios falhados: {falhas})\n"
+                  f"  Sharpe treino {treino.sharpe_anual:+.2f} -> "
+                  f"validacao {validacao.sharpe_anual:+.2f}\n"
+                  f"  drawdown {validacao.drawdown:.1%}, {validacao.trades} trades\n"
+                  f"  Deflated Sharpe {veredito.dsr:.3f} apos {veredito.n_ensaios} ensaios\n\n"
+                  f"O que se aprendeu?")
+
+        def validar(dados):
+            if not isinstance(dados, dict) or "licao" not in dados:
+                raise ValueError("falta a chave `licao`")
+            if not dados.get("lembrar", True):
+                return None
+            texto = str(dados["licao"]).strip()[:400]
+            if not texto:
+                return None
+            return texto
+
+        try:
+            return correr_agente(self.llm, papel="licao", modelo=MODELO_RELATORIO,
+                                 sistema=SISTEMA_LICAO, prompt=prompt, validar=validar,
+                                 tentativas=1)
+        except ErroAgente:
+            return None      # a memoria e um extra; nunca trava um ensaio
 
     # -- conversa ---------------------------------------------------------
     def conversar(self, pergunta: str, estado_txt: str) -> dict:
@@ -1902,6 +2024,23 @@ class Orquestrador:
         except (ValueError, json.JSONDecodeError):
             return None
 
+    def memoria(self, n_licoes=20, n_notas=30) -> str:
+        """O que ele sabe de antes deste estudo.
+
+        As notas vem primeiro porque foste tu que as escreveste: valem mais do
+        que qualquer coisa que ele tenha destilado sozinho.
+        """
+        partes = []
+        notas = self.estado.notas(n_notas)
+        if notas:
+            partes.append("O QUE O DONO DA ESTRATEGIA TE DISSE (vale mais que o resto):\n"
+                          + "\n".join(f"- {n['texto']}" for n in reversed(notas)))
+        licoes = self.estado.licoes(n_licoes)
+        if licoes:
+            partes.append("LICOES DE ENSAIOS ANTERIORES (mecanismos, nao valores):\n"
+                          + "\n".join(f"- {l['licao']}" for l in reversed(licoes)))
+        return "\n\n".join(partes) + "\n\n" if partes else ""
+
     def resumo_para_conversa(self) -> str:
         """Retrato do sistema, escrito por codigo.
 
@@ -1942,6 +2081,15 @@ class Orquestrador:
         if pendentes:
             linhas.append(f"A aguardar decisao dele: {len(pendentes)} "
                           f"({', '.join(p['id'] for p in pendentes[:3])})")
+
+        notas = self.estado.notas(15)
+        if notas:
+            linhas.append("Notas que ele te escreveu:")
+            linhas += [f"  - {n['texto']}" for n in reversed(notas)]
+        licoes = self.estado.licoes(10)
+        if licoes:
+            linhas.append("Licoes de ensaios anteriores:")
+            linhas += [f"  - {l['licao']}" for l in reversed(licoes)]
         return "\n".join(linhas)
 
     # -- tarefas ---------------------------------------------------------
@@ -1962,8 +2110,11 @@ class Orquestrador:
             return 0
 
         historico = self._historico(eid)
+        # Um lote pede mais hipoteses de uma vez; sem lote, tres chegam.
+        quantas = max(1, min(int(tarefa["lote"] or 0) or 3, 12))
         try:
-            hipoteses = self.agentes.pesquisar(objetivo, historico)
+            hipoteses = self.agentes.pesquisar(objetivo, historico, n=quantas,
+                                               memoria=self.memoria())
         except ErroAgente as e:
             self.aviso.enviar(f"⚠️ O agente de pesquisa nao produziu hipoteses: {e}")
             return 0
@@ -2022,6 +2173,13 @@ class Orquestrador:
         return n, nomes
 
     # -- ensaios ---------------------------------------------------------
+    def _silencioso(self, ensaio) -> bool:
+        """Este ensaio pertence a um lote autonomo?"""
+        if not ensaio["tarefa"]:
+            return False
+        t = self.estado.tarefa(ensaio["tarefa"])
+        return bool(t and t["silencioso"])
+
     def correr_ensaio(self, ensaio) -> bool:
         eid, params = ensaio["id"], json.loads(ensaio["params"])
         try:
@@ -2069,17 +2227,75 @@ class Orquestrador:
             veredito=veredito.dict(),
             aprovacao="pendente" if veredito.passou else "nenhuma")
 
+        licao = self.agentes.destilar_licao(ensaio["hipotese"] or "", veredito,
+                                            treino, validacao)
+        if licao:
+            self.estado.guardar_licao(licao, estudo=estudo_id, ensaio=eid,
+                                      hipotese=ensaio["hipotese"] or "",
+                                      resultado="passou" if veredito.passou else "chumbou")
+
         if veredito.passou:
             self.aviso.pedir_aprovacao(mensagem_aprovacao(
                 ensaio_id=eid, hipotese=ensaio["hipotese"] or "", params=params,
                 treino=treino, validacao=validacao, veredito=veredito,
                 alteracao=json.loads(ensaio["alteracao"]) if ensaio["alteracao"] else None,
                 comentario=self.agentes.comentar(veredito, ensaio["hipotese"] or "")), eid)
-        else:
+        elif not self._silencioso(ensaio):
             self.aviso.enviar(
                 f"❌ `{eid}` chumbou ({', '.join(c.nome for c in veredito.falhas)}) — "
                 f"Sharpe OOS {validacao.sharpe_anual:.2f}, DSR {veredito.dsr:.3f}")
+
+        # Ultimo do lote: um relatorio so, em vez de uma interrupcao por ensaio.
+        if ensaio["tarefa"] and self.estado.lote_por_terminar(ensaio["tarefa"]) == 0:
+            self._relatorio_do_lote(ensaio["tarefa"])
         return True
+
+    def _relatorio_do_lote(self, tid: str):
+        tarefa = self.estado.tarefa(tid)
+        if not tarefa or not tarefa["silencioso"]:
+            return
+        ensaios = self.estado.ensaios_da_tarefa(tid)
+        if not ensaios:
+            return
+
+        passaram, chumbaram, falharam = [], [], []
+        for e in ensaios:
+            if e["estado"] != "feito":
+                falharam.append(e)
+                continue
+            v = json.loads(e["veredito"]) if e["veredito"] else {}
+            (passaram if v.get("passou") else chumbaram).append((e, v))
+
+        linhas = [f"🔭 *Exploracao terminada* — {len(ensaios)} ensaios",
+                  f"_{tarefa['texto']}_", ""]
+        if passaram:
+            linhas.append(f"🟢 *Passaram no gate: {len(passaram)}*")
+            linhas += [f"  `{e['id']}` — {(e['hipotese'] or '')[:60]}" for e, _ in passaram]
+            linhas.append("  _(pedidos de aprovacao mandados a parte)_")
+        else:
+            linhas.append("🟢 Nenhum passou no gate.")
+
+        if chumbaram:
+            linhas.append(f"\n🔴 *Chumbaram: {len(chumbaram)}*")
+            for e, v in chumbaram[:6]:
+                m = json.loads(e["metricas"]) if e["metricas"] else {}
+                sh = m.get("validacao", {}).get("sharpe_anual")
+                motivos = ", ".join(c["nome"] for c in v.get("criterios", [])
+                                    if not c["passou"]) or "?"
+                linhas.append(f"  Sharpe OOS {sh:+.2f} — falhou: {motivos}"
+                              if sh is not None else f"  falhou: {motivos}")
+        if falharam:
+            linhas.append(f"\n⚠️ {len(falharam)} nao chegaram ao fim (erro tecnico)")
+
+        estudo = self.estado.estudo_aberto()
+        if estudo:
+            usados = self.estado.n_ensaios(estudo["id"])
+            linhas.append(f"\nOrcamento: {usados}/{MAX_ENSAIOS_POR_ESTUDO} ensaios gastos.")
+            if usados > MAX_ENSAIOS_POR_ESTUDO * 0.6:
+                linhas.append("_Quantos mais ensaios gastas, mais alto o Deflated Sharpe "
+                              "exige para acreditar num resultado. Nao e uma penalizacao "
+                              "arbitraria: e a correcao por teres procurado muito._")
+        self.aviso.enviar("\n".join(linhas))
 
     @staticmethod
     def _dict(j: Janela) -> dict:
@@ -2242,6 +2458,10 @@ Para mandar fazer diretamente, sem discussao: `/tarefa <o que queres>`
 /estado — estudo atual, fila, ensaios gastos
 /ensaios — ultimos ensaios e o que deram
 /baseline — mede a estrategia atual (referencia de comparacao)
+/explorar <n> <objetivo> — corro n ensaios sozinho e mando um relatorio no fim
+/nota <texto> — ensina-me algo que eu nunca teria como saber
+/memoria — o que sei: as tuas notas e as licoes dos ensaios
+/esquecer <id> — apaga uma nota
 /estudo <objetivo> — fecha o atual e abre um novo
 /aprovar <id> — aplica uma proposta (cria um ramo git)
 /rejeitar <id> — descarta
@@ -2440,11 +2660,91 @@ class Bot:
                 self._resp(chat, self._aviso_holdout(arg), botoes_holdout(arg))
             else:
                 self._resp(chat, "Usa: /holdout <id do ensaio>")
+        elif cmd == "explorar":
+            self._explorar(chat, arg)
+        elif cmd == "nota":
+            self._nota(chat, arg)
+        elif cmd in ("memoria", "notas"):
+            self._memoria(chat)
+        elif cmd == "esquecer":
+            if not arg:
+                self._resp(chat, "Usa: /esquecer <id da nota> (ve com /memoria)")
+            else:
+                self._resp(chat, f"🧠 Nota `{arg}` apagada." if self.estado.apagar_nota(arg)
+                           else f"Nao encontro a nota `{arg}`.")
         elif cmd == "parar":
             self._resp(chat, f"🛑 {self.estado.cancelar_fila()} tarefas canceladas. "
                              "O ensaio que ja estava a correr vai ate ao fim.")
         else:
             self._resp(chat, f"Nao conheco /{cmd}. Manda /ajuda.")
+
+    def _explorar(self, chat, arg):
+        """Corre varios ensaios sozinho e manda um relatorio so no fim.
+
+        O que muda face a uma tarefa normal: nao te interrompe a cada chumbo.
+        O que NAO muda: o gate continua a decidir, e nada e aplicado sem tu
+        carregares no botao. Autonomia na exploracao, nao na decisao.
+        """
+        partes = arg.split(maxsplit=1)
+        try:
+            quantos = int(partes[0]) if partes and partes[0].isdigit() else 6
+        except ValueError:
+            quantos = 6
+        objetivo = (partes[1] if len(partes) > 1 else
+                    (partes[0] if partes and not partes[0].isdigit() else ""))
+
+        estudo = self.estado.estudo_aberto()
+        if not objetivo:
+            if not estudo:
+                return self._resp(chat, "Usa: /explorar <n> <o que investigar>\n"
+                                        "Por exemplo: `/explorar 8 reduzir o drawdown`")
+            objetivo = estudo["objetivo"]
+
+        quantos = max(1, min(quantos, 12))
+        if estudo:
+            resta = MAX_ENSAIOS_POR_ESTUDO - self.estado.n_ensaios(estudo["id"])
+            if resta <= 0:
+                return self._resp(chat, "O orcamento deste estudo esgotou. Abre um novo "
+                                        "com /estudo — mas so se a hipotese for mesmo nova.")
+            if quantos > resta:
+                quantos = resta
+                self._resp(chat, f"Ajustei para {quantos}: e o que resta do orcamento.")
+
+        tid = self.estado.nova_tarefa(chat, objetivo, lote=quantos, silencioso=True)
+        self._resp(
+            chat,
+            f"🔭 A explorar: {quantos} ensaios\n_{objetivo}_\n\n"
+            f"Nao te vou interromper a cada um. Mando os que passarem no gate "
+            f"assim que passarem, e um relatorio no fim.\n\n"
+            f"`{tid}` — /parar cancela o que ainda nao arrancou.")
+
+    def _nota(self, chat, texto):
+        """Conhecimento teu, que ele nao tem como descobrir sozinho."""
+        if not texto:
+            return self._resp(
+                chat, "Usa: /nota <o que queres que eu saiba sempre>\n\n"
+                "Por exemplo:\n"
+                "_/nota este ativo tem funding de 8h que come 0.01% por dia_\n"
+                "_/nota nao quero posicoes vendidas, so compradas_\n\n"
+                "As notas entram em todas as pesquisas futuras e nunca expiram.")
+        nid = self.estado.guardar_nota(texto)
+        self._resp(chat, f"🧠 Guardado: `{nid}`\n_{texto}_\n\n"
+                         "Vou ter isto em conta em tudo o que investigar.")
+
+    def _memoria(self, chat):
+        notas, licoes = self.estado.notas(20), self.estado.licoes(15)
+        if not notas and not licoes:
+            return self._resp(chat, "Memoria vazia. Ensina-me alguma coisa com /nota.")
+        linhas = []
+        if notas:
+            linhas.append("*O que tu me ensinaste*")
+            linhas += [f"`{n['id']}` {n['texto']}" for n in reversed(notas)]
+        if licoes:
+            linhas.append("\n*O que aprendi sozinho*")
+            linhas += [f"• {l['licao']}" for l in reversed(licoes)]
+        linhas.append("\n_As licoes guardam mecanismos, nunca valores de parametros:_\n"
+                      "_um numero decorado de um estudo antigo e overfit disfarcado de memoria._")
+        self._resp(chat, "\n".join(linhas))
 
     def _conversar(self, chat, texto):
         """Texto normal e conversa, nao ordem.
