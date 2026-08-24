@@ -126,7 +126,10 @@ LIMITE_CONTEXTO = 60_000
 # --- Onde guardar o estado -------------------------------------------------
 BASE = Path(__file__).resolve().parent
 BD = BASE / "orq.db"
-WORKTREES = BASE / "worktrees"
+# Fora do projeto, de proposito: com os worktrees dentro do repositorio, cada
+# ensaio deixava lixo no `git status` do utilizador e o `git add -A` acabava por
+# apanhar copias inteiras do projeto.
+WORKTREES = Path(tempfile.gettempdir()) / "orq_worktrees"
 
 # ===========================================================================
 #  fim da configuracao
@@ -1209,6 +1212,19 @@ def raiz_git(caminho) -> Path | None:
     return Path(r.stdout.strip()).resolve() if r.returncode == 0 and r.stdout.strip() else None
 
 
+def tem_commits(caminho) -> bool:
+    """Ha pelo menos um commit?
+
+    `git init` sozinho cria um repositorio sem HEAD. O `git worktree add` falha
+    com "invalid reference: HEAD", que e verdade mas nao diz a ninguem que o que
+    falta e um commit.
+    """
+    try:
+        return git(caminho, "rev-parse", "--verify", "HEAD", check=False).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def e_repo_git(caminho) -> bool:
     """O caminho e a RAIZ de um repositorio git?
 
@@ -1290,6 +1306,11 @@ class Sandbox:
         self.raiz.parent.mkdir(parents=True, exist_ok=True)
         if self.raiz.exists():
             self.limpar()
+        if not tem_commits(self.projeto):
+            raise ErroSandbox(
+                f"{self.projeto} e um repositorio git sem nenhum commit. Sem commit "
+                f"nao ha HEAD, e sem HEAD nao ha worktree.\n"
+                f'    cd "{self.projeto}" && git add -A && git commit -m "inicial"')
         try:
             git(self.projeto, "worktree", "add", "--detach", str(self.raiz), "HEAD")
         except subprocess.CalledProcessError as e:
@@ -1457,6 +1478,28 @@ Formato exato:
 "direcao" so pode ser: "aumentar", "diminuir" ou "explorar".
 """
 
+SISTEMA_CONVERSA = """Es o assistente de um sistema de backtest, a falar com o
+dono da estrategia pelo Telegram, em portugues.
+
+Recebes o estado atual do sistema e uma pergunta ou comentario dele. Respondes
+com naturalidade, curto (o Telegram nao e sitio para paredes de texto).
+
+Regras absolutas:
+- NUNCA inventes numeros. So podes usar os que estao no estado que te dou. Se
+  te perguntarem algo que os numeros nao respondem, di-lo.
+- Se ele descrever um problema ou objetivo que valha a pena investigar,
+  propoe UMA atividade concreta em "tarefa". Se for so conversa, poe null.
+- Nao prometas resultados. Um backtest nao prova nada sobre o futuro.
+- Se ele parecer estar a pedir para forcar um resultado (baixar criterios,
+  repetir o holdout, abrir estudos novos so para limpar a contagem), diz
+  porque e que isso o prejudica, sem sermao.
+
+Formato exato da resposta:
+{"resposta": "o que lhe dizes", "tarefa": null}
+ou
+{"resposta": "...", "tarefa": "investigar X porque Y"}
+"""
+
 SISTEMA_PARAMS = """Escolhes valores de parametros para um backtest.
 
 Regras absolutas:
@@ -1603,6 +1646,27 @@ class Agentes:
                     "o modelo nao devolveu proposta valida; usei amostragem nos limites",
                     "recurso": True}
 
+    # -- conversa ---------------------------------------------------------
+    def conversar(self, pergunta: str, estado_txt: str) -> dict:
+        """Responde a uma mensagem em linguagem normal, e pode propor trabalho."""
+        prompt = (f"ESTADO ATUAL DO SISTEMA:\n{estado_txt}\n\n"
+                  f"MENSAGEM DELE:\n{pergunta}\n\nResponde.")
+
+        def validar(dados):
+            if not isinstance(dados, dict) or "resposta" not in dados:
+                raise ValueError("falta a chave `resposta`")
+            tarefa = dados.get("tarefa")
+            if tarefa is not None and not isinstance(tarefa, str):
+                raise ValueError("`tarefa` tem de ser texto ou null")
+            if isinstance(tarefa, str) and not tarefa.strip():
+                tarefa = None
+            return {"resposta": str(dados["resposta"])[:1500],
+                    "tarefa": tarefa.strip()[:400] if tarefa else None}
+
+        return correr_agente(self.llm, papel="conversa", modelo=MODELO_PESQUISA,
+                             sistema=SISTEMA_CONVERSA, prompt=prompt, validar=validar,
+                             tentativas=TENTATIVAS_JSON)
+
     # -- comentario de leitura (opcional) --------------------------------
     def comentar(self, veredito: Veredito, hipotese: str) -> str | None:
         falhas = "; ".join(c.detalhe for c in veredito.falhas) or "nenhum criterio falhou"
@@ -1728,6 +1792,7 @@ class Orquestrador:
                 continue
             m = json.loads(r["metricas"]) if r["metricas"] else {}
             saida.append({"params": json.loads(r["params"]),
+                          "hipotese": r["hipotese"],
                           "sharpe": m.get("validacao", {}).get("sharpe_anual")})
         return saida
 
@@ -1758,6 +1823,48 @@ class Orquestrador:
             return ler_metricas(json.loads(est["baseline"]))
         except (ValueError, json.JSONDecodeError):
             return None
+
+    def resumo_para_conversa(self) -> str:
+        """Retrato do sistema, escrito por codigo.
+
+        Todos os numeros que o modelo pode usar vem daqui. Assim ele nao tem de
+        os inventar — e quando inventar, e visivel.
+        """
+        linhas = [f"Modo: {MODO}",
+                  f"Janelas: treino {TREINO[0]}..{TREINO[1]} | "
+                  f"validacao {VALIDACAO[0]}..{VALIDACAO[1]} | "
+                  f"holdout {HOLDOUT[0]}..{HOLDOUT[1]} (intocado)",
+                  f"Gate: Sharpe OOS >= {MIN_SHARPE_OOS}, drawdown <= {MAX_DRAWDOWN_OOS:.0%}, "
+                  f"trades >= {MIN_TRADES}, DSR >= {MIN_DSR}, "
+                  f"melhoria sobre a baseline >= {MIN_MELHORIA_PCT:.0f}%"]
+
+        est = self.estado.estudo_aberto()
+        if est is None:
+            linhas.append("Nenhum estudo aberto ainda. Nenhum ensaio feito.")
+            return "\n".join(linhas)
+
+        usados = self.estado.n_ensaios(est["id"])
+        linhas.append(f"Estudo: {est['objetivo']!r} — {usados}/{MAX_ENSAIOS_POR_ESTUDO} ensaios")
+        base = self._baseline(est["id"])
+        linhas.append(f"Baseline: Sharpe {base.sharpe_anual:+.2f}, drawdown "
+                      f"{base.drawdown:.1%}, {base.trades} trades" if base
+                      else "Baseline: POR DEFINIR (o utilizador tem de correr /baseline)")
+
+        historico = self._historico(est["id"], 12)
+        if historico:
+            linhas.append("Ensaios (mais recentes no fim):")
+            for h in historico:
+                sh = h.get("sharpe")
+                linhas.append(f"  - {h['hipotese'][:70] if h.get('hipotese') else '(sem hipotese)'}"
+                              f" -> " + (f"Sharpe OOS {sh:+.2f}" if sh is not None else "falhou"))
+        else:
+            linhas.append("Ainda nao ha ensaios concluidos.")
+
+        pendentes = self.estado.por_decidir()
+        if pendentes:
+            linhas.append(f"A aguardar decisao dele: {len(pendentes)} "
+                          f"({', '.join(p['id'] for p in pendentes[:3])})")
+        return "\n".join(linhas)
 
     # -- tarefas ---------------------------------------------------------
     def tratar_tarefa(self, tarefa) -> int:
@@ -2044,8 +2151,14 @@ class Worker:
 
 AJUDA = """*Orquestrador de backtest*
 
-Manda-me uma tarefa em texto normal, por exemplo:
-_reduzir o drawdown sem perder mais de 10% de retorno_
+Fala comigo em texto normal — pergunta, discute, conta-me o que te incomoda:
+
+_o drawdown esta muito alto, o que achas?_
+_porque e que o ultimo ensaio chumbou?_
+_quantos ensaios ja gastei?_
+
+Quando fizer sentido, eu proponho uma atividade e tu confirmas com um botao.
+Para mandar fazer diretamente, sem discussao: `/tarefa <o que queres>`
 
 *Comandos*
 /estado — estudo atual, fila, ensaios gastos
@@ -2221,8 +2334,7 @@ class Bot:
 
     def _texto(self, chat, texto):
         if not texto.startswith("/"):
-            tid = self.estado.nova_tarefa(chat, texto)
-            return self._resp(chat, f"📥 Tarefa aceite: `{tid}`\nVou pensar e enfileirar ensaios.")
+            return self._conversar(chat, texto)
         cmd, _, arg = texto.partition(" ")
         cmd, arg = cmd.lstrip("/").split("@")[0].lower(), arg.strip()
 
@@ -2255,6 +2367,31 @@ class Bot:
                              "O ensaio que ja estava a correr vai ate ao fim.")
         else:
             self._resp(chat, f"Nao conheco /{cmd}. Manda /ajuda.")
+
+    def _conversar(self, chat, texto):
+        """Texto normal e conversa, nao ordem.
+
+        Antes, qualquer mensagem virava uma tarefa e ia direta para a fila —
+        incluindo perguntas. Agora perguntar e perguntar; para mandar fazer, ou
+        confirmas a proposta dele, ou usas /tarefa.
+        """
+        try:
+            saida = self.orq.agentes.conversar(texto, self.orq.resumo_para_conversa())
+        except ErroAgente as exc:
+            return self._resp(chat, f"⚠️ Nao consegui responder: {exc}\n\n"
+                                    "Para mandar fazer alguma coisa sem passar por mim: "
+                                    "/tarefa <o que queres>")
+        tarefa = saida.get("tarefa")
+        if not tarefa:
+            return self._resp(chat, saida["resposta"])
+
+        # A proposta nao cabe no callback_data (64 bytes), por isso fica guardada.
+        ref = novo_id("prop")
+        self.estado.kv_gravar(f"proposta:{ref}", tarefa)
+        self._resp(chat, f"{saida['resposta']}\n\n*Proponho:* _{tarefa}_",
+                   {"inline_keyboard": [[
+                       {"text": "✅ Faz isso", "callback_data": f"tp:{ref}"},
+                       {"text": "❌ Agora nao", "callback_data": f"tx:{ref}"}]]})
 
     def _estado(self, chat):
         est = self.estado.estudo_aberto()
@@ -2362,6 +2499,16 @@ class Bot:
         elif acao == "hx":
             self.tg.responder_botao(cb_id, "Cancelado.")
             self.tg.tirar_botoes(chat, msg_id)
+        elif acao == "tp":
+            tarefa = self.estado.kv_ler(f"proposta:{eid}")
+            self.tg.responder_botao(cb_id, "Vou tratar disso." if tarefa else "Proposta perdida.")
+            self.tg.tirar_botoes(chat, msg_id)
+            if tarefa:
+                tid = self.estado.nova_tarefa(chat, tarefa)
+                self._resp(chat, f"📥 Na fila: `{tid}`\n_{tarefa}_")
+        elif acao == "tx":
+            self.tg.responder_botao(cb_id, "Fica para depois.")
+            self.tg.tirar_botoes(chat, msg_id)
         elif acao == "hc":
             self.tg.responder_botao(cb_id, "A correr o holdout...")
             self.tg.tirar_botoes(chat, msg_id)
@@ -2422,6 +2569,9 @@ def doctor() -> int:
         erro(f"PROJETO — {problema_caminho}")
     elif not p.is_dir():
         erro(f"PROJETO nao existe: {p}")
+    elif e_repo_git(p) and not tem_commits(p):
+        erro(f"{p} e repositorio git mas nao tem commits. "
+             'Corre:  git add -A && git commit -m "inicial"')
     elif not e_repo_git(p):
         erro(f"{p} nao e repositorio git (faz `git init` + commit)")
     else:
@@ -3067,8 +3217,18 @@ def pronto_para_arrancar() -> list[str]:
     elif not projeto.is_dir():
         faltas.append(f"PROJETO — a pasta {PROJETO} nao existe")
     elif not e_repo_git(projeto):
-        faltas.append(f"PROJETO — {PROJETO} tem de ser um repositorio git "
-                      f'(cd para la e corre: git init && git add -A && git commit -m inicial)')
+        faltas.append(f"PROJETO — {PROJETO} tem de ser um repositorio git.\n"
+                      f'     cd "{PROJETO}"\n'
+                      f"     git init\n"
+                      f"     git add -A\n"
+                      f'     git commit -m "inicial"')
+    elif not tem_commits(projeto):
+        faltas.append(f"PROJETO — {PROJETO} e um repositorio git mas nao tem "
+                      f"nenhum commit.\n"
+                      f"     Sem um commit nao ha HEAD, e sem HEAD nao ha worktree.\n"
+                      f'     cd "{PROJETO}"\n'
+                      f"     git add -A\n"
+                      f'     git commit -m "inicial"')
     if MODO == "code" and not FICHEIROS_EDITAVEIS:
         faltas.append("FICHEIROS_EDITAVEIS — sem lista branca o agente podia reescrever "
                       "o codigo que calcula as metricas")
