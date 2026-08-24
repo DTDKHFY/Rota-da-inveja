@@ -176,12 +176,16 @@ AUTO_APLICAR_SOZINHO = False
 # --- Onde guardar o estado -------------------------------------------------
 BASE = Path(__file__).resolve().parent
 BD = BASE / "orq.db"
-# Dentro do projeto, para poderes ver o que ele esta a fazer. Fica em `.orq/`,
-# que e acrescentado ao teu .gitignore no arranque — assim nao te enche o
-# `git status` nem e apanhado por um `git add -A` distraido.
-# (Ja estiveram no Temp do sistema; a poupanca nao compensava teres de procurar
-# numa pasta escondida sempre que algo corria mal.)
-WORKTREES = BASE / ".orq" / "worktrees"
+
+# AO LADO do projeto, nao dentro. Ficas a ve-los no explorador, mas o git nao
+# tem de lidar com uma copia do repositorio dentro do proprio repositorio — que
+# e o que fazia o `git worktree add` demorar minutos e acabar em timeout.
+WORKTREES = BASE.parent / f"{BASE.name} - orq" / "worktrees"
+
+# Quanto tempo os comandos git podem demorar. Se tiveres muitos dados
+# versionados, cada worktree tem de os materializar e isto precisa de subir —
+# mas o melhor e nao versionar dados (ve o aviso do `doctor`).
+TIMEOUT_GIT = 600
 
 # ===========================================================================
 #  fim da configuracao
@@ -1700,9 +1704,10 @@ def dividir_comando(comando: str) -> list[str]:
     return shlex.split(comando)
 
 
-def git(repo, *args, check=True):
+def git(repo, *args, check=True, timeout=None):
     return subprocess.run(["git", "-C", str(repo), *args],
-                          capture_output=True, text=True, check=check, timeout=120)
+                          capture_output=True, text=True, check=check,
+                          timeout=timeout or TIMEOUT_GIT)
 
 
 def raiz_git(caminho) -> Path | None:
@@ -1725,6 +1730,33 @@ def tem_commits(caminho) -> bool:
         return git(caminho, "rev-parse", "--verify", "HEAD", check=False).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def ficheiros_pesados(repo, minimo_bytes: int = 5_000_000) -> list[tuple[str, int]]:
+    """Ficheiros versionados grandes, do maior para o mais pequeno.
+
+    Sao a causa habitual de um worktree lento: cada ensaio tem de os
+    materializar. Dados de mercado nao pertencem ao git — pertencem ao disco,
+    ligados por atalho.
+    """
+    try:
+        r = git(repo, "ls-files", check=False, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    pesados = []
+    raiz = Path(repo)
+    for rel in r.stdout.splitlines():
+        if not rel:
+            continue
+        try:
+            tamanho = (raiz / rel).stat().st_size
+        except OSError:
+            continue
+        if tamanho >= minimo_bytes:
+            pesados.append((rel, tamanho))
+    return sorted(pesados, key=lambda x: -x[1])
 
 
 def e_repo_git(caminho) -> bool:
@@ -1817,6 +1849,22 @@ class Sandbox:
             git(self.projeto, "worktree", "add", "--detach", str(self.raiz), "HEAD")
         except subprocess.CalledProcessError as e:
             raise ErroSandbox(f"git worktree add falhou: {e.stderr.strip()}") from e
+        except subprocess.TimeoutExpired as e:
+            pesados = ficheiros_pesados(self.projeto)
+            detalhe = ""
+            if pesados:
+                total = sum(t for _, t in pesados) / 1e6
+                detalhe = ("\n\nO mais provavel: tens dados versionados no git, e cada "
+                           f"ensaio tem de os copiar. Os maiores ({total:.0f} MB no total):\n"
+                           + "\n".join(f"  {t/1e6:7.1f} MB  {f}" for f, t in pesados[:5])
+                           + "\n\nTira-os do git (ficam no disco na mesma):\n"
+                           + "\n".join(f'  git rm --cached -r "{f.split("/")[0]}"'
+                                       for f in {p.split("/")[0] for p, _ in pesados[:3]})
+                           + "\n  e acrescenta essa pasta ao .gitignore.\n"
+                           "Depois poe o nome dela em PASTAS_LIGADAS: eu ligo-a por "
+                           "atalho a cada ensaio, sem copiar nada.")
+            raise ErroSandbox(
+                f"o `git worktree add` passou de {TIMEOUT_GIT}s.{detalhe}") from e
         self.criado = True
         # Symlink e nao copia: um worktree por ensaio a copiar 4 GB de candles
         # enche o disco ao decimo ensaio.
@@ -3827,6 +3875,23 @@ def doctor() -> int:
         aviso("nao percebi que ficheiro o COMANDO_BACKTEST manda correr — "
               "confere-o a mao")
 
+    if p.is_dir() and e_repo_git(p):
+        pesados = ficheiros_pesados(p)
+        if pesados:
+            total = sum(t for _, t in pesados) / 1e6
+            erro(f"tens {total:.0f} MB de dados versionados no git. Cada ensaio "
+                 f"tem de os copiar para o worktree, e isso vai dar timeout.")
+            for f, t in pesados[:4]:
+                print(f"         {t/1e6:7.1f} MB  {f}")
+            pastas = sorted({f.split("/")[0] for f, _ in pesados if "/" in f})
+            print("      Tira-os do git (ficam no disco na mesma):")
+            for pasta in pastas[:3] or ["<ficheiro>"]:
+                print(f'         git rm --cached -r "{pasta}"')
+            print("      Acrescenta ao .gitignore e poe o nome em PASTAS_LIGADAS —")
+            print("      eu ligo-as por atalho a cada ensaio, sem copiar nada.")
+        else:
+            ok("nao ha dados pesados versionados")
+
     print("\nIsolamento")
     if BACKTEST_COM_REDE:
         aviso("BACKTEST_COM_REDE = True — o backtest tem acesso a rede")
@@ -4542,6 +4607,37 @@ def diagnosticar_caminho(caminho: str) -> str | None:
             f"     ou usa barras normais:       PROJETO = \"C:/...\"")
 
 
+def tentar_arranjar_comando() -> str | None:
+    """Se der para descobrir o script certo, arranja em vez de voltar a queixar-se.
+
+    A alternativa era o que estava a acontecer: a mesma mensagem a repetir-se a
+    cada arranque, porque quem carrega em Run no editor corre sempre a mesma
+    coisa e nunca chega ao comando que eu mandava escrever. Uma mensagem que se
+    repete sem nada mudar nao e um aviso — e ruido.
+    """
+    projeto = Path(PROJETO)
+    if not projeto.is_dir():
+        return None
+    entrada, comando = _detetar_entrada(projeto)
+    if not entrada or not comando or "FALTAM" in comando:
+        return None      # sem certeza, e melhor perguntar
+
+    origem = Path(__file__)
+    try:
+        texto = origem.read_text(encoding="utf-8")
+        origem.with_suffix(".py.bak").write_text(texto, encoding="utf-8")
+        novo, ok = _substituir_constante(texto, "COMANDO_BACKTEST", f'"{comando}"')
+        if not ok:
+            return None
+        origem.write_text(novo, encoding="utf-8")
+    except OSError:
+        return None
+
+    global COMANDO_BACKTEST
+    COMANDO_BACKTEST = comando
+    return comando
+
+
 def garantir_gitignore():
     """Acrescenta .orq/ ao .gitignore do projeto, se ainda la nao estiver.
 
@@ -4596,6 +4692,12 @@ def pronto_para_arrancar() -> list[str]:
     script = script_do_comando(COMANDO_BACKTEST)
     if script and projeto.is_dir() and not (projeto / script).exists():
         existentes = sorted(c.name for c in projeto.glob("*.py"))[:6]
+        duplos = [c for c in existentes if c.lower().endswith(".py.py")]
+        if duplos:
+            faltas.append(
+                f"Extensao a dobrar: {', '.join(duplos)}\n"
+                "     Isto acontece ao renomear no Explorador do Windows, que esconde\n"
+                "     as extensoes e acrescenta .py outra vez. Tira o .py a mais.")
         faltas.append(
             f"COMANDO_BACKTEST — o ficheiro `{script}` nao existe em {PROJETO}.\n"
             f"     Provavelmente ficou o exemplo que veio comigo.\n"
@@ -4659,6 +4761,14 @@ def main(argv=None) -> int:
 
     garantir_gitignore()
     faltas = pronto_para_arrancar()
+    if faltas and any("COMANDO_BACKTEST" in f for f in faltas):
+        arranjado = tentar_arranjar_comando()
+        if arranjado:
+            print(f"\n🔧 O COMANDO_BACKTEST apontava para um ficheiro que nao existe.\n"
+                  f"   Encontrei o teu script e corrigi sozinho:\n\n"
+                  f"   {arranjado}\n\n"
+                  f"   (copia do ficheiro anterior em {Path(__file__).stem}.py.bak)\n")
+            faltas = pronto_para_arrancar()
     if faltas:
         return avisar_o_que_falta(faltas)
     return correr(com_bot=a.comando in ("correr", "bot"),
