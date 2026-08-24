@@ -77,8 +77,11 @@ TENTATIVAS_JSON = 3
 # separacao arnes/estrategia ja feita, em ../projeto-backtest/
 PROJETO = "/caminho/para/o/teu/backtest"
 
-# Placeholders disponiveis: {params} {saida} {inicio} {fim}
-COMANDO_BACKTEST = "python3 run_backtest.py --params {params} --start {inicio} --end {fim} --out {saida}"
+# Placeholders: {python} {params} {saida} {inicio} {fim}
+# {python} e o interpretador que esta a correr este ficheiro. Usa-o em vez de
+# escreveres "python": no Windows a palavra solta apanha o atalho da Microsoft
+# Store, que devolve o erro 9009 e nao corre nada.
+COMANDO_BACKTEST = "{python} run_backtest.py --params {params} --start {inicio} --end {fim} --out {saida}"
 
 # Testes do teu projeto. Correm depois de alterar o codigo e ANTES do backtest:
 # um erro de sintaxe apanhado em 2s poupa 40 minutos. Poe "" se nao tiveres.
@@ -134,6 +137,23 @@ MAX_GAP_TREINO_VALIDACAO = 1.0
 
 # Teto do contexto enviado ao modelo, em caracteres.
 LIMITE_CONTEXTO = 60_000
+
+# --- Piloto automatico -----------------------------------------------------
+# A cerca dentro da qual ele decide sozinho. Estes limites sao verificados em
+# codigo, nao pedidos ao modelo: ele nao os pode ultrapassar por muito que ache
+# que devia. Tu defines a cerca; ele decide livremente la dentro.
+
+AUTO_MAX_ENSAIOS = 20          # ensaios que uma corrida autonoma pode gastar
+AUTO_MAX_HORAS = 6.0           # tempo de parede maximo
+AUTO_MAX_RONDAS = 8            # rondas de pesquisa -> ensaios -> reflexao
+AUTO_ENSAIOS_POR_RONDA = 3     # quantas hipoteses testa de cada vez
+AUTO_PARAR_SEM_PROGRESSO = 3   # rondas seguidas sem nada passar o gate
+
+# Se True, uma proposta que passe o gate e escrita no ramo sem te perguntar.
+# Continua a NAO haver merge: o ramo fica a espera de ti. Deixo em False porque
+# o gate deteta ruido estatistico, nao deteta uma alteracao que faz sentido nos
+# numeros e nao faz sentido nenhum no mercado — isso so tu ves.
+AUTO_APLICAR_SOZINHO = False
 
 # --- Onde guardar o estado -------------------------------------------------
 BASE = Path(__file__).resolve().parent
@@ -456,7 +476,8 @@ CREATE TABLE IF NOT EXISTS tarefas (
     id TEXT PRIMARY KEY, chat INTEGER NOT NULL, texto TEXT NOT NULL,
     estado TEXT NOT NULL DEFAULT 'fila', criado REAL NOT NULL,
     inicio REAL, fim REAL, pulso REAL, erro TEXT,
-    lote INTEGER NOT NULL DEFAULT 0, silencioso INTEGER NOT NULL DEFAULT 0);
+    lote INTEGER NOT NULL DEFAULT 0, silencioso INTEGER NOT NULL DEFAULT 0,
+    auto INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS ensaios (
     id TEXT PRIMARY KEY, estudo TEXT NOT NULL, tarefa TEXT, hipotese TEXT,
     params TEXT NOT NULL, alteracao TEXT,
@@ -515,7 +536,8 @@ class Estado:
         """
         colunas = {r["name"] for r in self.c.execute("PRAGMA table_info(tarefas)")}
         for nome, definicao in (("lote", "INTEGER NOT NULL DEFAULT 0"),
-                                ("silencioso", "INTEGER NOT NULL DEFAULT 0")):
+                                ("silencioso", "INTEGER NOT NULL DEFAULT 0"),
+                                ("auto", "INTEGER NOT NULL DEFAULT 0")):
             if nome not in colunas:
                 self.c.execute(f"ALTER TABLE tarefas ADD COLUMN {nome} {definicao}")
 
@@ -605,11 +627,11 @@ class Estado:
         return self.c
 
     def nova_tarefa(self, chat: int, texto: str, lote: int = 0,
-                    silencioso: bool = False) -> str:
+                    silencioso: bool = False, auto: bool = False) -> str:
         tid = novo_id("tar")
-        self.c.execute("INSERT INTO tarefas (id, chat, texto, criado, lote, silencioso) "
-                       "VALUES (?,?,?,?,?,?)",
-                       (tid, chat, texto, time.time(), lote, int(silencioso)))
+        self.c.execute("INSERT INTO tarefas (id, chat, texto, criado, lote, silencioso, auto) "
+                       "VALUES (?,?,?,?,?,?,?)",
+                       (tid, chat, texto, time.time(), lote, int(silencioso), int(auto)))
         self.evento("tarefa.fila", tid, texto=texto)
         return tid
 
@@ -1310,6 +1332,30 @@ def ambiente_limpo() -> dict:
     }
 
 
+def interpretador() -> str:
+    """O Python que esta a correr este ficheiro.
+
+    No Windows, `python` sozinho resolve muitas vezes para o atalho da
+    Microsoft Store, que nao e um interpretador — e um stub que devolve o codigo
+    9009 e manda instalar. Usar o caminho absoluto do interpretador atual evita
+    isso e, de bonus, respeita o ambiente virtual de quem usa um.
+    """
+    return sys.executable or "python"
+
+
+def resolver_python(comando: str) -> str:
+    """Troca o `python` do inicio do comando pelo interpretador real.
+
+    Aceita tambem o marcador {python}, para quem quiser ser explicito.
+    """
+    comando = comando.replace("{python}", citar(interpretador()))
+    partes = comando.split(maxsplit=1)
+    if partes and partes[0].lower() in ("python", "python3", "py", "python.exe"):
+        resto = partes[1] if len(partes) > 1 else ""
+        return f"{citar(interpretador())} {resto}".strip()
+    return comando
+
+
 def citar(caminho: str) -> str:
     """Cita um caminho para entrar num comando, conforme o sistema.
 
@@ -1495,7 +1541,7 @@ class Sandbox:
         """Sem shell, de proposito: `&&` e `|` nao funcionam. Usa um script."""
         if not self.criado:
             raise ErroSandbox("sandbox nao criado")
-        argv = dividir_comando(comando)
+        argv = dividir_comando(resolver_python(comando))
         if not argv:
             raise ErroSandbox("comando vazio")
         prefixo = () if BACKTEST_COM_REDE else _prefixo_sem_rede()
@@ -1512,6 +1558,12 @@ class Sandbox:
         except FileNotFoundError as e:
             raise ErroSandbox(f"comando nao encontrado: {argv[0]}") from e
         junto = p.stdout + (("\n[stderr]\n" + p.stderr) if p.stderr else "")
+        if p.returncode == 9009 or "was not found" in (p.stderr or ""):
+            junto += (
+                "\n\n[orq] O codigo 9009 no Windows quer dizer 'comando nao encontrado'.\n"
+                f"     O interpretador que eu uso e: {interpretador()}\n"
+                "     Se o COMANDO_BACKTEST invoca outro programa que nao esta no PATH,\n"
+                "     poe o caminho completo dele.")
         return Resultado(p.returncode == 0, p.returncode, cortar(junto), time.monotonic() - t0)
 
     def ficheiros_versionados(self) -> list[str]:
@@ -1579,7 +1631,10 @@ class Sandbox:
         f_params.write_text(json.dumps(params, indent=2, ensure_ascii=False, sort_keys=True),
                             encoding="utf-8")
         f_saida.unlink(missing_ok=True)
+        # `python` entra aqui e nao so no `resolver_python` porque o .format()
+        # corre primeiro e rebentaria com um marcador que nao conhece.
         r = self.correr(COMANDO_BACKTEST.format(
+            python=citar(interpretador()),
             params=citar(str(f_params)), saida=citar(str(f_saida)),
             inicio=inicio, fim=fim))
         if not r.ok:
@@ -1625,6 +1680,33 @@ Formato exato:
 {"hipoteses": [{"nome": "...", "raciocinio": "...", "direcao": "aumentar"}]}
 
 "direcao" so pode ser: "aumentar", "diminuir" ou "explorar".
+"""
+
+SISTEMA_REFLEXAO = """Decides o que fazer a seguir numa investigacao de backtest.
+
+Acabaste uma ronda de ensaios. Recebes o que deu, o que ja tinhas tentado antes,
+e quanto orcamento resta. Decides UMA de tres coisas:
+
+  "continuar"      a direcao atual esta a dar sinais; vale a pena insistir
+  "mudar_direcao"  esta linha esgotou-se; ha outra coisa que faz mais sentido
+  "parar"          nao vale a pena gastar mais ensaios
+
+Quando parar — e isto e a parte que exige coragem:
+- Se varias rondas seguidas nao produziram nada, parar e a decisao certa.
+  Continuar a procurar so porque ha orcamento e como continuar a atirar dados
+  ate sair o numero que querias.
+- Se ja encontraste algo que passou o gate, parar e melhor do que procurar mais:
+  cada ensaio adicional aperta o Deflated Sharpe exigido, e podes acabar por
+  invalidar o que ja tinhas.
+- Se os resultados sao todos maus da mesma maneira, o problema pode nao estar
+  nos parametros nem no codigo — pode estar na premissa. Di-lo.
+
+Nao inventes numeros. Usa so os que te dou.
+
+Formato exato:
+{"decisao": "continuar", "raciocinio": "porque", "novo_objetivo": null}
+{"decisao": "mudar_direcao", "raciocinio": "porque", "novo_objetivo": "o que investigar agora"}
+{"decisao": "parar", "raciocinio": "porque paras"}
 """
 
 SISTEMA_LICAO = """Destilas o que se aprendeu com um ensaio de backtest, para
@@ -1814,6 +1896,33 @@ class Agentes:
             return {"params": params_aleatorios(rng), "justificacao":
                     "o modelo nao devolveu proposta valida; usei amostragem nos limites",
                     "recurso": True}
+
+    # -- reflexao entre rondas ---------------------------------------------
+    def refletir(self, objetivo: str, resumo_ronda: str, historico: str,
+                 orcamento: str) -> dict:
+        """O que fazer a seguir. E aqui que ele decide parar sozinho."""
+        prompt = (f"OBJETIVO ATUAL:\n{objetivo}\n\n"
+                  f"RONDA QUE ACABOU:\n{resumo_ronda}\n\n"
+                  f"HISTORICO DO ESTUDO:\n{historico}\n\n"
+                  f"ORCAMENTO:\n{orcamento}\n\nDecide.")
+
+        def validar(dados):
+            if not isinstance(dados, dict) or "decisao" not in dados:
+                raise ValueError("falta a chave `decisao`")
+            d = str(dados["decisao"]).lower().strip()
+            if d not in ("continuar", "mudar_direcao", "parar"):
+                raise ValueError(f"decisao {d!r} invalida: usa continuar, "
+                                 "mudar_direcao ou parar")
+            novo = dados.get("novo_objetivo")
+            if d == "mudar_direcao" and not (isinstance(novo, str) and novo.strip()):
+                raise ValueError("`mudar_direcao` exige `novo_objetivo` com texto")
+            return {"decisao": d,
+                    "raciocinio": str(dados.get("raciocinio", ""))[:600],
+                    "novo_objetivo": novo.strip()[:300] if isinstance(novo, str) and novo.strip() else None}
+
+        return correr_agente(self.llm, papel="reflexao", modelo=MODELO_PESQUISA,
+                             sistema=SISTEMA_REFLEXAO, prompt=prompt, validar=validar,
+                             tentativas=TENTATIVAS_JSON)
 
     # -- destilar licoes ---------------------------------------------------
     def destilar_licao(self, hipotese: str, veredito, treino, validacao) -> str | None:
@@ -2178,7 +2287,8 @@ class Orquestrador:
         if not ensaio["tarefa"]:
             return False
         t = self.estado.tarefa(ensaio["tarefa"])
-        return bool(t and t["silencioso"])
+        # O piloto manda resumos por ronda; os chumbos um a um seriam ruido.
+        return bool(t and (t["silencioso"] or t["auto"]))
 
     def correr_ensaio(self, ensaio) -> bool:
         eid, params = ensaio["id"], json.loads(ensaio["params"])
@@ -2246,7 +2356,10 @@ class Orquestrador:
                 f"Sharpe OOS {validacao.sharpe_anual:.2f}, DSR {veredito.dsr:.3f}")
 
         # Ultimo do lote: um relatorio so, em vez de uma interrupcao por ensaio.
-        if ensaio["tarefa"] and self.estado.lote_por_terminar(ensaio["tarefa"]) == 0:
+        # (O piloto tem o seu proprio relatorio, no fim de todas as rondas.)
+        tarefa_row = self.estado.tarefa(ensaio["tarefa"]) if ensaio["tarefa"] else None
+        if (tarefa_row and not tarefa_row["auto"]
+                and self.estado.lote_por_terminar(ensaio["tarefa"]) == 0):
             self._relatorio_do_lote(ensaio["tarefa"])
         return True
 
@@ -2308,6 +2421,183 @@ class Orquestrador:
         self.estado.acabar_ensaio(eid, estado="falhou", erro=erro, saida=saida)
         self.aviso.enviar(f"⚠️ `{eid}` falhou: {erro}")
         return False
+
+    # -- piloto automatico -------------------------------------------------
+    def pilotar(self, tarefa, parar_evento=None) -> int:
+        """Corre sozinho: pesquisa, implementa, testa, reflete, decide.
+
+        A cerca (AUTO_*) e verificada aqui, em codigo. O modelo decide o que
+        investigar e quando parar; nao decide quanto orcamento pode gastar nem
+        quanto tempo pode levar. Autonomia dentro de limites e autonomia; sem
+        limites e so uma maneira lenta de esgotar o orcamento.
+
+        Devolve o numero de ensaios feitos.
+        """
+        objetivo = tarefa["texto"]
+        estudo = self.garantir_estudo(objetivo)
+        eid = estudo["id"]
+        inicio = time.monotonic()
+        feitos = 0
+        rondas_sem_nada = 0
+        aprovados: list[str] = []
+        historia: list[str] = []
+
+        def deve_parar() -> str | None:
+            """Os limites que ele nao pode ultrapassar."""
+            if parar_evento is not None and parar_evento.is_set():
+                return "mandaste parar"
+            if self.estado.kv_ler("auto_parar") == "1":
+                return "mandaste parar"
+            if feitos >= AUTO_MAX_ENSAIOS:
+                return f"cheguei ao limite de {AUTO_MAX_ENSAIOS} ensaios desta corrida"
+            horas = (time.monotonic() - inicio) / 3600
+            if horas >= AUTO_MAX_HORAS:
+                return f"passaram {horas:.1f}h, o limite era {AUTO_MAX_HORAS}h"
+            restante = MAX_ENSAIOS_POR_ESTUDO - self.estado.n_ensaios(eid)
+            if restante <= 0:
+                return "o orcamento do estudo esgotou"
+            if rondas_sem_nada >= AUTO_PARAR_SEM_PROGRESSO:
+                return (f"{rondas_sem_nada} rondas seguidas sem nada passar o gate — "
+                        "insistir a partir daqui e procurar ruido")
+            return None
+
+        # Sem baseline nao ha com que comparar. Isto e ele a decidir um comando.
+        if not self._baseline(eid):
+            self.aviso.enviar("🤖 Ainda nao havia baseline. Vou medi-la primeiro.")
+            try:
+                base = self.medir_baseline(eid)
+                self.aviso.enviar(f"📏 Baseline: Sharpe {base.sharpe_anual:+.2f}, "
+                                  f"drawdown {base.drawdown:.1%}, {base.trades} trades")
+            except (ErroSandbox, ValueError) as exc:
+                self.aviso.enviar(f"⚠️ Sem baseline nao posso comparar nada: {exc}")
+                return 0
+
+        self.estado.kv_gravar("auto_parar", "0")
+        self.aviso.enviar(
+            f"🤖 *Piloto automatico ligado*\n_{objetivo}_\n\n"
+            f"Limites: {AUTO_MAX_ENSAIOS} ensaios, {AUTO_MAX_HORAS}h, "
+            f"{AUTO_MAX_RONDAS} rondas.\n"
+            f"Paro sozinho se {AUTO_PARAR_SEM_PROGRESSO} rondas seguidas nao derem nada.\n"
+            f"{'Aplico sozinho o que passar.' if AUTO_APLICAR_SOZINHO else 'Peco-te aprovacao para tudo o que passar.'}\n\n"
+            f"/parar interrompe.")
+
+        for ronda in range(1, AUTO_MAX_RONDAS + 1):
+            motivo = deve_parar()
+            if motivo:
+                return self._fim_do_piloto(objetivo, feitos, aprovados, historia, motivo)
+
+            quantos = max(1, min(AUTO_ENSAIOS_POR_RONDA,
+                                 AUTO_MAX_ENSAIOS - feitos,
+                                 MAX_ENSAIOS_POR_ESTUDO - self.estado.n_ensaios(eid)))
+            try:
+                hipoteses = self.agentes.pesquisar(objetivo, self._historico(eid),
+                                                  n=quantos, memoria=self.memoria())
+            except ErroAgente as exc:
+                return self._fim_do_piloto(objetivo, feitos, aprovados, historia,
+                                           f"o agente de pesquisa falhou: {exc}")
+
+            if MODO == "code":
+                n, _ = self._fila_codigo(eid, tarefa, hipoteses)
+            else:
+                n, _ = self._fila_params(eid, tarefa, hipoteses, self._historico(eid))
+            if n == 0:
+                rondas_sem_nada += 1
+                historia.append(f"Ronda {ronda}: nenhuma hipotese deu proposta aplicavel.")
+                continue
+
+            self.aviso.enviar(f"🤖 Ronda {ronda}: {n} ensaios — "
+                              + "; ".join(h["nome"] for h in hipoteses[:n]))
+
+            passou_alguma = False
+            resumo_ronda = []
+            for ensaio in self.estado.ensaios(eid, 50):
+                if ensaio["estado"] != "fila" or ensaio["tarefa"] != tarefa["id"]:
+                    continue
+                if deve_parar():
+                    break
+                reclamado = self.estado.reclamar_ensaio()
+                if reclamado is None:
+                    break
+                self.correr_ensaio(reclamado)
+                feitos += 1
+                depois = self.estado.ensaio(reclamado["id"])
+                v = json.loads(depois["veredito"]) if depois["veredito"] else {}
+                m = json.loads(depois["metricas"]) if depois["metricas"] else {}
+                sh = m.get("validacao", {}).get("sharpe_anual")
+                if v.get("passou"):
+                    passou_alguma = True
+                    aprovados.append(depois["id"])
+                    if AUTO_APLICAR_SOZINHO:
+                        self.estado.aprovar(depois["id"], "aprovado")
+                        try:
+                            ramo = self.aplicar_aprovado(depois["id"])
+                            self.aviso.enviar(f"🤖 Apliquei `{depois['id']}` no ramo `{ramo}`. "
+                                              "Nao fiz merge — o ramo espera por ti.")
+                        except (ErroSandbox, ValueError) as exc:
+                            self.aviso.enviar(f"⚠️ Passou mas nao consegui aplicar: {exc}")
+                resumo_ronda.append(
+                    f"{(depois['hipotese'] or '?')[:50]} -> "
+                    + (f"Sharpe OOS {sh:+.2f}, " if sh is not None else "")
+                    + ("PASSOU" if v.get("passou") else
+                       "chumbou em " + ", ".join(c["nome"] for c in v.get("criterios", [])
+                                                 if not c["passou"])))
+
+            rondas_sem_nada = 0 if passou_alguma else rondas_sem_nada + 1
+            historia.append(f"Ronda {ronda}: " + " | ".join(resumo_ronda))
+
+            motivo = deve_parar()
+            if motivo:
+                return self._fim_do_piloto(objetivo, feitos, aprovados, historia, motivo)
+
+            # A decisao dele.
+            restante = min(AUTO_MAX_ENSAIOS - feitos,
+                           MAX_ENSAIOS_POR_ESTUDO - self.estado.n_ensaios(eid))
+            try:
+                escolha = self.agentes.refletir(
+                    objetivo, "\n".join(resumo_ronda) or "(nada correu)",
+                    "\n".join(historia[-5:]),
+                    f"restam {restante} ensaios nesta corrida; "
+                    f"{self.estado.n_ensaios(eid)}/{MAX_ENSAIOS_POR_ESTUDO} gastos no estudo; "
+                    f"ronda {ronda} de {AUTO_MAX_RONDAS}")
+            except ErroAgente:
+                escolha = {"decisao": "continuar", "raciocinio": "", "novo_objetivo": None}
+
+            if escolha["decisao"] == "parar":
+                return self._fim_do_piloto(objetivo, feitos, aprovados, historia,
+                                           f"decidi parar: {escolha['raciocinio']}")
+            if escolha["decisao"] == "mudar_direcao" and escolha["novo_objetivo"]:
+                objetivo = escolha["novo_objetivo"]
+                self.aviso.enviar(f"🤖 Mudei de direcao: _{objetivo}_\n"
+                                  f"_{escolha['raciocinio']}_")
+
+        return self._fim_do_piloto(objetivo, feitos, aprovados, historia,
+                                   f"fiz as {AUTO_MAX_RONDAS} rondas que me deixaste")
+
+    def _fim_do_piloto(self, objetivo, feitos, aprovados, historia, motivo) -> int:
+        linhas = [f"🤖 *Piloto parado* — {feitos} ensaios",
+                  f"Motivo: {motivo}", ""]
+        if aprovados:
+            linhas.append(f"🟢 *Passaram no gate: {len(aprovados)}*")
+            linhas += [f"  `{a}`" for a in aprovados]
+            if not AUTO_APLICAR_SOZINHO:
+                linhas.append("  _a espera da tua decisao_")
+        else:
+            linhas.append("Nenhuma proposta passou no gate.")
+            linhas.append("_Isso e informacao, nao fracasso: significa que o que "
+                          "tentei nao aguentou a validacao out-of-sample._")
+        linhas.append("\n*O que fui fazendo*")
+        linhas += [f"  {h}" for h in historia[-6:]]
+
+        est = self.estado.estudo_aberto()
+        if est:
+            usados = self.estado.n_ensaios(est["id"])
+            linhas.append(f"\nOrcamento: {usados}/{MAX_ENSAIOS_POR_ESTUDO}")
+            if usados > MAX_ENSAIOS_POR_ESTUDO * 0.6:
+                linhas.append("_Cada ensaio aperta o Deflated Sharpe exigido ao seguinte. "
+                              "Se ja tens um candidato, procurar mais pode invalida-lo._")
+        self.aviso.enviar("\n".join(linhas))
+        self.estado.kv_gravar("auto_parar", "0")
+        return feitos
 
     # -- baseline e holdout ----------------------------------------------
     def medir_baseline(self, estudo_id: str) -> Janela:
@@ -2409,7 +2699,10 @@ class Worker:
         t = self.estado.reclamar_tarefa()
         if t is not None:
             try:
-                self.orq.tratar_tarefa(t)
+                if t["auto"]:
+                    self.orq.pilotar(t, self.parar)
+                else:
+                    self.orq.tratar_tarefa(t)
                 self.estado.acabar_tarefa(t["id"], "feita")
             except Exception as e:              # o worker nao morre por uma tarefa ma
                 log.exception("tarefa %s rebentou", t["id"])
@@ -2458,6 +2751,9 @@ Para mandar fazer diretamente, sem discussao: `/tarefa <o que queres>`
 /estado — estudo atual, fila, ensaios gastos
 /ensaios — ultimos ensaios e o que deram
 /baseline — mede a estrategia atual (referencia de comparacao)
+/auto <objetivo> — piloto automatico: investigo, testo, decido sozinho quando
+  mudar de direcao ou parar. Os limites estao no topo do ficheiro (AUTO_*).
+/auto parar — interrompe o piloto
 /explorar <n> <objetivo> — corro n ensaios sozinho e mando um relatorio no fim
 /nota <texto> — ensina-me algo que eu nunca teria como saber
 /memoria — o que sei: as tuas notas e as licoes dos ensaios
@@ -2660,6 +2956,8 @@ class Bot:
                 self._resp(chat, self._aviso_holdout(arg), botoes_holdout(arg))
             else:
                 self._resp(chat, "Usa: /holdout <id do ensaio>")
+        elif cmd == "auto":
+            self._auto(chat, arg)
         elif cmd == "explorar":
             self._explorar(chat, arg)
         elif cmd == "nota":
@@ -2677,6 +2975,25 @@ class Bot:
                              "O ensaio que ja estava a correr vai ate ao fim.")
         else:
             self._resp(chat, f"Nao conheco /{cmd}. Manda /ajuda.")
+
+    def _auto(self, chat, arg):
+        """Liga o piloto: ele investiga sozinho ate decidir parar."""
+        if arg.strip().lower() in ("parar", "stop", "off"):
+            self.estado.kv_gravar("auto_parar", "1")
+            return self._resp(chat, "🛑 Vou parar depois do ensaio que esta a correr.")
+        objetivo = arg.strip()
+        if not objetivo:
+            est = self.estado.estudo_aberto()
+            if not est:
+                return self._resp(
+                    chat, "Usa: `/auto <o que queres que eu investigue>`\n\n"
+                    "Eu decido as hipoteses, corro os ensaios, avalio, e decido quando "
+                    "mudar de direcao ou parar. Tu defines os limites no topo do "
+                    "ficheiro (AUTO_*).\n\n"
+                    "`/auto parar` interrompe.")
+            objetivo = est["objetivo"]
+        tid = self.estado.nova_tarefa(chat, objetivo, auto=True)
+        self._resp(chat, f"🤖 Piloto na fila: `{tid}`\n_{objetivo}_")
 
     def _explorar(self, chat, arg):
         """Corre varios ensaios sozinho e manda um relatorio so no fim.
@@ -3117,7 +3434,9 @@ def _detetar_entrada(projeto: Path) -> tuple[Path | None, str | None]:
             em_falta.append(marcador)
 
     rel = entrada.relative_to(projeto).as_posix()
-    comando = f"python {rel} " + " ".join(partes)
+    # {python} em vez de "python": no Windows a palavra solta apanha o atalho da
+    # Microsoft Store, que devolve 9009 e nao corre nada.
+    comando = f"{{python}} {rel} " + " ".join(partes)
     return entrada, (comando if not em_falta else comando + "   # FALTAM: " + " ".join(em_falta))
 
 
