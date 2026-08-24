@@ -2402,7 +2402,10 @@ def doctor() -> int:
 
     print("\nProjeto")
     p = Path(PROJETO)
-    if not p.is_dir():
+    problema_caminho = diagnosticar_caminho(PROJETO)
+    if problema_caminho:
+        erro(f"PROJETO — {problema_caminho}")
+    elif not p.is_dir():
         erro(f"PROJETO nao existe: {p}")
     elif not e_repo_git(p):
         erro(f"{p} nao e repositorio git (faz `git init` + commit)")
@@ -2816,6 +2819,27 @@ def cmd_ver(projeto: Path, editaveis: Sequence[str]) -> int:
 
 
 
+ESCAPES_ACIDENTAIS = {"\t": "\\t", "\n": "\\n", "\r": "\\r",
+                      "\b": "\\b", "\f": "\\f", "\v": "\\v", "\a": "\\a"}
+
+
+def diagnosticar_caminho(caminho: str) -> str | None:
+    """Deteta o erro classico de escrever caminhos do Windows em Python.
+
+    `"C:\\codigo\\teste backtest"` sem o prefixo `r` faz o `\\t` virar um TAB. O
+    caminho resultante nao existe e a mensagem de erro so diz "nao existe", o
+    que manda a pessoa procurar no sitio errado — na pasta, em vez de na linha
+    que a escreveu.
+    """
+    encontrados = [nome for char, nome in ESCAPES_ACIDENTAIS.items() if char in caminho]
+    if not encontrados:
+        return None
+    return (f"o caminho tem caracteres de escape ({', '.join(encontrados)}), o que "
+            f"quer dizer que as barras invertidas foram interpretadas.\n"
+            f"     Poe um `r` antes das aspas:  PROJETO = r\"C:\\...\"\n"
+            f"     ou usa barras normais:       PROJETO = \"C:/...\"")
+
+
 def pronto_para_arrancar() -> list[str]:
     """O que falta configurar. Lista vazia = pode arrancar."""
     faltas = []
@@ -2823,8 +2847,11 @@ def pronto_para_arrancar() -> list[str]:
         faltas.append("TELEGRAM_TOKEN — o token do teu bot (@BotFather no Telegram)")
     if not CHAT_ID:
         faltas.append("CHAT_ID — o teu chat (fala com @userinfobot para o saberes)")
+    problema = diagnosticar_caminho(PROJETO)
     projeto = Path(PROJETO)
-    if not projeto.is_dir():
+    if problema:
+        faltas.append(f"PROJETO — {problema}")
+    elif not projeto.is_dir():
         faltas.append(f"PROJETO — a pasta {PROJETO} nao existe")
     elif not e_repo_git(projeto):
         faltas.append(f"PROJETO — {PROJETO} tem de ser um repositorio git "
