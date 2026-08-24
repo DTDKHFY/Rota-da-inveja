@@ -94,6 +94,9 @@ class TargetConfig:
     # alterar. Tudo o resto — em especial o que corre e mede o backtest — fica
     # fora do alcance dele.
     editable_paths: tuple[str, ...] = ()
+    # Funcoes congeladas: para quando estrategia e metricas partilham
+    # ficheiro e a lista branca de caminhos ja nao protege nada.
+    frozen_functions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -311,6 +314,7 @@ def load_config(path: str | Path | None = None, *, env_path: str | Path | None =
             link_paths=tuple(target_raw.get("link_paths", []) or []),
             params_file=str(target_raw.get("params_file", "params.json")),
             editable_paths=tuple(target_raw.get("editable_paths", []) or []),
+            frozen_functions=tuple(target_raw.get("frozen_functions", []) or []),
         ),
         experiment=ExperimentConfig(
             mode=mode,

@@ -22,6 +22,7 @@ branca (FICHEIROS_EDITAVEIS) impede-o de tocar no que calcula as metricas.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import logging
 import math
@@ -97,6 +98,17 @@ MODO = "code"        # "code" = o agente altera codigo | "params" = so valores
 # calcula. Nao e rebuscado — e o caminho de menor resistencia.
 FICHEIROS_EDITAVEIS = ["estrategia"]   # nunca run_backtest.py nem metricas.py
 MAX_LINHAS_EDICAO = 120              # travao contra reescritas
+
+# Para quando a estrategia e as metricas vivem no MESMO ficheiro — o caso comum
+# em backtests que cresceram organicamente. Aqui a lista branca de ficheiros nao
+# protege nada, porque o ficheiro tem de ser editavel para a estrategia mudar.
+#
+# Estas funcoes ficam congeladas: depois de cada alteracao, o codigo delas e
+# comparado com o original e qualquer diferenca faz a proposta ser recusada. Poe
+# aqui tudo o que calcula ou regista resultados.
+#
+#   FUNCOES_PROTEGIDAS = ["calcular_metricas", "sharpe", "max_drawdown"]
+FUNCOES_PROTEGIDAS: list[str] = []
 
 # Limites dos parametros (usados em MODO="params"; o agente nunca sai daqui)
 PARAMETROS = {
@@ -726,6 +738,11 @@ def caminho_permitido(rel: str, padroes: Sequence[str]) -> bool:
 
 
 def exigir_permitido(rel: str, padroes: Sequence[str]) -> None:
+    # O proprio orquestrador vive muitas vezes dentro do projeto que vigia.
+    # Deixa-lo editavel seria deixar o agente reescrever o gate.
+    if PurePosixPath(rel).name == Path(__file__).name:
+        raise CaminhoProibido(
+            f"`{rel}` e o proprio orquestrador. Nunca podes altera-lo.")
     if not caminho_permitido(rel, padroes):
         raise CaminhoProibido(
             f"`{rel}` nao esta na lista de ficheiros editaveis. So podes alterar: "
@@ -819,6 +836,55 @@ def _pista(conteudo: str, procurado: str) -> str:
     if primeira and primeira.replace(" ", "") in conteudo.replace(" ", ""):
         return " O texto existe mas com espacamento diferente."
     return ""
+
+
+def funcoes_do_ficheiro(codigo: str) -> dict[str, str]:
+    """Nome -> codigo-fonte, para funcoes e classes de topo e de dentro de classes.
+
+    Serve para congelar pedacos de um ficheiro que tem de ser editavel no resto.
+    Comparo o texto do corpo, nao a arvore: uma alteracao que so mude
+    formatacao tambem e uma alteracao, e nao quero discutir com o modelo sobre
+    o que conta como "igual".
+    """
+    try:
+        arvore = ast.parse(codigo)
+    except SyntaxError:
+        return {}
+    saida: dict[str, str] = {}
+    for no in ast.walk(arvore):
+        if isinstance(no, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            try:
+                saida[no.name] = ast.get_source_segment(codigo, no) or ""
+            except (ValueError, TypeError):
+                continue
+    return saida
+
+
+def verificar_funcoes_protegidas(antes: str, depois: str,
+                                 protegidas: Sequence[str]) -> str | None:
+    """Alguma funcao congelada mudou? Devolve a queixa, ou None se esta tudo bem."""
+    if not protegidas:
+        return None
+    f_antes, f_depois = funcoes_do_ficheiro(antes), funcoes_do_ficheiro(depois)
+    alteradas, desaparecidas = [], []
+    for nome in protegidas:
+        if nome not in f_antes:
+            continue                       # nao existe neste ficheiro; nada a proteger
+        if nome not in f_depois:
+            desaparecidas.append(nome)
+        elif f_antes[nome] != f_depois[nome]:
+            alteradas.append(nome)
+    if not alteradas and not desaparecidas:
+        return None
+    queixa = []
+    if alteradas:
+        queixa.append(f"alteraste {', '.join(alteradas)}")
+    if desaparecidas:
+        queixa.append(f"apagaste {', '.join(desaparecidas)}")
+    return (f"{' e '.join(queixa)}. Essas funcoes calculam ou registam resultados "
+            "e estao congeladas — se pudesses mexer nelas, podias melhorar a tua "
+            "propria nota em vez de melhorar a estrategia. Faz a alteracao sem "
+            "lhes tocar.")
 
 
 def tamanho_edicoes(edicoes: list[dict]) -> int:
@@ -1067,6 +1133,11 @@ def propor_alteracao(ficheiros: dict[str, str], hipotese: dict, *,
         if novo == ficheiros[ficheiro]:
             raise ErroEdicao("as edicoes nao mudam nada no ficheiro. Se a hipotese nao "
                              "se consegue implementar aqui, di-lo em `justificacao`.")
+        # Verificado aqui tambem, e nao so ao aplicar: assim o modelo recebe a
+        # queixa e corrige, em vez de gastarmos um ensaio inteiro para descobrir.
+        queixa = verificar_funcoes_protegidas(ficheiros[ficheiro], novo, FUNCOES_PROTEGIDAS)
+        if queixa:
+            raise ErroEdicao(queixa)
 
         return {"ficheiro": ficheiro, "edicoes": edicoes, "conteudo_novo": novo,
                 "linhas": tam, "justificacao": str(dados.get("justificacao", ""))[:400]}
@@ -1404,9 +1475,16 @@ class Sandbox:
             alvo = self.raiz / ficheiro
             if not alvo.is_file():
                 return False, f"`{ficheiro}` nao existe no worktree"
-            novo = aplicar_edicoes(alvo.read_text(encoding="utf-8"), edicoes)
+            antes = alvo.read_text(encoding="utf-8")
+            novo = aplicar_edicoes(antes, edicoes)
         except (ValueError, KeyError, TypeError) as e:
             return False, str(e)
+
+        # A segunda guarda, para quando estrategia e metricas partilham ficheiro.
+        queixa = verificar_funcoes_protegidas(antes, novo, FUNCOES_PROTEGIDAS)
+        if queixa:
+            return False, queixa
+
         alvo.write_text(novo, encoding="utf-8")
         return True, f"{ficheiro} alterado"
 
@@ -2619,6 +2697,29 @@ def doctor() -> int:
                         print(f"         {f}")
             except Exception as e:
                 erro(f"nao consegui listar os ficheiros: {e}")
+        # Quando a lista branca cobre um ficheiro que tambem calcula metricas, a
+        # unica coisa entre o agente e a regua sao estas funcoes. Se estiverem
+        # vazias, e um erro — nao um aviso.
+        editaveis_py = [f for f in FICHEIROS_EDITAVEIS if str(f).endswith(".py")]
+        if editaveis_py:
+            if FUNCOES_PROTEGIDAS:
+                ok(f"funcoes congeladas: {', '.join(FUNCOES_PROTEGIDAS)}")
+                em_falta = []
+                for rel in editaveis_py:
+                    caminho = p / rel
+                    if not caminho.is_file():
+                        continue
+                    presentes = funcoes_do_ficheiro(caminho.read_text(encoding="utf-8",
+                                                                      errors="replace"))
+                    em_falta += [f for f in FUNCOES_PROTEGIDAS if f not in presentes]
+                if em_falta:
+                    aviso(f"nao encontrei em {editaveis_py}: {', '.join(sorted(set(em_falta)))} "
+                          "— nomes errados nao protegem nada")
+            else:
+                erro(f"a lista branca inclui ficheiros .py ({', '.join(editaveis_py)}) mas "
+                     "FUNCOES_PROTEGIDAS esta vazia. Se esse ficheiro tambem calcula "
+                     "metricas, o agente pode reescrever a propria nota. Corre "
+                     "`configurar` para veres uma proposta.")
         (ok if COMANDO_TESTES else aviso)(
             f"testes do projeto: {COMANDO_TESTES}" if COMANDO_TESTES else
             "sem COMANDO_TESTES: codigo partido so vai ser apanhado pelo backtest")
@@ -2660,6 +2761,14 @@ PISTAS_ARNES = ("metric", "backtest", "resultado", "score", "avalia", "engine",
 PISTAS_ESTRATEGIA = ("estrateg", "strateg", "sinal", "signal", "indicador",
                      "indicator", "regra", "rule", "entrada", "entry", "setup",
                      "risco", "risk", "filtro", "filter")
+
+# Nomes de funcao que denunciam calculo ou registo de resultados. Servem para
+# propor FUNCOES_PROTEGIDAS quando tudo vive no mesmo ficheiro.
+PISTAS_FUNCOES_METRICA = ("sharpe", "metric", "drawdown", "retorno", "return",
+                          "pnl", "lucro", "profit", "equity", "resultado",
+                          "score", "avalia", "estatistica", "stats", "relatorio",
+                          "report", "salvar", "grava", "export", "sortino",
+                          "calmar", "winrate", "win_rate")
 
 # Como os argumentos do teu script se mapeiam nos meus marcadores.
 MAPA_ARGUMENTOS = {
@@ -2740,7 +2849,7 @@ def _agrupar(caminhos: list[str]) -> list[str]:
 
 
 def _substituir_constante(texto: str, nome: str, valor: str) -> tuple[str, bool]:
-    padrao = re.compile(rf"^{nome} = .*$", re.MULTILINE)
+    padrao = re.compile(rf"^{nome}(?::[^=]+)? = .*$", re.MULTILINE)
     if not padrao.search(texto):
         return texto, False
     return padrao.sub(f"{nome} = {valor}", texto, count=1), True
@@ -2788,6 +2897,38 @@ def cmd_configurar(escrever: bool) -> int:
         print("   um agente sem lista branca pode reescrever o codigo que o avalia.")
         print("   Escreve tu FICHEIROS_EDITAVEIS com os teus ficheiros de estrategia.")
 
+    # O caso do backtest que cresceu num ficheiro so: nao ha pasta de estrategia,
+    # e o ficheiro que teria de ser editavel e o mesmo que calcula as metricas.
+    # Aqui a lista branca de ficheiros nao protege nada — a protecao tem de
+    # descer ao nivel da funcao.
+    protegidas: list[str] = []
+    ficheiro_unico = None
+    if not estrategia and entrada:
+        ficheiro_unico = entrada.relative_to(projeto).as_posix()
+        try:
+            funcoes = funcoes_do_ficheiro(entrada.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            funcoes = {}
+        protegidas = sorted(n for n in funcoes
+                            if any(p in n.lower() for p in PISTAS_FUNCOES_METRICA))
+        print(f"\n  ⚠️  O teu backtest esta num ficheiro so: {ficheiro_unico}")
+        print("     A estrategia e o calculo das metricas partilham o mesmo ficheiro,")
+        print("     portanto uma lista branca de FICHEIROS nao protege nada: para o")
+        print("     agente poder mexer na estrategia, tem de poder mexer no ficheiro")
+        print("     inteiro — incluindo o Sharpe.")
+        if protegidas:
+            print(f"\n     Encontrei {len(protegidas)} funcao(oes) que parecem calcular")
+            print("     resultados. Proponho congela-las:")
+            for f in protegidas:
+                print(f"        🔒 {f}")
+            print("\n     Congeladas = qualquer alteracao a elas faz a proposta ser")
+            print("     recusada, com o motivo devolvido ao modelo. Confere a lista:")
+            print("     o que ficar de fora, o agente pode reescrever.")
+        else:
+            print("\n     Nao reconheci nenhuma funcao de metricas pelo nome. Preenche")
+            print("     FUNCOES_PROTEGIDAS a mao antes de ligar o modo `code`, ou usa")
+            print('     MODO = "params", em que o agente nao toca em codigo nenhum.')
+
     pastas_dados = sorted({d.name for d in projeto.iterdir()
                            if d.is_dir() and d.name.lower() in
                            ("dados", "data", "csv", "series", "historico", "cache")})
@@ -2799,6 +2940,9 @@ def cmd_configurar(escrever: bool) -> int:
         linhas.append(f'COMANDO_BACKTEST = "{comando}"')
     if editaveis:
         linhas.append(f"FICHEIROS_EDITAVEIS = {editaveis!r}")
+    elif ficheiro_unico and protegidas:
+        linhas.append(f"FICHEIROS_EDITAVEIS = {[ficheiro_unico]!r}")
+        linhas.append(f"FUNCOES_PROTEGIDAS = {protegidas!r}")
     if pastas_dados:
         linhas.append(f"PASTAS_LIGADAS = {pastas_dados!r}")
     for l in linhas:
@@ -2815,8 +2959,10 @@ def cmd_configurar(escrever: bool) -> int:
     copia.write_text(texto, encoding="utf-8")
 
     aplicadas = []
+    lista_branca = editaveis or ([ficheiro_unico] if ficheiro_unico and protegidas else None)
     for nome, valor in (("COMANDO_BACKTEST", f'"{comando}"' if comando else None),
-                        ("FICHEIROS_EDITAVEIS", repr(editaveis) if editaveis else None),
+                        ("FICHEIROS_EDITAVEIS", repr(lista_branca) if lista_branca else None),
+                        ("FUNCOES_PROTEGIDAS", repr(protegidas) if protegidas else None),
                         ("PASTAS_LIGADAS", repr(pastas_dados) if pastas_dados else None)):
         if valor is None:
             continue

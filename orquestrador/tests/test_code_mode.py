@@ -306,3 +306,112 @@ def test_falha_do_agente_de_codigo_nao_enfileira_nada(config_code, store_code):
 
     assert store_code.list_experiments(store_code.open_study()["id"], limit=5) == []
     assert "coder.failed" in [e["kind"] for e in store_code.recent_events(50)]
+
+
+# --- funcoes congeladas ---------------------------------------------------
+#
+# O caso do backtest que vive num ficheiro so: a estrategia e o calculo do
+# Sharpe partilham ficheiro, portanto a lista branca de CAMINHOS nao protege
+# nada. A protecao desce ao nivel da funcao.
+
+FICHEIRO_MISTO = '''\
+def gerar_sinais(barras, params):
+    return [1 if b > 0 else 0 for b in barras]
+
+
+def calcular_sharpe(retornos):
+    import statistics
+    return statistics.mean(retornos) / statistics.stdev(retornos)
+'''
+
+
+def test_funcoes_do_ficheiro_encontra_tudo():
+    from orq.patching import file_functions
+    funcoes = file_functions(FICHEIRO_MISTO)
+    assert set(funcoes) == {"gerar_sinais", "calcular_sharpe"}
+    assert "statistics.mean" in funcoes["calcular_sharpe"]
+
+
+def test_ficheiro_com_erro_de_sintaxe_nao_rebenta():
+    from orq.patching import file_functions
+    assert file_functions("def partido(:\n") == {}
+
+
+def test_mexer_so_na_estrategia_passa():
+    from orq.patching import check_frozen_functions
+    depois = FICHEIRO_MISTO.replace("if b > 0", "if b > 0.5")
+    assert check_frozen_functions(FICHEIRO_MISTO, depois, ["calcular_sharpe"]) is None
+
+
+def test_reescrever_a_metrica_e_recusado():
+    """O atalho mais curto para 'melhorar o Sharpe'."""
+    from orq.patching import check_frozen_functions
+    depois = FICHEIRO_MISTO.replace(
+        "return statistics.mean(retornos) / statistics.stdev(retornos)", "return 99.0")
+    queixa = check_frozen_functions(FICHEIRO_MISTO, depois, ["calcular_sharpe"])
+    assert queixa and "alteraste calcular_sharpe" in queixa
+    assert "propria nota" in queixa
+
+
+def test_apagar_a_metrica_e_recusado():
+    from orq.patching import check_frozen_functions
+    depois = FICHEIRO_MISTO.split("def calcular_sharpe")[0]
+    queixa = check_frozen_functions(FICHEIRO_MISTO, depois, ["calcular_sharpe"])
+    assert queixa and "apagaste calcular_sharpe" in queixa
+
+
+def test_nome_que_nao_existe_nao_bloqueia():
+    """Proteger uma funcao inexistente nao pode travar o trabalho."""
+    from orq.patching import check_frozen_functions
+    depois = FICHEIRO_MISTO.replace("if b > 0", "if b > 0.5")
+    assert check_frozen_functions(FICHEIRO_MISTO, depois, ["nao_existe"]) is None
+
+
+def test_sem_lista_de_congeladas_nao_verifica_nada():
+    from orq.patching import check_frozen_functions
+    assert check_frozen_functions(FICHEIRO_MISTO, "outra coisa", []) is None
+
+
+def test_sandbox_recusa_alteracao_a_funcao_congelada(config_code):
+    """A guarda no ponto onde a alteracao seria escrita no disco."""
+    alvo = config_code.target.path / "estrategia" / "sinal.py"
+    alvo.write_text(FICHEIRO_MISTO, encoding="utf-8")
+    subprocess.run(["git", "-C", str(config_code.target.path), "add", "-A"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(config_code.target.path), "-c", "user.email=t@t",
+                    "-c", "user.name=t", "commit", "-qm", "misto"],
+                   check=True, capture_output=True)
+
+    alterado = type(config_code.target)(
+        **{**config_code.target.__dict__, "frozen_functions": ("calcular_sharpe",)})
+
+    with Sandbox(alterado, config_code.storage.worktrees_dir, "exp_congelada") as sb:
+        ok, detalhe = sb.apply_edits(
+            "estrategia/sinal.py",
+            [{"procurar": "    return statistics.mean(retornos) / statistics.stdev(retornos)",
+              "substituir": "    return 99.0"}],
+            alterado.editable_paths)
+        assert not ok
+        assert "calcular_sharpe" in detalhe
+        # E o ficheiro no worktree nao foi tocado.
+        assert "99.0" not in (sb.root / "estrategia" / "sinal.py").read_text()
+
+
+def test_agente_recebe_a_queixa_e_corrige():
+    """O ciclo de correcao aplicado a tentativa de reescrever a regua."""
+    ficheiros = {"estrategia/sinal.py": FICHEIRO_MISTO}
+    provider = FakeProvider([
+        json.dumps({"ficheiro": "estrategia/sinal.py", "edicoes": [
+            {"procurar": "    return statistics.mean(retornos) / statistics.stdev(retornos)",
+             "substituir": "    return 99.0"}]}),
+        json.dumps({"ficheiro": "estrategia/sinal.py", "edicoes": [
+            {"procurar": "if b > 0", "substituir": "if b > 0.5"}]}),
+    ])
+    agente = CodeAgent(provider, "m", editable_paths=("estrategia",),
+                       frozen_functions=("calcular_sharpe",), max_retries=3)
+    saida = agente.run(hipotese=HIPOTESE, ficheiros=ficheiros)
+
+    assert "0.5" in saida["conteudo_novo"]
+    assert "99.0" not in saida["conteudo_novo"]
+    assert "calcular_sharpe" in provider.calls[1]["user"], \
+        "o modelo tem de saber porque foi recusado"

@@ -14,7 +14,8 @@ from __future__ import annotations
 from typing import Any
 
 from ..patching import (
-    PatchError, apply_edits, edit_size, ensure_path_allowed, parse_edits,
+    PatchError, apply_edits, check_frozen_functions, edit_size,
+    ensure_path_allowed, parse_edits,
 )
 from .base import Agent
 
@@ -70,10 +71,12 @@ class CodeAgent(Agent):
 
     role = "coder"
 
-    def __init__(self, provider, model, *, editable_paths, max_edit_lines=120, **kwargs):
+    def __init__(self, provider, model, *, editable_paths, max_edit_lines=120,
+                 frozen_functions=(), **kwargs):
         super().__init__(provider, model, **kwargs)
         self.editable_paths = tuple(editable_paths)
         self.max_edit_lines = max_edit_lines
+        self.frozen_functions = tuple(frozen_functions)
 
     def system_prompt(self) -> str:
         return SYSTEM
@@ -121,6 +124,12 @@ class CodeAgent(Agent):
             novo = apply_edits(ficheiros[caminho], edicoes)
         except PatchError as exc:
             raise ValueError(str(exc)) from exc
+
+        # Verificado aqui e nao so ao aplicar: assim o modelo recebe a queixa e
+        # corrige, em vez de gastarmos um ensaio inteiro para descobrir.
+        queixa = check_frozen_functions(ficheiros[caminho], novo, self.frozen_functions)
+        if queixa:
+            raise ValueError(queixa)
 
         if novo == ficheiros[caminho]:
             raise ValueError(

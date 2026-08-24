@@ -24,7 +24,8 @@ from pathlib import Path
 
 from .config import TargetConfig
 from .patching import (
-    Edit, PatchError, apply_edits, ensure_path_allowed, path_allowed,
+    Edit, PatchError, apply_edits, check_frozen_functions, ensure_path_allowed,
+    path_allowed,
 )
 
 STDOUT_HEAD = 2000
@@ -458,9 +459,16 @@ class Sandbox:
             alvo = self.root / ficheiro
             if not alvo.is_file():
                 return False, f"`{ficheiro}` nao existe no worktree"
-            novo = apply_edits(alvo.read_text(encoding="utf-8"), blocos)
+            antes = alvo.read_text(encoding="utf-8")
+            novo = apply_edits(antes, blocos)
         except (PatchError, KeyError, TypeError) as exc:
             return False, str(exc)
+
+        # A segunda guarda, para quando estrategia e metricas partilham ficheiro.
+        queixa = check_frozen_functions(antes, novo, self.target.frozen_functions)
+        if queixa:
+            return False, queixa
+
         alvo.write_text(novo, encoding="utf-8")
         return True, f"{ficheiro} alterado"
 

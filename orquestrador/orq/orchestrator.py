@@ -101,6 +101,7 @@ class Orchestrator:
                 llm.model_for("coder"),
                 editable_paths=config.target.editable_paths,
                 max_edit_lines=config.experiment.max_edit_lines,
+                frozen_functions=config.target.frozen_functions,
                 max_retries=llm.max_json_retries,
                 store=store,
             )

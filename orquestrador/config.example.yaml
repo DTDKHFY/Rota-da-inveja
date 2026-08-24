@@ -55,6 +55,18 @@ target:
   # testes que a validam.
   editable_paths:
     - estrategia
+  # Para quando a estrategia e as metricas vivem no MESMO ficheiro — o caso
+  # comum em backtests que cresceram organicamente. Aí a lista acima nao protege
+  # nada: para o agente mexer na estrategia tem de poder mexer no ficheiro
+  # inteiro, incluindo o Sharpe.
+  #
+  # Estas funcoes ficam congeladas: depois de cada alteracao o codigo delas e
+  # comparado com o original, e qualquer diferenca faz a proposta ser recusada,
+  # com o motivo devolvido ao modelo.
+  frozen_functions: []
+  #  - calcular_sharpe
+  #  - calcular_drawdown
+  #  - gravar_resultado
   # Testes do projeto-alvo. Correm depois de aplicar a alteracao e ANTES do
   # backtest: um erro de sintaxe apanhado em 2s poupa 40 minutos.
   test_cmd: "python -m pytest testes -q"

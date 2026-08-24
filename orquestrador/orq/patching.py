@@ -17,9 +17,11 @@ editavel; o arnes que a mede nunca e.
 """
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from typing import Sequence
 
 
 class PatchError(ValueError):
@@ -148,3 +150,53 @@ def edit_size(edicoes: list[Edit]) -> int:
     return sum(
         len(e.procurar.splitlines()) + len(e.substituir.splitlines()) for e in edicoes
     )
+
+
+# --------------------------------------------------------------------------
+# Protecao ao nivel da funcao
+#
+# Para quando a estrategia e o calculo das metricas vivem no MESMO ficheiro — o
+# caso comum em backtests que cresceram organicamente. Aqui a lista branca de
+# ficheiros nao protege nada: para o agente poder mexer na estrategia, tem de
+# poder mexer no ficheiro inteiro. A protecao tem de descer um nivel.
+# --------------------------------------------------------------------------
+
+def file_functions(source: str) -> dict[str, str]:
+    """Nome -> codigo-fonte, para funcoes e classes a qualquer profundidade.
+
+    Comparo o texto e nao a arvore: uma alteracao que so mude formatacao
+    tambem e uma alteracao, e nao quero discutir com o modelo sobre o que conta
+    como "igual".
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    out: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            try:
+                out[node.name] = ast.get_source_segment(source, node) or ""
+            except (ValueError, TypeError):
+                continue
+    return out
+
+
+def check_frozen_functions(before: str, after: str,
+                           frozen: Sequence[str]) -> str | None:
+    """Alguma funcao congelada mudou? Devolve a queixa, ou None se esta tudo bem."""
+    if not frozen:
+        return None
+    antes, depois = file_functions(before), file_functions(after)
+    alteradas = [n for n in frozen if n in antes and n in depois and antes[n] != depois[n]]
+    desaparecidas = [n for n in frozen if n in antes and n not in depois]
+    if not alteradas and not desaparecidas:
+        return None
+    queixa = []
+    if alteradas:
+        queixa.append(f"alteraste {', '.join(alteradas)}")
+    if desaparecidas:
+        queixa.append(f"apagaste {', '.join(desaparecidas)}")
+    return (f"{' e '.join(queixa)}. Essas funcoes calculam ou registam resultados e "
+            "estao congeladas — se pudesses mexer nelas, podias melhorar a tua propria "
+            "nota em vez de melhorar a estrategia. Faz a alteracao sem lhes tocar.")
