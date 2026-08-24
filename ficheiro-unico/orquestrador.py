@@ -160,10 +160,12 @@ AUTO_APLICAR_SOZINHO = False
 # --- Onde guardar o estado -------------------------------------------------
 BASE = Path(__file__).resolve().parent
 BD = BASE / "orq.db"
-# Fora do projeto, de proposito: com os worktrees dentro do repositorio, cada
-# ensaio deixava lixo no `git status` do utilizador e o `git add -A` acabava por
-# apanhar copias inteiras do projeto.
-WORKTREES = Path(tempfile.gettempdir()) / "orq_worktrees"
+# Dentro do projeto, para poderes ver o que ele esta a fazer. Fica em `.orq/`,
+# que e acrescentado ao teu .gitignore no arranque — assim nao te enche o
+# `git status` nem e apanhado por um `git add -A` distraido.
+# (Ja estiveram no Temp do sistema; a poupanca nao compensava teres de procurar
+# numa pasta escondida sempre que algo corria mal.)
+WORKTREES = BASE / ".orq" / "worktrees"
 
 # ===========================================================================
 #  fim da configuracao
@@ -1588,6 +1590,35 @@ def ambiente_limpo() -> dict:
     return env
 
 
+def script_do_comando(comando: str) -> str | None:
+    """O ficheiro que o COMANDO_BACKTEST manda correr.
+
+    Serve para conferir que ele existe ANTES de montar um worktree e chamar um
+    subprocesso. O erro que sai de la — "No such file or directory" com um
+    caminho temporario pelo meio — nao aponta para a causa, que e quase sempre
+    o comando ter ficado com o nome de exemplo.
+    """
+    # Divido sempre em modo Windows: preserva as barras invertidas, e num
+    # caminho POSIX nao ha nada para preservar. Assim a deteccao da o mesmo
+    # resultado independentemente de onde este codigo corre.
+    try:
+        pedacos = [t.strip('"').strip("'") for t in shlex.split(comando.replace("{python}", "python"),
+                                                                posix=False)]
+    except ValueError:
+        return None
+
+    for pedaco in pedacos:
+        if not pedaco or pedaco.startswith("-"):
+            continue
+        nome = PurePosixPath(pedaco.replace("\\", "/")).name.lower()
+        if nome.rsplit(".", 1)[0] in ("python", "python3", "py", "pythonw"):
+            continue                      # e o interpretador, nao o script
+        if nome.endswith((".py", ".bat", ".cmd", ".sh", ".exe")):
+            return pedaco
+        return None       # primeiro argumento real nao e um ficheiro reconhecivel
+    return None
+
+
 def interpretador() -> str:
     """O Python que esta a correr este ficheiro.
 
@@ -1894,6 +1925,20 @@ class Sandbox:
         f_saida.unlink(missing_ok=True)
         # `python` entra aqui e nao so no `resolver_python` porque o .format()
         # corre primeiro e rebentaria com um marcador que nao conhece.
+        script = script_do_comando(COMANDO_BACKTEST)
+        if script and not (self.raiz / script).exists():
+            versionados = self.ficheiros_versionados()
+            candidatos = [f for f in versionados if f.endswith(".py")][:8]
+            return None, Resultado(False, -1, (
+                f"[orq] O COMANDO_BACKTEST manda correr `{script}`, que nao existe "
+                f"no projeto.\n\n"
+                f"Ficheiros .py versionados que encontrei:\n"
+                + "\n".join(f"  - {c}" for c in candidatos or ["(nenhum)"])
+                + "\n\nSe o teu script tem outro nome, corre `configurar --escrever` "
+                  "ou corrige o COMANDO_BACKTEST a mao.\n"
+                  "Se o ficheiro existe mas nao esta versionado, faz `git add` e commit: "
+                  "o worktree so traz o que esta no git."), 0.0)
+
         r = self.correr(COMANDO_BACKTEST.format(
             python=citar(interpretador()),
             params=citar(str(f_params)), saida=citar(str(f_saida)),
@@ -3715,6 +3760,17 @@ def doctor() -> int:
             f"FICHEIRO_PARAMS: {FICHEIRO_PARAMS}" +
             ("" if (p / FICHEIRO_PARAMS).is_file() else " (em falta — /baseline nao funciona)"))
 
+    script = script_do_comando(COMANDO_BACKTEST)
+    if script:
+        if p.is_dir() and (p / script).exists():
+            ok(f"o backtest corre: {script}")
+        elif p.is_dir():
+            erro(f"COMANDO_BACKTEST aponta para `{script}`, que nao existe em {p}. "
+                 f"Corre `configurar --escrever`.")
+    else:
+        aviso("nao percebi que ficheiro o COMANDO_BACKTEST manda correr — "
+              "confere-o a mao")
+
     print("\nIsolamento")
     if BACKTEST_COM_REDE:
         aviso("BACKTEST_COM_REDE = True — o backtest tem acesso a rede")
@@ -4424,6 +4480,31 @@ def diagnosticar_caminho(caminho: str) -> str | None:
             f"     ou usa barras normais:       PROJETO = \"C:/...\"")
 
 
+def garantir_gitignore():
+    """Acrescenta .orq/ ao .gitignore do projeto, se ainda la nao estiver.
+
+    Os worktrees vivem dentro do projeto para os poderes ver. Sem esta linha,
+    apareciam no teu `git status` e um `git add -A` distraido acabava por
+    commitar copias inteiras do projeto dentro do projeto.
+    """
+    projeto = Path(PROJETO)
+    if not projeto.is_dir() or not e_repo_git(projeto):
+        return
+    caminho = projeto / ".gitignore"
+    try:
+        atual = caminho.read_text(encoding="utf-8") if caminho.is_file() else ""
+        if any(l.strip() in (".orq", ".orq/", "/.orq", "/.orq/")
+               for l in atual.splitlines()):
+            return
+        prefixo = "" if (not atual or atual.endswith("\n")) else "\n"
+        caminho.write_text(
+            atual + prefixo + "\n# worktrees e base de dados do orquestrador\n.orq/\norq.db\n",
+            encoding="utf-8")
+        log.info("acrescentei .orq/ ao .gitignore do projeto")
+    except OSError as exc:
+        log.warning("nao consegui escrever no .gitignore: %s", exc)
+
+
 def pronto_para_arrancar() -> list[str]:
     """O que falta configurar. Lista vazia = pode arrancar."""
     faltas = []
@@ -4450,6 +4531,14 @@ def pronto_para_arrancar() -> list[str]:
                       f'     cd "{PROJETO}"\n'
                       f"     git add -A\n"
                       f'     git commit -m "inicial"')
+    script = script_do_comando(COMANDO_BACKTEST)
+    if script and projeto.is_dir() and not (projeto / script).exists():
+        existentes = sorted(c.name for c in projeto.glob("*.py"))[:6]
+        faltas.append(
+            f"COMANDO_BACKTEST — o ficheiro `{script}` nao existe em {PROJETO}.\n"
+            f"     Provavelmente ficou o exemplo que veio comigo.\n"
+            + (f"     Na tua pasta encontrei: {', '.join(existentes)}\n" if existentes else "")
+            + f"     Corre:  python {Path(__file__).name} configurar --escrever")
     if MODO == "code" and not FICHEIROS_EDITAVEIS:
         faltas.append("FICHEIROS_EDITAVEIS — sem lista branca o agente podia reescrever "
                       "o codigo que calcula as metricas")
@@ -4506,6 +4595,7 @@ def main(argv=None) -> int:
     if a.comando == "estado":
         return estado_cli()
 
+    garantir_gitignore()
     faltas = pronto_para_arrancar()
     if faltas:
         return avisar_o_que_falta(faltas)
