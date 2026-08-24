@@ -3862,7 +3862,9 @@ def doctor() -> int:
         ok(f"{p} e repositorio git")
         (ok if (p / FICHEIRO_PARAMS).is_file() else aviso)(
             f"FICHEIRO_PARAMS: {FICHEIRO_PARAMS}" +
-            ("" if (p / FICHEIRO_PARAMS).is_file() else " (em falta — /baseline nao funciona)"))
+            ("" if (p / FICHEIRO_PARAMS).is_file() else
+             " (em falta — a baseline corre na mesma, com os valores por omissao "
+             "do teu script)"))
 
     script = script_do_comando(COMANDO_BACKTEST)
     if script:
@@ -3887,8 +3889,14 @@ def doctor() -> int:
             print("      Tira-os do git (ficam no disco na mesma):")
             for pasta in pastas[:3] or ["<ficheiro>"]:
                 print(f'         git rm --cached -r "{pasta}"')
-            print("      Acrescenta ao .gitignore e poe o nome em PASTAS_LIGADAS —")
-            print("      eu ligo-as por atalho a cada ensaio, sem copiar nada.")
+            print("      Acrescenta essas pastas ao .gitignore, e depois poe no topo")
+            print("      deste ficheiro:")
+            print(f"         PASTAS_LIGADAS = {pastas!r}")
+            print("      Assim eu ligo-as por atalho a cada ensaio, sem copiar um byte.")
+            em_falta = [x for x in pastas if x not in PASTAS_LIGADAS]
+            if em_falta:
+                aviso(f"PASTAS_LIGADAS ainda nao inclui: {', '.join(em_falta)} — "
+                      "sem isso o backtest nao encontra os dados dentro do worktree")
         else:
             ok("nao ha dados pesados versionados")
 
