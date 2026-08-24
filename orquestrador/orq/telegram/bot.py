@@ -89,6 +89,7 @@ class Bot:
 
     # ------------------------------------------------------------------
     def run(self) -> None:
+        self.store.assert_same_thread("o bot")
         offset_gravado = self.store.kv_get("telegram_offset")
         offset = int(offset_gravado) if offset_gravado else None
         log.info("bot a ouvir (offset %s)", offset)

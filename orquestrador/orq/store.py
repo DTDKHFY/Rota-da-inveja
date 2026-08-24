@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -111,6 +112,19 @@ class Store:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        # Uma ligacao SQLite so pode ser usada na thread que a criou. Guardo
+        # quem me criou para poder falhar com uma mensagem util em vez da do
+        # sqlite3, que aparece a meio de uma transacao e nao diz o que fazer.
+        self._thread = threading.get_ident()
+
+    def assert_same_thread(self, quem: str = "este componente") -> None:
+        """Falha cedo e claro se o Store vier de outra thread."""
+        if threading.get_ident() != self._thread:
+            raise RuntimeError(
+                f"{quem} recebeu um Store aberto noutra thread. Uma ligacao SQLite "
+                "so funciona na thread que a criou: abre o Store DENTRO da funcao "
+                "que a thread vai correr, em vez de o criar fora e passar."
+            )
 
     def close(self) -> None:
         self._conn.close()

@@ -215,3 +215,46 @@ def test_falha_do_llm_nao_para_o_estudo(config, store):
     assert all(e["status"] == "done" for e in ensaios)
     eventos = [e["kind"] for e in store.recent_events(100)]
     assert "proposer.fallback" in eventos
+
+
+def test_worker_a_correr_numa_thread(config, store):
+    """O caminho real: worker numa thread, com o seu proprio Store.
+
+    Este teste existe porque a suite passava com um bug que rebentava mal o
+    worker arrancasse. Todos os outros testes chamam `step()` na mesma thread.
+    """
+    import threading
+
+    from orq.store import Store
+
+    estudo = store.create_study("s", "o")
+    store.enqueue_experiment(estudo, {"sma_fast": 20, "sma_slow": 60, "stop_atr": 2.0})
+
+    provider = FakeProvider(["Resultado consistente."] * 4)
+    notifier = NullNotifier()
+    parar = threading.Event()
+    falhas = []
+
+    def tarefa():
+        try:
+            proprio = Store(config.storage.db_path)
+            try:
+                w = Worker(Orchestrator(config, proprio, provider, notifier), proprio,
+                           idle_sleep=0.05, stop_event=parar)
+                w.recover()
+                while not parar.is_set() and w.step():
+                    pass
+            finally:
+                proprio.close()
+        except Exception as exc:  # noqa: BLE001
+            falhas.append(f"{type(exc).__name__}: {exc}")
+
+    t = threading.Thread(target=tarefa, daemon=True)
+    t.start()
+    t.join(timeout=60)
+    parar.set()
+
+    assert not falhas, falhas
+    assert not t.is_alive(), "o worker ficou pendurado"
+    ensaios = store.list_experiments(estudo, limit=5)
+    assert ensaios[0]["status"] == "done", ensaios[0]["error"]

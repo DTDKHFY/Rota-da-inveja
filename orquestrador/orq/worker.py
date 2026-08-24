@@ -35,6 +35,7 @@ class Worker:
         self.stop_event = stop_event or threading.Event()
 
     def recover(self) -> None:
+        self.store.assert_same_thread("o worker")
         stale_after = self.orq.config.target.timeout_sec * STALE_FACTOR
         recovered = self.store.recover_stale(stale_after)
         if recovered["experiments"] or recovered["tasks"]:

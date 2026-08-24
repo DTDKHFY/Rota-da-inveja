@@ -190,24 +190,28 @@ def _run_threads(config: Config, *, com_bot: bool, com_worker: bool) -> int:
     notifier = TelegramNotifier(client, config.telegram.allowed_chat_ids[0])
     threads: list[threading.Thread] = []
 
-    if com_worker:
-        # Cada thread tem o seu Store: uma ligacao SQLite nao atravessa threads.
-        worker_store = Store(config.storage.db_path)
-        worker = Worker(
-            _build(config, worker_store, notifier=notifier), worker_store, stop_event=stop
-        )
-        threads.append(threading.Thread(target=worker.run, name="worker", daemon=True))
+    # Uma ligacao SQLite so pode ser usada na thread que a criou. Por isso cada
+    # Store e aberto DENTRO da thread que o vai usar, e nao aqui fora e passado.
+    # O WAL trata da concorrencia entre as duas ligacoes.
+    def tarefa_worker() -> None:
+        store = Store(config.storage.db_path)
+        try:
+            Worker(_build(config, store, notifier=notifier), store, stop_event=stop).run()
+        finally:
+            store.close()
 
+    def tarefa_bot() -> None:
+        store = Store(config.storage.db_path)
+        try:
+            Bot(config, store, _build(config, store, notifier=notifier), client,
+                stop_event=stop).run()
+        finally:
+            store.close()
+
+    if com_worker:
+        threads.append(threading.Thread(target=tarefa_worker, name="worker", daemon=True))
     if com_bot:
-        bot_store = Store(config.storage.db_path)
-        bot = Bot(
-            config,
-            bot_store,
-            _build(config, bot_store, notifier=notifier),
-            client,
-            stop_event=stop,
-        )
-        threads.append(threading.Thread(target=bot.run, name="bot", daemon=True))
+        threads.append(threading.Thread(target=tarefa_bot, name="bot", daemon=True))
 
     for t in threads:
         t.start()

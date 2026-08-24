@@ -465,6 +465,18 @@ class Estado:
         self.c.execute("PRAGMA journal_mode=WAL")
         self.c.execute("PRAGMA synchronous=NORMAL")
         self.c.executescript(ESQUEMA)
+        # Uma ligacao SQLite so pode ser usada na thread que a criou. Guardo
+        # quem me criou para poder falhar com uma mensagem util em vez da do
+        # sqlite3, que aparece a meio de uma transacao e nao diz o que fazer.
+        self._thread = threading.get_ident()
+
+    def exigir_mesma_thread(self, quem: str = "este componente"):
+        """Falha cedo e claro se o Estado vier de outra thread."""
+        if threading.get_ident() != self._thread:
+            raise RuntimeError(
+                f"{quem} recebeu um Estado aberto noutra thread. Uma ligacao SQLite "
+                "so funciona na thread que a criou: abre o Estado DENTRO da funcao "
+                "que a thread vai correr, em vez de o criar fora e passar.")
 
     def fechar(self):
         self.c.close()
@@ -1984,6 +1996,7 @@ class Worker:
         self.parar = parar or threading.Event()
 
     def recuperar(self):
+        self.estado.exigir_mesma_thread("o worker")
         r = self.estado.recuperar(1800 * 3)
         if r["ensaios"] or r["tarefas"]:
             self.orq.aviso.enviar(f"♻️ Retomei depois de uma paragem: {r['ensaios']} ensaios "
@@ -2162,6 +2175,7 @@ class Bot:
         self.parar = parar or threading.Event()
 
     def correr(self):
+        self.estado.exigir_mesma_thread("o bot")
         gravado = self.estado.kv_ler("offset")
         offset = int(gravado) if gravado else None
         log.info("bot a ouvir")
@@ -2912,8 +2926,8 @@ def autoteste() -> int:
 
 def correr(com_bot=True, com_worker=True) -> int:
     if not token():
-        print("\n❌ Sem token do Telegram. Preenche TELEGRAM_TOKEN no topo do ficheiro,\n"
-              "   ou define a variavel de ambiente TELEGRAM_BOT_TOKEN.\n", file=sys.stderr)
+        print("\n❌ Sem token do Telegram. Preenche TELEGRAM_TOKEN no topo do ficheiro.\n",
+              file=sys.stderr)
         return 2
     parar = threading.Event()
     signal.signal(signal.SIGINT, lambda *a: (print("\na parar..."), parar.set()))
@@ -2921,18 +2935,31 @@ def correr(com_bot=True, com_worker=True) -> int:
 
     tg = Telegram(token())
     aviso = AvisoTelegram(tg, CHAT_ID)
+
+    # Uma ligacao SQLite so pode ser usada na thread que a criou. Por isso cada
+    # `Estado` e criado DENTRO da thread que o vai usar, e nao aqui fora e
+    # passado — que era o que eu fazia, e o que rebentava mal o worker
+    # arrancava. O SQLite deteta e recusa; o WAL trata da concorrencia entre as
+    # duas ligacoes.
+    def tarefa_worker():
+        estado = Estado(BD)
+        try:
+            Worker(Orquestrador(estado, Ollama(), aviso), estado, parar=parar).correr()
+        finally:
+            estado.fechar()
+
+    def tarefa_bot():
+        estado = Estado(BD)
+        try:
+            Bot(estado, Orquestrador(estado, Ollama(), aviso), tg, parar=parar).correr()
+        finally:
+            estado.fechar()
+
     threads = []
     if com_worker:
-        # Uma ligacao SQLite nao atravessa threads: cada uma tem a sua.
-        e1 = Estado(BD)
-        threads.append(threading.Thread(
-            target=Worker(Orquestrador(e1, Ollama(), aviso), e1, parar=parar).correr,
-            name="worker", daemon=True))
+        threads.append(threading.Thread(target=tarefa_worker, name="worker", daemon=True))
     if com_bot:
-        e2 = Estado(BD)
-        threads.append(threading.Thread(
-            target=Bot(e2, Orquestrador(e2, Ollama(), aviso), tg, parar=parar).correr,
-            name="bot", daemon=True))
+        threads.append(threading.Thread(target=tarefa_bot, name="bot", daemon=True))
     for t in threads:
         t.start()
     print(f"a correr: {', '.join(t.name for t in threads)} — Ctrl+C para parar")
