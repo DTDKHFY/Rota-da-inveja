@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..patching import (
-    Edit, PatchError, apply_edits, edit_size, ensure_path_allowed, parse_edits,
+    PatchError, apply_edits, edit_size, ensure_path_allowed, parse_edits,
 )
 from .base import Agent
 

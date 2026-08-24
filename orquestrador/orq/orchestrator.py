@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import random
 import subprocess
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -294,7 +293,7 @@ class Orchestrator:
                 self.notifier.send(f"⚠️ Nao consegui implementar _{hipotese['nome']}_: {exc}")
                 continue
 
-            exp_id = self.store.enqueue_experiment(
+            self.store.enqueue_experiment(
                 study_id=study_id,
                 params=params,
                 hypothesis=f"{hipotese['nome']} — {hipotese['raciocinio']}",

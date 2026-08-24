@@ -1,2 +1,5 @@
 -r requirements.txt
 pytest>=8.0
+# Apanha nomes indefinidos e imports em falta, que os testes nao apanham
+# quando `from __future__ import annotations` faz as anotacoes virarem texto.
+pyflakes>=3.0

@@ -1,12 +1,11 @@
 import json
-import os
 import subprocess
 
 import pytest
 
 from orq.sandbox import (
-    HoldoutViolation, Sandbox, SandboxError, is_git_repo, quote_path,
-    split_command, truncate_output,
+    HoldoutViolation, Sandbox, SandboxError, quote_path, split_command,
+    truncate_output,
 )
 
 

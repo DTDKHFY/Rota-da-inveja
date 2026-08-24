@@ -18,7 +18,7 @@ import threading
 from orq.config import Config, ConfigError, load_config
 from orq.llm import build_provider
 from orq.llm.ollama import OllamaProvider
-from orq.orchestrator import NullNotifier, Orchestrator
+from orq.orchestrator import Orchestrator
 from orq.sandbox import is_git_repo, network_isolation_available
 from orq.store import Store
 from orq.telegram import Bot, TelegramClient, TelegramError, TelegramNotifier

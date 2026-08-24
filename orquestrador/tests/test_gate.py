@@ -3,7 +3,7 @@ import random
 import pytest
 
 from orq.config import GateConfig
-from orq.gate import Verdict, evaluate, trials_sharpe_variance
+from orq.gate import evaluate, trials_sharpe_variance
 from orq.metrics import parse_window_metrics
 
 

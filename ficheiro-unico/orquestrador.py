@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from statistics import NormalDist
-from typing import Any, Sequence
+from typing import Callable, Sequence
 
 try:
     import requests
@@ -1427,10 +1427,6 @@ class Sandbox:
 #  ele corrige quase sempre a tentativa seguinte.
 # ===========================================================================
 
-class ErroAgente(Exception):
-    pass
-
-
 SISTEMA_PESQUISA = """Es um analista quantitativo.
 
 A tua unica funcao e propor HIPOTESES para o proximo ensaio, olhando para o
@@ -1998,7 +1994,7 @@ class Worker:
         t = self.estado.reclamar_tarefa()
         if t is not None:
             try:
-                n = self.orq.tratar_tarefa(t)
+                self.orq.tratar_tarefa(t)
                 self.estado.acabar_tarefa(t["id"], "feita")
             except Exception as e:              # o worker nao morre por uma tarefa ma
                 log.exception("tarefa %s rebentou", t["id"])
@@ -2812,10 +2808,10 @@ def cmd_ver(projeto: Path, editaveis: Sequence[str]) -> int:
     suspeitos = [r for r in ficheiros if any(
         p in r.lower() for p in ("metric", "backtest", "resultado", "score", "avalia"))]
     if suspeitos:
-        print(f"\n  ⚠️  Estes ficheiros editaveis tem nomes que sugerem que calculam")
+        print("\n  ⚠️  Estes ficheiros editaveis tem nomes que sugerem que calculam")
         print(f"      resultados: {', '.join(suspeitos)}")
-        print(f"      Se algum deles mede o desempenho, tira-o da lista branca. Um")
-        print(f"      agente que pode reescrever a regua vai reescrever a regua.")
+        print("      Se algum deles mede o desempenho, tira-o da lista branca. Um")
+        print("      agente que pode reescrever a regua vai reescrever a regua.")
     return 0
 
 
@@ -2857,7 +2853,7 @@ Entretanto podes ver se a maquinaria esta sa, sem configurar nada:
 
     python {Path(__file__).name} teste
 """)
-    return 1
+    return 0
 
 
 def main(argv=None) -> int:

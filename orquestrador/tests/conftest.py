@@ -7,9 +7,7 @@ de "correu sem rebentar".
 from __future__ import annotations
 
 import json
-import math
 import subprocess
-import textwrap
 
 import pytest
 import yaml
