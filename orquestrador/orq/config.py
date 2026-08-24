@@ -93,6 +93,11 @@ class TargetConfig:
     # Modo `code`: os UNICOS ficheiros que o agente de desenvolvimento pode
     # alterar. Tudo o resto — em especial o que corre e mede o backtest — fica
     # fora do alcance dele.
+    # O que o agente VE. Por omissao tudo o que esta no git: ver o codigo que
+    # mede nao lhe da poder sobre ele, e sem ver nao percebe que interface tem
+    # de respeitar.
+    visible_paths: tuple[str, ...] = ("*",)
+    max_visible_files: int = 40
     editable_paths: tuple[str, ...] = ()
     # Funcoes congeladas: para quando estrategia e metricas partilham
     # ficheiro e a lista branca de caminhos ja nao protege nada.
@@ -317,6 +322,8 @@ def load_config(path: str | Path | None = None, *, env_path: str | Path | None =
             test_cmd=target_raw.get("test_cmd") or None,
             link_paths=tuple(target_raw.get("link_paths", []) or []),
             params_file=str(target_raw.get("params_file", "params.json")),
+            visible_paths=tuple(target_raw.get("visible_paths", ["*"]) or ["*"]),
+            max_visible_files=int(target_raw.get("max_visible_files", 40)),
             editable_paths=tuple(target_raw.get("editable_paths", []) or []),
             frozen_functions=tuple(target_raw.get("frozen_functions", []) or []),
             env_passthrough=tuple(target_raw.get("env_passthrough", []) or []),

@@ -448,6 +448,36 @@ class Sandbox:
             return []
         return [linha for linha in saida.stdout.splitlines() if linha]
 
+    def read_visible(self, limit_bytes: int = 200_000) -> dict[str, str]:
+        """Tudo o que o agente pode LER — por omissao, o projeto inteiro.
+
+        Ver o codigo que mede nao lhe da poder nenhum sobre ele: a lista de
+        edicao e verificada em separado, duas vezes. O que ver lhe da e
+        contexto — sem ele, escreve codigo que nao encaixa na interface que o
+        resto do sistema espera.
+
+        Os editaveis vem primeiro, para serem os ultimos a cair se o contexto
+        acabar.
+        """
+        tracked = [r for r in self.tracked_files()
+                   if path_allowed(r, self.target.visible_paths)]
+        tracked.sort(key=lambda r: (not path_allowed(r, self.target.editable_paths), r))
+
+        out, spent = {}, 0
+        for rel in tracked[: self.target.max_visible_files]:
+            caminho = self.root / rel
+            try:
+                if caminho.stat().st_size > 120_000:
+                    continue
+                texto = caminho.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            if spent + len(texto) > limit_bytes:
+                continue
+            spent += len(texto)
+            out[rel] = texto
+        return out
+
     def read_editable(self, patterns: tuple[str, ...]) -> dict[str, str]:
         """Le os ficheiros que o agente de desenvolvimento pode alterar.
 

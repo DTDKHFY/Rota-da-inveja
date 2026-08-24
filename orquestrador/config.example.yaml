@@ -44,6 +44,13 @@ target:
   # Onde vivem os parametros em producao. Uma proposta aprovada e escrita aqui,
   # num ramo git novo — nunca no ramo ativo. Es tu que fazes o merge.
   params_file: params.json
+  # O que o agente VE. Por omissao, tudo o que esta versionado no git.
+  # Ver o arnes nao lhe da poder sobre ele — a lista de edicao e verificada em
+  # separado. O que ver lhe da e contexto: sem isso escreve codigo que nao
+  # encaixa na interface que o resto do sistema espera.
+  visible_paths: ["*"]
+  max_visible_files: 40
+
   # === A guarda mais importante do modo `code` ===
   # Os UNICOS ficheiros que o Agente de Desenvolvimento pode alterar.
   #

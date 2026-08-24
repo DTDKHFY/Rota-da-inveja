@@ -415,3 +415,36 @@ def test_agente_recebe_a_queixa_e_corrige():
     assert "99.0" not in saida["conteudo_novo"]
     assert "calcular_sharpe" in provider.calls[1]["user"], \
         "o modelo tem de saber porque foi recusado"
+
+
+# --- ver nao e o mesmo que poder alterar ----------------------------------
+
+def test_ve_o_projeto_inteiro_mas_altera_so_a_estrategia(config_code):
+    """Sem ver o arnes, o agente nao sabe que interface tem de respeitar.
+
+    Ver nao lhe da poder nenhum sobre ele: a lista de edicao e verificada em
+    separado, e duas vezes.
+    """
+    with Sandbox(config_code.target, config_code.storage.worktrees_dir, "exp_ver") as sb:
+        visiveis = sb.read_visible()
+        editaveis = sb.read_editable(config_code.target.editable_paths)
+
+    assert "metricas.py" not in editaveis or "run_backtest.py" in visiveis
+    assert "run_backtest.py" in visiveis, "tem de ver o arnes para o perceber"
+    assert "run_backtest.py" not in editaveis, "mas nunca o pode alterar"
+    assert "estrategia/sinal.py" in editaveis
+
+
+def test_asterisco_permite_tudo():
+    from orq.patching import path_allowed
+    assert path_allowed("qualquer/coisa.py", ["*"])
+    assert path_allowed("metricas.py", ["*"])
+    assert not path_allowed("metricas.py", ["estrategia"])
+
+
+def test_editaveis_vem_primeiro_quando_o_contexto_aperta(config_code):
+    """Se o contexto acabar, o que se perde e o que ele nao pode mexer."""
+    with Sandbox(config_code.target, config_code.storage.worktrees_dir, "exp_ordem") as sb:
+        visiveis = list(sb.read_visible(limit_bytes=400))
+    if visiveis:
+        assert visiveis[0].startswith("estrategia/"), visiveis

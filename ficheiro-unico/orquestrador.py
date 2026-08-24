@@ -101,7 +101,23 @@ MODO = "code"        # "code" = o agente altera codigo | "params" = so valores
 # Deixa de fora tudo o que corre e mede o backtest: um agente cuja tarefa e
 # melhorar o Sharpe tem um atalho obvio, que e reescrever a funcao que o
 # calcula. Nao e rebuscado — e o caminho de menor resistencia.
-FICHEIROS_EDITAVEIS = ["estrategia"]   # nunca run_backtest.py nem metricas.py
+# O que ele VE. Por omissao, tudo o que esta versionado no git.
+# Ver tudo nao e um risco — e o que lhe permite perceber que formato de dados o
+# arnes espera, que funcoes ja existem, e que interface tem de respeitar. Um
+# agente que so ve metade do sistema escreve codigo que nao encaixa na outra
+# metade.
+FICHEIROS_VISIVEIS = ["*"]           # "*" = tudo o que esta no git
+MAX_FICHEIROS_VISIVEIS = 40          # teto, para nao rebentar o contexto do modelo
+
+# O que ele pode ALTERAR. Isto sim, importa.
+#
+# Poe ["*"] para o deixar mexer em tudo. Antes de o fazeres, le isto:
+# cada ensaio ja corre num worktree descartavel — os teus ficheiros nunca sao
+# tocados, com ou sem lista branca. O que a lista protege nao sao os teus
+# ficheiros; e o significado dos numeros. Se ele puder editar o codigo que
+# calcula o Sharpe, o Sharpe que te chega deixa de querer dizer nada, e nenhuma
+# copia de seguranca te avisa disso — descobres quando operares a serio.
+FICHEIROS_EDITAVEIS = ["estrategia"]
 MAX_LINHAS_EDICAO = 120              # travao contra reescritas
 
 # Para quando a estrategia e as metricas vivem no MESMO ficheiro — o caso comum
@@ -946,7 +962,10 @@ def caminho_permitido(rel: str, padroes: Sequence[str]) -> bool:
     if alvo.startswith("/") or ".." in PurePosixPath(alvo).parts:
         return False
     for bruto in padroes:
-        p = str(PurePosixPath(str(bruto).strip().rstrip("/")))
+        cru = str(bruto).strip()
+        if cru in ("*", "**", "."):        # tudo
+            return True
+        p = str(PurePosixPath(cru.rstrip("/")))
         if alvo == p or alvo.startswith(p + "/"):
             return True
         regex = (re.escape(p).replace(r"\*\*/", "(?:.*/)?").replace(r"\*\*", ".*")
@@ -1286,15 +1305,25 @@ Formato exato da resposta:
 """
 
 
-def render_ficheiros(ficheiros: dict[str, str], limite: int = LIMITE_CONTEXTO) -> str:
-    """Junta os ficheiros com numeros de linha, para o modelo se orientar."""
+def render_ficheiros(ficheiros: dict[str, str], limite: int = LIMITE_CONTEXTO,
+                     editaveis: Sequence[str] = ()) -> str:
+    """Junta os ficheiros com numeros de linha, marcando quais pode alterar.
+
+    Os protegidos vao com o conteudo na mesma: e assim que ele sabe que formato
+    de metricas escrever e que funcoes ja existem. O que nao pode e altera-los,
+    e isso e verificado em Python, nao pedido no prompt.
+    """
     partes, gasto = [], 0
-    for caminho, conteudo in sorted(ficheiros.items()):
+    for caminho, conteudo in sorted(
+            ficheiros.items(),
+            key=lambda kv: (not caminho_permitido(kv[0], editaveis), kv[0])):
+        pode = caminho_permitido(caminho, editaveis)
+        marca = "PODES ALTERAR" if pode else "SO PARA LERES — nao podes alterar"
         corpo = "\n".join(f"{n:>4} | {l}" for n, l in enumerate(conteudo.splitlines(), 1))
-        bloco = f"===== {caminho} =====\n{corpo}\n"
+        bloco = f"===== {caminho}  [{marca}] =====\n{corpo}\n"
         if gasto + len(bloco) > limite:
             partes.append(f"===== {caminho} =====\n[omitido: contexto esgotado. "
-                          "Restringe a lista de ficheiros editaveis.]\n")
+                          "Baixa MAX_FICHEIROS_VISIVEIS ou restringe FICHEIROS_VISIVEIS.]\n")
             continue
         gasto += len(bloco)
         partes.append(bloco)
@@ -1323,9 +1352,11 @@ def propor_alteracao(ficheiros: dict[str, str], hipotese: dict, *,
 
     prompt = (
         f"HIPOTESE A IMPLEMENTAR:\n{hipotese['nome']} — {hipotese.get('raciocinio', '')}\n\n"
-        f"FICHEIROS QUE PODES ALTERAR:\n{', '.join(editaveis)}\n\n"
+        f"FICHEIROS QUE PODES ALTERAR: {', '.join(editaveis)}\n"
+        f"Os restantes aparecem para os leres e perceberes o sistema. Se "
+        f"propuseres uma alteracao a um deles, e recusada.\n\n"
         f"CONTEUDO (os numeros de linha sao so para te orientares — nao os "
-        f"incluas nos blocos):\n{render_ficheiros(ficheiros)}\n\n"
+        f"incluas nos blocos):\n{render_ficheiros(ficheiros, editaveis=editaveis)}\n\n"
         f"Limite: no maximo {max_linhas} linhas tocadas no total.\n\n"
         f"Devolve as edicoes.")
 
@@ -1863,15 +1894,38 @@ class Sandbox:
         return [l for l in r.stdout.splitlines() if l] if r.returncode == 0 else []
 
     def ler_editaveis(self) -> dict[str, str]:
-        """Le so o que o agente pode alterar. O que ele nao ve, nao pode editar."""
-        saida = {}
-        for rel in self.ficheiros_versionados():
-            if not caminho_permitido(rel, FICHEIROS_EDITAVEIS):
-                continue
+        """So o que ele pode alterar. Usado onde a distincao importa."""
+        return {rel: texto for rel, texto in self.ler_visiveis().items()
+                if caminho_permitido(rel, FICHEIROS_EDITAVEIS)}
+
+    def ler_visiveis(self, limite_bytes: int = 200_000) -> dict[str, str]:
+        """Tudo o que ele pode LER — que por omissao e o projeto inteiro.
+
+        Ver o codigo que mede nao lhe da poder nenhum sobre ele: a lista de
+        edicao e verificada em separado, duas vezes. O que ver lhe da e
+        contexto — sem ele, escreve codigo que nao encaixa na interface que o
+        resto do sistema espera.
+
+        Os editaveis vem primeiro, para que sejam os ultimos a ser cortados se o
+        contexto acabar.
+        """
+        versionados = [r for r in self.ficheiros_versionados()
+                       if caminho_permitido(r, FICHEIROS_VISIVEIS)]
+        versionados.sort(key=lambda r: (not caminho_permitido(r, FICHEIROS_EDITAVEIS), r))
+
+        saida, gasto = {}, 0
+        for rel in versionados[:MAX_FICHEIROS_VISIVEIS]:
+            caminho = self.raiz / rel
             try:
-                saida[rel] = (self.raiz / rel).read_text(encoding="utf-8")
+                if caminho.stat().st_size > 120_000:
+                    continue
+                texto = caminho.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
                 continue
+            if gasto + len(texto) > limite_bytes:
+                continue
+            gasto += len(texto)
+            saida[rel] = texto
         return saida
 
     def aplicar(self, ficheiro: str, edicoes: list[dict]) -> tuple[bool, str]:
@@ -2620,11 +2674,13 @@ class Orquestrador:
         """Le os ficheiros uma unica vez: todas as hipoteses partem do mesmo HEAD."""
         params = self._params_vivos()
         with Sandbox(f"{tarefa['id']}_leitura") as sb:
-            ficheiros = sb.ler_editaveis()
-        if not ficheiros:
+            ficheiros = sb.ler_visiveis()      # ve tudo; edita so o permitido
+        editaveis = {r for r in ficheiros if caminho_permitido(r, FICHEIROS_EDITAVEIS)}
+        if not editaveis:
             self.aviso.enviar(
                 f"⚠️ Nenhum ficheiro versionado corresponde a FICHEIROS_EDITAVEIS "
-                f"({', '.join(FICHEIROS_EDITAVEIS)}). O agente nao tem onde mexer.")
+                f"({', '.join(FICHEIROS_EDITAVEIS)}). O agente nao tem onde mexer.\n"
+                f"Ve {len(ficheiros)} ficheiro(s), mas nao pode alterar nenhum.")
             return 0, []
         n, nomes = 0, []
         for h in hipoteses:
@@ -3797,17 +3853,23 @@ def doctor() -> int:
             try:
                 with Sandbox("doctor") as sb:
                     todos = sb.ficheiros_versionados()
-                editaveis = [f for f in todos if caminho_permitido(f, FICHEIROS_EDITAVEIS)]
-                protegidos = [f for f in todos if f not in editaveis]
+                visiveis = [f for f in todos if caminho_permitido(f, FICHEIROS_VISIVEIS)]
+                editaveis = [f for f in visiveis if caminho_permitido(f, FICHEIROS_EDITAVEIS)]
+                protegidos = [f for f in visiveis if f not in editaveis]
+                ok(f"le {len(visiveis)} de {len(todos)} ficheiros versionados")
                 if not editaveis:
                     erro("nenhum ficheiro versionado corresponde a FICHEIROS_EDITAVEIS")
                 else:
-                    ok(f"{len(editaveis)} ficheiro(s) ao alcance do agente")
+                    ok(f"pode ALTERAR {len(editaveis)}:")
                     for f in editaveis[:8]:
                         print(f"      ✏️  {f}")
-                    print(f"      🔒 {len(protegidos)} protegido(s), entre eles:")
-                    for f in protegidos[:5]:
-                        print(f"         {f}")
+                    if protegidos:
+                        print(f"      🔒 le mas nao altera ({len(protegidos)}):")
+                        for f in protegidos[:5]:
+                            print(f"         {f}")
+                    else:
+                        aviso("nao ha ficheiros protegidos: ele pode alterar tudo o que ve. "
+                              "As FUNCOES_PROTEGIDAS sao a unica coisa entre ele e a regua.")
             except Exception as e:
                 erro(f"nao consegui listar os ficheiros: {e}")
         # Quando a lista branca cobre um ficheiro que tambem calcula metricas, a

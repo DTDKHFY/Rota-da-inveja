@@ -51,7 +51,10 @@ def path_allowed(rel_path: str, patterns: tuple[str, ...] | list[str]) -> bool:
         return False  # nada de escapar da raiz do projeto
 
     for bruto in patterns:
-        padrao = str(PurePosixPath(bruto.strip().rstrip("/")))
+        cru = str(bruto).strip()
+        if cru in ("*", "**", "."):
+            return True
+        padrao = str(PurePosixPath(cru.rstrip("/")))
         if alvo == padrao or alvo.startswith(padrao + "/"):
             return True
         if re.fullmatch(_glob_para_regex(padrao), alvo):
