@@ -3315,8 +3315,20 @@ class Orquestrador:
             bruto, r = sb.backtest(params, *VALIDACAO)
         if bruto is None:
             raise ErroSandbox(f"baseline falhou: {r.resumo}\n{r.saida[-800:]}")
+        j = ler_metricas(bruto)
+        # Uma baseline com meia duzia de trades nao e um ponto de partida: e
+        # ruido. E todo o estudo se mede contra ela — MIN_MELHORIA_PCT compara
+        # com este numero. Deixar passar era construir tudo sobre nada, e so
+        # dar por isso ao fim de dezenas de ensaios.
+        if j.trades < MIN_TRADES:
+            raise ErroSandbox(
+                f"a baseline so fez {j.trades} trades na janela de validacao, e o "
+                f"gate exige {MIN_TRADES}.\n\nNao vale a pena abrir um estudo "
+                f"contra ela: e ela o termo de comparacao de tudo o resto. "
+                f"Ve porque e que a estrategia opera tao pouco antes de continuar:\n"
+                f"    python orq_runner.py --diagnostico")
         self.estado.gravar_baseline(estudo_id, bruto)
-        return ler_metricas(bruto)
+        return j
 
     def correr_holdout(self, ensaio_id: str) -> Janela:
         """So por ordem humana, e so uma vez.

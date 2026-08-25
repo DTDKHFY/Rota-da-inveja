@@ -643,6 +643,48 @@ def test_zero_trades_com_funil_diz_que_filtro_matou(tmp_path):
     assert not (p / "m.json").exists()      # nao escreve metricas falsas
 
 
+def test_o_funil_aponta_para_o_fim_e_nao_para_o_maior(tmp_path):
+    """O funil real do utilizador, que mostrou o defeito da mensagem antiga.
+
+    Ordenar por contagem punha `fora_de_londres` em primeiro e mandava
+    afrouxa-lo — mas esse filtro rejeita 3/4 do dia POR DESENHO: a estrategia
+    so opera em Londres. Afrouxa-lo era desligar a estrategia.
+
+    Quem tem contagem pequena esta no FIM do funil: sao os sinais que
+    sobreviveram a tudo e morreram a um passo da entrada.
+    """
+    p = alvo_que_devolve(tmp_path, "{'total': 0, 'closed': 0, 'trades': [], "
+                         "'no_entry_diagnostics': {'fora_de_londres': 1723695, "
+                         "'sem_rompimento': 304923, 'faixa_ja_operada': 268546, "
+                         "'spread_excedido': 1145, 'faixa_asia_curta': 360}}")
+    r = ensaio(p, {}, "2024-02-01", "2024-04-30")
+    assert r.returncode != 0
+
+    fim = r.stderr[r.stderr.index(">>>"):]
+    assert "spread_excedido" in fim          # o que se pode arranjar
+    assert "fora_de_londres" not in fim      # esse e por desenho
+    assert "spread_excedido" in r.stderr[r.stderr.index("tens de mexer") - 120:]
+    assert "1505 sinais chegaram" in r.stderr    # 1145 + 360
+
+
+def test_funil_so_estrutural_diz_que_nada_chegou_ao_fim(tmp_path):
+    p = alvo_que_devolve(tmp_path, "{'total': 0, 'closed': 0, 'trades': [], "
+                         "'no_entry_diagnostics': {'fora_de_londres': 500000, "
+                         "'sem_rompimento': 400000}}")
+    r = ensaio(p, {}, "2024-02-01", "2024-04-30")
+    assert "nunca gerou uma entrada" in r.stderr
+
+
+def test_os_dois_contadores_do_alvo_entram_no_funil(tmp_path):
+    """O alvo tem dois: `no_entry_diagnostics` antes da entrada e
+    `context_blocks` depois. Mostrar so um escondia metade da historia."""
+    p = alvo_que_devolve(tmp_path, "{'total': 0, 'closed': 0, 'trades': [], "
+                         "'no_entry_diagnostics': {'fora_de_londres': 900000}, "
+                         "'context_blocks': {'score_baixo': 12}}")
+    r = ensaio(p, {}, "2024-02-01", "2024-04-30")
+    assert "fora_de_londres" in r.stderr and "score_baixo" in r.stderr
+
+
 def test_zero_trades_sem_funil_aponta_para_as_janelas(tmp_path):
     """Sem `no_entry_diagnostics`, o teu script desistiu por falta de candles
     validos — e isso quase sempre e a janela a nao bater com o cache."""

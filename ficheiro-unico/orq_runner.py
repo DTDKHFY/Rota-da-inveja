@@ -376,18 +376,45 @@ def porque_zero(res: dict, barras, mod, inicio: str, fim: str) -> str:
             f"{datetime.utcfromtimestamp(t0):%Y-%m-%d} a "
             f"{datetime.utcfromtimestamp(t1):%Y-%m-%d}")
 
-    funil = res.get("no_entry_diagnostics") or res.get("context_blocks") or {}
+    funil = {**(res.get("context_blocks") or {}),
+             **(res.get("no_entry_diagnostics") or {})}
     if funil:
-        linhas = sorted(funil.items(), key=lambda kv: -int(kv[1] or 0))[:8]
         total = sum(int(v or 0) for v in funil.values())
-        return (
-            f"o motor avaliou os sinais e bloqueou-os todos ({total} no total).\n\n"
-            f"{onde}\n\nOnde eles morreram:\n"
-            + "\n".join(f"  {n:>7}  {r}" for r, n in linhas)
-            + "\n\nIsto e configuracao, nao avaria: afrouxa o filtro que esta no "
-              "topo da lista. Se for `sem_fluxo_agressor`, e ausencia de dados e "
-              "nao aperto — esse mercado nao serve a estrategia de acumulacao."
-        )
+        itens = sorted(funil.items(), key=lambda kv: -int(kv[1] or 0))
+
+        # O funil e SEQUENCIAL, e por isso ordenar por contagem engana: os
+        # numeros gigantes sao os primeiros filtros, que rejeitam quase tudo
+        # POR DESENHO (uma estrategia de sessao ignora 3/4 do dia de proposito).
+        # Mandar afrouxar o maior era mandar desligar a propria estrategia.
+        #
+        # Quem tem contagem pequena esta no FIM do funil: sao as barras que
+        # sobreviveram a tudo o resto e morreram a um passo da entrada. E ai
+        # que esta o que se pode arranjar.
+        corte = max(1, total // 100)          # 1% das barras
+        estrutural = [(r, n) for r, n in itens if n > corte]
+        terminais = [(r, n) for r, n in itens if n <= corte]
+
+        partes = [f"o motor avaliou os sinais e bloqueou-os todos "
+                  f"({total} barras no total).\n\n{onde}\n"]
+        if estrutural:
+            partes.append("\nPor desenho (a estrategia so opera em parte do dia):")
+            partes += [f"\n  {n:>9}  {r}" for r, n in estrutural[:6]]
+        if terminais:
+            sobreviventes = sum(n for _, n in terminais)
+            partes.append(
+                f"\n\n>>> {sobreviventes} sinais chegaram ao fim do funil, e "
+                f"morreram aqui:")
+            partes += [f"\n  {n:>9}  {r}" for r, n in terminais[:6]]
+            partes.append(
+                f"\n\nE em `{terminais[0][0]}` que tens de mexer. Se ele rejeita "
+                f"100% dos sinais que la chegam, nenhum valor de nenhum parametro "
+                f"o vai desbloquear — confirma se o limiar dele e compativel com "
+                f"a escala deste mercado.")
+        else:
+            partes.append("\n\nNenhum sinal chegou sequer ao fim do funil: o que "
+                          "esta acima e por desenho, e a estrategia nunca gerou "
+                          "uma entrada nesta janela.")
+        return "".join(partes)
 
     if res.get("trades"):
         return (f"houve {len(res['trades'])} trades, mas nenhum fechou dentro da "
@@ -475,6 +502,9 @@ def main() -> int:
                     help="mostra os parametros afinaveis e sai")
     ap.add_argument("--verificar", action="store_true",
                     help="confirma que da para correr offline e sai")
+    ap.add_argument("--diagnostico", type=int, metavar="DIAS", nargs="?", const=90,
+                    help="corre uma janela curta (por omissao 90 dias) so para "
+                         "ver o funil de bloqueios, e sai")
     a = ap.parse_args()
 
     try:
@@ -529,6 +559,36 @@ def main() -> int:
                       f'"{d1:%Y-%m-%d}")')
             print("\nDa para correr offline.")
             return 0
+
+        if a.diagnostico:
+            # Uma janela curta no FIM do cache: chega para ver onde os sinais
+            # morrem, e custa um minuto em vez dos trinta que a janela inteira
+            # gasta. Descobrir um filtro impossivel nao devia exigir um estudo.
+            from datetime import timedelta
+            barras_todas, _ = mod._load_bars_cache(simbolo)
+            if not barras_todas:
+                raise ErroRunner(f"nao ha candles em cache para {simbolo}.")
+            fim = datetime.utcfromtimestamp(mod._bar_ts_min(barras_todas[-1]) * 60)
+            ini = fim - timedelta(days=int(a.diagnostico))
+            print(f"Diagnostico: {simbolo}, {ini:%Y-%m-%d} a {fim:%Y-%m-%d} "
+                  f"({a.diagnostico} dias)\n")
+            semear(mod, a.semente)
+            barras, digits = carregar_barras(mod, simbolo,
+                                             f"{ini:%Y-%m-%d}", f"{fim:%Y-%m-%d}")
+            res, cfg = correr(mod, barras, digits, {}, "diagnostico", None)
+            fechados = sum(1 for t in (res.get("trades") or [])
+                           if int(t.get("close_ts") or 0) > 0)
+            if fechados:
+                print(f"✅ {fechados} trades fecharam nesta janela. O motor opera.")
+                funil = {**(res.get("context_blocks") or {}),
+                         **(res.get("no_entry_diagnostics") or {})}
+                if funil:
+                    print("\nFunil de bloqueios:")
+                    for r, n in sorted(funil.items(), key=lambda kv: -int(kv[1] or 0))[:10]:
+                        print(f"  {int(n or 0):>9}  {r}")
+                return 0
+            print(porque_zero(res, barras, mod, f"{ini:%Y-%m-%d}", f"{fim:%Y-%m-%d}"))
+            return 1
 
         em_falta = [n for n in ("params", "start", "end", "out") if not getattr(a, n)]
         if em_falta:
