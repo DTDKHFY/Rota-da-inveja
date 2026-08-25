@@ -493,6 +493,126 @@ def test_o_proprio_runner_nao_e_acusado():
 
 
 # ---------------------------------------------------------------------------
+#  Parametros que nao estao ligados a nada
+# ---------------------------------------------------------------------------
+class _OrqFalso:
+    """So o suficiente para exercitar _params_mortos sem montar o sistema."""
+
+    def __init__(self, historico):
+        self._h = historico
+
+    def _historico(self, estudo_id, n=30):
+        return self._h[-n:]
+
+
+def mortos(historico):
+    orq = carregar_orquestrador()
+    return orq.Orquestrador._params_mortos(_OrqFalso(historico), "est_1")
+
+
+def h(sharpe, **params):
+    return {"params": params, "hipotese": "", "sharpe": sharpe}
+
+
+def test_tres_ensaios_iguais_denunciam_o_parametro(alvo):
+    """O sintoma que custou 12 ensaios: numeros identicos com parametros
+    diferentes. Nao e a estrategia a nao prestar — e o motor a nao ler."""
+    assert mortos([h(0.0, EMA_FAST=9), h(0.0, EMA_FAST=15),
+                   h(0.0, EMA_FAST=30)]) == ["EMA_FAST"]
+
+
+def test_dois_ensaios_ainda_nao_chegam():
+    """Dois valores darem o mesmo numero ainda e coincidencia plausivel."""
+    assert mortos([h(0.0, EMA_FAST=9), h(0.0, EMA_FAST=15)]) is None
+
+
+def test_resultados_que_mexem_nao_acusam_ninguem():
+    assert mortos([h(0.0, EMA_FAST=9), h(0.4, EMA_FAST=15),
+                   h(0.0, EMA_FAST=30)]) is None
+
+
+def test_so_acusa_o_parametro_que_variou():
+    """Um parametro que ficou parado nao provou nada, e acusa-lo mandava-te
+    procurar no sitio errado."""
+    assert mortos([h(0.0, EMA_FAST=9, SESSAO_LIMIAR=0.25),
+                   h(0.0, EMA_FAST=15, SESSAO_LIMIAR=0.25),
+                   h(0.0, EMA_FAST=30, SESSAO_LIMIAR=0.25)]) == ["EMA_FAST"]
+
+
+def test_varios_mortos_saem_todos():
+    assert mortos([h(1.0, A=1, B=10), h(1.0, A=2, B=20),
+                   h(1.0, A=3, B=30)]) == ["A", "B"]
+
+
+def test_ensaios_sem_sharpe_nao_contam():
+    assert mortos([h(None, A=1), h(None, A=2), h(None, A=3)]) is None
+
+
+def test_nao_acusa_quando_os_params_nao_mudaram():
+    """Repetir o mesmo ensaio da o mesmo numero, e ainda bem — isso e a
+    reprodutibilidade a funcionar, nao um parametro morto."""
+    assert mortos([h(0.5, A=1), h(0.5, A=1), h(0.5, A=1)]) is None
+
+
+# ---------------------------------------------------------------------------
+#  Zero trades nao e uma medicao
+# ---------------------------------------------------------------------------
+def alvo_que_devolve(tmp_path: Path, corpo_do_retorno: str) -> Path:
+    """Um duplo cujo run_backtest devolve exatamente o dict que eu mandar."""
+    fonte = DUPLO.replace(
+        DUPLO[DUPLO.index("def run_backtest("):DUPLO.index('if __name__ == "__main__":')],
+        "def run_backtest(bars_raw, digits, label='', cfg=None):\n"
+        f"    return {corpo_do_retorno}\n\n")
+    (tmp_path / "run_backtest.py").write_text(fonte, encoding="utf-8")
+    escrever_cache(tmp_path, dias=200, passo_min=60)
+    return tmp_path
+
+
+def test_zero_trades_com_funil_diz_que_filtro_matou(tmp_path):
+    """O gate recebia `Sharpe 0.00` e chumbava por `sharpe_oos` — a mensagem
+    culpava o parametro quando o problema era um filtro a cortar tudo."""
+    p = alvo_que_devolve(tmp_path, "{'total': 0, 'closed': 0, 'trades': [], "
+                         "'no_entry_diagnostics': {'fora_de_londres': 90000, "
+                         "'sem_rompimento': 412, 'faixa_asia_curta': 7}}")
+    r = ensaio(p, {}, "2024-02-01", "2024-04-30")
+    assert r.returncode != 0
+    assert "bloqueou-os todos" in r.stderr
+    assert "fora_de_londres" in r.stderr and "90000" in r.stderr
+    assert not (p / "m.json").exists()      # nao escreve metricas falsas
+
+
+def test_zero_trades_sem_funil_aponta_para_as_janelas(tmp_path):
+    """Sem `no_entry_diagnostics`, o teu script desistiu por falta de candles
+    validos — e isso quase sempre e a janela a nao bater com o cache."""
+    p = alvo_que_devolve(tmp_path, "{'total': 0, 'closed': 0, 'trades': []}")
+    r = ensaio(p, {}, "2024-02-01", "2024-04-30")
+    assert r.returncode != 0
+    assert "nem chegou a avaliar" in r.stderr
+    assert "--verificar" in r.stderr
+
+
+def test_trades_todos_abertos_tambem_e_zero(tmp_path):
+    p = alvo_que_devolve(tmp_path, "{'total': 1, 'closed': 0, 'trades': ["
+                         "{'side': 'BUY', 'pnl': 500.0, 'close_ts': 0, 'open_ts': 1}]}")
+    r = ensaio(p, {}, "2024-02-01", "2024-04-30")
+    assert r.returncode != 0
+    assert "nenhum fechou" in r.stderr
+
+
+def test_a_janela_do_cache_aparece_no_diagnostico(tmp_path):
+    p = alvo_que_devolve(tmp_path, "{'total': 0, 'closed': 0, 'trades': []}")
+    r = ensaio(p, {}, "2024-02-01", "2024-04-30")
+    assert "2024-02-01" in r.stderr and "2024-04-30" in r.stderr
+
+
+def test_com_trades_o_funil_entra_nas_metricas(alvo):
+    """Com trades a mais isto e curiosidade; quando a contagem cai a pique e a
+    primeira coisa que se quer ver."""
+    assert ensaio(alvo, {}, "2024-02-01", "2024-04-30").returncode == 0
+    assert "bloqueios" in json.loads((alvo / "m.json").read_text())
+
+
+# ---------------------------------------------------------------------------
 #  O arnes entra no worktree sem passar pelo git
 # ---------------------------------------------------------------------------
 def repo_com_arnes(tmp_path: Path) -> Path:

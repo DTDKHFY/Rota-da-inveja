@@ -325,6 +325,85 @@ def serie_de_retornos(trades, por_ponto: float, dias: list[str], capital: float)
     return rets, curva, fechados, ruina
 
 
+def outros_simbolos(mod, atual: str) -> list[tuple[str, int, str, str]]:
+    """Que mercados ja tens em disco, alem do que estas a usar.
+
+    Vale a pena porque a estrategia certa para um mercado pode nao ser a certa
+    para outro, e descobrir isso a olhar para a pasta e mais rapido do que
+    descobri-lo a gastar ensaios.
+    """
+    achados = []
+    try:
+        pasta = Path(mod._bars_cache_dir())
+    except Exception:
+        return achados
+    for f in sorted(pasta.glob("bars_*_M1.pkl")):
+        nome = f.name[len("bars_"):-len("_M1.pkl")]
+        if nome.upper() == str(atual).upper():
+            continue
+        try:
+            barras, _ = mod._load_bars_cache(nome)
+        except Exception:
+            continue
+        if not barras:
+            continue
+        t0 = mod._bar_ts_min(barras[0]) * 60
+        t1 = mod._bar_ts_min(barras[-1]) * 60
+        achados.append((nome, len(barras),
+                        f"{datetime.utcfromtimestamp(t0):%Y-%m-%d}",
+                        f"{datetime.utcfromtimestamp(t1):%Y-%m-%d}"))
+    return achados
+
+
+def porque_zero(res: dict, barras, mod, inicio: str, fim: str) -> str:
+    """Um backtest sem trades nao e uma medicao. Diz porque.
+
+    Zero trades chegava ao gate como Sharpe 0.00, que parece um resultado e
+    nao e: e o motor a nao correr. Pior, esse 0.00 entrava na variancia dos
+    ensaios anteriores, que e o que alimenta o Deflated Sharpe — um punhado
+    de corridas vazias estragava a conta de todas as seguintes.
+
+    O teu script distingue tres casos e eu sei le-los:
+      - `no_entry_diagnostics` presente: avaliou sinais e bloqueou-os todos,
+        e diz qual filtro os matou;
+      - ausente e sem trades: nem chegou a avaliar, faltaram candles validos;
+      - trades abertos mas nenhum fechado: a janela acabou a meio.
+    """
+    t0 = mod._bar_ts_min(barras[0]) * 60
+    t1 = mod._bar_ts_min(barras[-1]) * 60
+    onde = (f"Janela pedida: {inicio} a {fim}\n"
+            f"Candles que la estavam: {len(barras)}, de "
+            f"{datetime.utcfromtimestamp(t0):%Y-%m-%d} a "
+            f"{datetime.utcfromtimestamp(t1):%Y-%m-%d}")
+
+    funil = res.get("no_entry_diagnostics") or res.get("context_blocks") or {}
+    if funil:
+        linhas = sorted(funil.items(), key=lambda kv: -int(kv[1] or 0))[:8]
+        total = sum(int(v or 0) for v in funil.values())
+        return (
+            f"o motor avaliou os sinais e bloqueou-os todos ({total} no total).\n\n"
+            f"{onde}\n\nOnde eles morreram:\n"
+            + "\n".join(f"  {n:>7}  {r}" for r, n in linhas)
+            + "\n\nIsto e configuracao, nao avaria: afrouxa o filtro que esta no "
+              "topo da lista. Se for `sem_fluxo_agressor`, e ausencia de dados e "
+              "nao aperto — esse mercado nao serve a estrategia de acumulacao."
+        )
+
+    if res.get("trades"):
+        return (f"houve {len(res['trades'])} trades, mas nenhum fechou dentro da "
+                f"janela.\n\n{onde}\n\nAlarga a janela, ou encurta o alvo.")
+
+    return (
+        f"o motor nem chegou a avaliar sinais.\n\n{onde}\n\n"
+        f"O teu run_backtest.py desiste em silencio quando fica com menos de 50 "
+        f"candles VALIDOS — e ele descarta candles com preco de fecho <= 0.1, por "
+        f"isso o numero dele pode ser bem menor do que os {len(barras)} que eu lhe "
+        f"dei.\n\nO mais provavel e as janelas do orquestrador (TREINO, VALIDACAO, "
+        f"HOLDOUT) nao baterem certo com o que ha em cache. Confirma o que tens:\n"
+        f"    python orq_runner.py --verificar"
+    )
+
+
 def drawdown_maximo(curva: list[float]) -> float:
     pico, pior = curva[0] if curva else 0.0, 0.0
     for v in curva:
@@ -411,16 +490,44 @@ def main() -> int:
             barras, digits = mod._load_bars_cache(simbolo)
             print(f"alvo      : {a.alvo}")
             print(f"simbolo   : {simbolo}")
+            print(f"estrategia: {getattr(mod, 'ESTRATEGIA', '?')}")
             print(f"cache     : {mod._bars_cache_path(simbolo)}")
+            outros = outros_simbolos(mod, simbolo)
+            if outros:
+                print("\noutros mercados que ja tens em cache:")
+                for nome, n, ini, fim in outros:
+                    print(f"  {nome:<12} {n:>9} candles  {ini} a {fim}")
+                print()
             if not barras:
                 print("candles   : NENHUM — enche o cache com /run ou /importcsv")
                 return 1
             t0 = mod._bar_ts_min(barras[0]) * 60
             t1 = mod._bar_ts_min(barras[-1]) * 60
-            print(f"candles   : {len(barras)} ({datetime.utcfromtimestamp(t0):%Y-%m-%d}"
-                  f" a {datetime.utcfromtimestamp(t1):%Y-%m-%d}), digits={digits}")
+            d0 = datetime.utcfromtimestamp(t0)
+            d1 = datetime.utcfromtimestamp(t1)
+            print(f"candles   : {len(barras)} ({d0:%Y-%m-%d} a {d1:%Y-%m-%d}), "
+                  f"digits={digits}")
             print(f"params    : {len(afinaveis(mod))} afinaveis")
-            print("\nDa para correr offline. Usa estas datas nas janelas do orquestrador.")
+
+            # Sugerir as janelas em vez de deixar adivinhar: janelas que nao
+            # batem certo com o cache dao zero trades, e zero trades parece um
+            # resultado mau quando e so o motor a nao correr.
+            vao = (d1 - d0).days
+            if vao < 90:
+                print(f"\n⚠️  So ha {vao} dias em cache. Da para um teste, nao da "
+                      f"para treino/validacao/holdout separados.")
+            else:
+                from datetime import timedelta
+                c1 = d0 + timedelta(days=int(vao * 0.5))
+                c2 = d0 + timedelta(days=int(vao * 0.75))
+                print("\nPoe isto no orquestrador.py (metade treino, "
+                      "um quarto validacao, um quarto holdout):")
+                print(f'    TREINO    = ("{d0:%Y-%m-%d}", "{c1:%Y-%m-%d}")')
+                print(f'    VALIDACAO = ("{c1 + timedelta(days=1):%Y-%m-%d}", '
+                      f'"{c2:%Y-%m-%d}")')
+                print(f'    HOLDOUT   = ("{c2 + timedelta(days=1):%Y-%m-%d}", '
+                      f'"{d1:%Y-%m-%d}")')
+            print("\nDa para correr offline.")
             return 0
 
         em_falta = [n for n in ("params", "start", "end", "out") if not getattr(a, n)]
@@ -448,6 +555,9 @@ def main() -> int:
         rets, curva, fechados, ruina = serie_de_retornos(
             res.get("trades") or [], por_ponto, dias, a.capital)
 
+        if fechados == 0:
+            raise ErroRunner(porque_zero(res, barras, mod, a.start, a.end))
+
         saida = {
             "returns": rets,
             "trades": int(fechados),
@@ -464,6 +574,10 @@ def main() -> int:
             "pnl_usd": float(res.get("pnl_usd") or 0.0),
             "pontos": float(res.get("total_pips") or 0.0),
             "drawdown_do_script": float(res.get("drawdown") or 0.0),
+            # Onde os sinais morreram. Com trades a mais isto e curiosidade;
+            # quando a contagem cai a pique e a primeira coisa que se quer ver.
+            "bloqueios": {str(k): int(v or 0) for k, v in
+                          (res.get("context_blocks") or {}).items()},
             "usd_por_ponto": por_ponto,
             "capital_base": a.capital,
             "ruina": ruina,

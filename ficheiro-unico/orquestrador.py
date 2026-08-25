@@ -154,6 +154,25 @@ MAX_LINHAS_EDICAO = 120              # travao contra reescritas
 FUNCOES_PROTEGIDAS: list[str] = []
 
 # Limites dos parametros (usados em MODO="params"; o agente nunca sai daqui)
+#
+# DUAS ARMADILHAS, e eu ja cai nas duas.
+#
+# 1. PARAMETROS MORTOS. Um nome existir no teu codigo nao quer dizer que o
+#    motor ATIVO o leia. Se a tua estrategia tem varios motores selecionaveis,
+#    os parametros dos outros continuam la, aceitam qualquer valor, e nao mudam
+#    coisa nenhuma. O sintoma e cruel: todos os ensaios dao exatamente o mesmo
+#    numero, e parece que a estrategia nao presta quando o que se esta a variar
+#    nao esta ligado a nada. Antes de encher esta lista, confirma no codigo que
+#    o motor ativo le mesmo cada nome.
+#
+# 2. PARAMETROS A MAIS. Cada eixo extra exige mais historico para o resultado
+#    ser credivel — pelo MinBTL (Bailey, Borwein, Lopez de Prado, Zhu), da
+#    ordem de +3 anos por parametro para um Sharpe 1.0. Tres parametros pedem
+#    ~7 anos; oito pedem ~22. Se tens um ano de dados, quatro eixos ja e uma
+#    pergunta grande demais, e nenhuma quantidade de ensaios a torna pequena.
+#    O DSR desconta as tentativas; nao inventa historico que nao existe.
+#
+#    A regra que funciona: para acrescentar um parametro, tira outro.
 PARAMETROS = {
     "sma_fast":        {"tipo": "int",   "min": 2,     "max": 50},
     "sma_slow":        {"tipo": "int",   "min": 10,    "max": 300},
@@ -166,6 +185,11 @@ TREINO    = ("2015-01-01", "2021-12-31")   # o agente otimiza aqui
 VALIDACAO = ("2022-01-01", "2023-12-31")   # e medido aqui
 HOLDOUT   = ("2024-01-01", "2025-12-31")   # NUNCA automaticamente. So tu.
 MAX_ENSAIOS_POR_ESTUDO = 200               # trava de multiple testing
+
+# Quantos ensaios seguidos com o MESMO resultado exato antes de eu parar o
+# estudo e desconfiar dos parametros. Tres chega: dois valores diferentes
+# darem o mesmo numero ainda e coincidencia plausivel; tres nao e.
+MIN_ENSAIOS_PARA_SUSPEITA = 3
 
 # --- Gate: todos os criterios tem de passar --------------------------------
 MIN_TRADES = 100
@@ -2625,6 +2649,38 @@ class Orquestrador:
     def _sharpes(self, estudo_id: str) -> list[float]:
         return [h["sharpe"] for h in self._historico(estudo_id, 500) if h["sharpe"] is not None]
 
+    def _params_mortos(self, estudo_id: str) -> list[str] | None:
+        """Que parametros variaram sem mudar coisa nenhuma no resultado?
+
+        Um nome existir no codigo do alvo nao quer dizer que o motor ATIVO o
+        leia. Quando a estrategia tem varios motores selecionaveis, os
+        parametros dos outros continuam la, aceitam qualquer valor e nao ligam
+        a nada — e o estudo passa a varrer botoes desligados.
+
+        O sintoma e mudo: ensaios diferentes com o MESMO numero. Sem esta
+        verificacao o agente conclui "a estrategia nao presta", quando o que
+        se estava a variar nunca chegou a entrar na conta.
+
+        Devolve os nomes suspeitos, ou None enquanto nao houver prova.
+        """
+        historico = [h for h in self._historico(estudo_id, 500)
+                     if h["sharpe"] is not None]
+        if len(historico) < MIN_ENSAIOS_PARA_SUSPEITA:
+            return None
+        if len({round(h["sharpe"], 9) for h in historico}) != 1:
+            return None            # os resultados mexem-se: nada a dizer
+
+        # So acusa um parametro que REALMENTE tomou valores diferentes. Um que
+        # ficou parado nao provou nada, e acusa-lo mandava-te procurar no
+        # sitio errado.
+        variaram = []
+        for nome in {k for h in historico for k in h["params"]}:
+            vistos = {json.dumps(h["params"].get(nome), sort_keys=True)
+                      for h in historico}
+            if len(vistos) > 1:
+                variaram.append(nome)
+        return sorted(variaram) or None
+
     def _melhores_params(self, estudo_id: str) -> dict:
         melhor, top = {}, float("-inf")
         for h in self._historico(estudo_id, 500):
@@ -2887,6 +2943,28 @@ class Orquestrador:
             self.aviso.enviar(
                 f"❌ `{eid}` chumbou ({', '.join(c.nome for c in veredito.falhas)}) — "
                 f"Sharpe OOS {validacao.sharpe_anual:.2f}, DSR {veredito.dsr:.3f}")
+
+        # Antes de gastar mais um ensaio: os parametros estao ligados a alguma
+        # coisa? Isto interrompe o estudo, e e para interromper — continuar a
+        # varrer botoes desligados nao produz conhecimento nenhum.
+        estudo_row = self.estado.estudo(estudo_id)
+        mortos = self._params_mortos(estudo_id) if (
+            estudo_row and estudo_row["estado"] == "aberto") else None
+        if mortos:
+            self.estado.fechar_estudo(
+                estudo_id, f"parametros sem efeito: {', '.join(mortos)}")
+            descartados = self.estado.cancelar_fila()
+            self.aviso.enviar(
+                f"⛔ Estudo parado ({descartados} ensaios descartados da fila). "
+                f"{len(self._historico(estudo_id, 500))} ensaios "
+                f"deram EXATAMENTE o mesmo Sharpe ({validacao.sharpe_anual:.2f}), "
+                f"apesar de estes parametros terem mudado:\n"
+                + "".join(f"  • {n}\n" for n in mortos)
+                + "\nIsso nao e a estrategia a nao prestar — e o motor ativo a nao "
+                  "ler estes valores. Se o teu codigo tem varios motores "
+                  "selecionaveis, estes sao provavelmente de outro.\n\n"
+                  "Confirma no codigo quais os parametros do motor ATIVO, poe so "
+                  "esses no PARAMETROS, e recomeca com /estudo.")
 
         # Ultimo do lote: um relatorio so, em vez de uma interrupcao por ensaio.
         # (O piloto tem o seu proprio relatorio, no fim de todas as rondas.)
