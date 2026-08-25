@@ -1916,12 +1916,27 @@ class Sandbox:
         try:
             p = subprocess.run([*prefixo, *argv], cwd=self.raiz, env=ambiente_limpo(),
                                capture_output=True, text=True,
+                               # Sem stdin: um script que peca input falha de
+                               # imediato em vez de ficar pendurado ate ao
+                               # timeout, e o erro diz o que se passou.
+                               stdin=subprocess.DEVNULL,
                                timeout=timeout or self.timeout, check=False)
         except subprocess.TimeoutExpired as e:
             parcial = e.stdout or b""
             if isinstance(parcial, bytes):
                 parcial = parcial.decode("utf-8", "replace")
-            return Resultado(False, -1, cortar(parcial), time.monotonic() - t0, True)
+            aviso_timeout = (
+                f"\n\n[orq] Passou de {timeout or self.timeout}s sem terminar.\n"
+                "     Antes de subires o limite, confirma que o comando TERMINA:\n"
+                "     um script que arranca um bot, abre um menu, ou fica a ouvir\n"
+                "     comandos nunca sai, e nenhum timeout resolve isso.\n"
+                "     Testa a mao, na pasta do projeto:\n"
+                f"       {resolver_python(COMANDO_BACKTEST).split()[0]} <o teu script> --help\n"
+                "     Se ele nao aceitar argumentos e for interativo, precisas de um\n"
+                "     modo nao-interativo — ou de um pequeno script que chame a\n"
+                "     funcao do backtest diretamente e escreva o JSON de metricas.")
+            return Resultado(False, -1, cortar(parcial) + aviso_timeout,
+                             time.monotonic() - t0, True)
         except FileNotFoundError as e:
             raise ErroSandbox(f"comando nao encontrado: {argv[0]}") from e
         junto = p.stdout + (("\n[stderr]\n" + p.stderr) if p.stderr else "")
@@ -4029,6 +4044,14 @@ PISTAS_ESTRATEGIA = ("estrateg", "strateg", "sinal", "signal", "indicador",
 
 # Nomes de funcao que denunciam calculo ou registo de resultados. Servem para
 # propor FUNCOES_PROTEGIDAS quando tudo vive no mesmo ficheiro.
+# Sinais de que o script nao termina sozinho: e um bot, um menu, um servidor.
+# Correr um destes num backtest automatico da timeout, nao resultado.
+PISTAS_INTERATIVO = (
+    "telegram", "getupdates", "polling", "start_polling", "run_polling",
+    "input(", "while true:", "app.run(", "uvicorn", "flask", "streamlit",
+    "bot.infinity_polling", "updater.start", "discord", "schedule.run_pending",
+)
+
 PISTAS_FUNCOES_METRICA = ("sharpe", "metric", "drawdown", "retorno", "return",
                           "pnl", "lucro", "profit", "equity", "resultado",
                           "score", "avalia", "estatistica", "stats", "relatorio",
@@ -4140,6 +4163,19 @@ def cmd_configurar(escrever: bool) -> int:
 
     if entrada:
         print(f"  Script de backtest : {entrada.relative_to(projeto).as_posix()}")
+        try:
+            corpo = entrada.read_text(encoding="utf-8", errors="replace").lower()
+        except OSError:
+            corpo = ""
+        encontrados = sorted({p for p in PISTAS_INTERATIVO if p in corpo})
+        if encontrados:
+            print("\n  ⚠️  ESTE SCRIPT PARECE FICAR A CORRER SOZINHO")
+            print(f"     Encontrei: {', '.join(encontrados[:6])}")
+            print("     Se ele arranca um bot ou fica a ouvir comandos, nunca termina —")
+            print("     e um backtest que nao termina da timeout, nao da resultado.")
+            print("     Precisas de um modo nao-interativo: um caminho no codigo que")
+            print("     corra o backtest, escreva o JSON de metricas, e saia.")
+            print("     Confirma com:  python <script> --help")
     else:
         print("  Script de backtest : NAO ENCONTRADO")
         print("     Procurei um .py com `__main__` e `add_argument`. Se o teu")
