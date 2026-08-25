@@ -98,6 +98,39 @@ python orquestrador.py            # arranca
 
 Correr sem argumentos arranca. Se faltar configuração, diz-te exatamente o quê.
 
+## Se o teu backtest for controlado por chat
+
+Há um caso que rebenta com tudo isto e não é óbvio: **um backtest que se
+comanda pelo Telegram**. Ele não termina — fica à espera de `/run`. Um ensaio
+que não termina dá timeout em vez de dar resultado, e nenhum bot pode mandar
+mensagens a outro bot para o desbloquear.
+
+[`../ficheiro-unico/orq_runner.py`](../ficheiro-unico/orq_runner.py) resolve
+isso sem alterar uma linha do teu script. Põe-no na mesma pasta e:
+
+```bash
+python orq_runner.py --verificar        # dá para correr offline?
+python orq_runner.py --listar-params    # que parâmetros há para afinar
+```
+
+Importa o teu ficheiro como módulo (e não como `__main__`, por isso o bot
+nunca arranca), lê os candles do cache em disco, chama a função de backtest
+em síncrono e escreve o JSON de métricas. Depois é só apontar:
+
+```python
+COMANDO_BACKTEST = "{python} orq_runner.py --params {params} --start {inicio} --end {fim} --out {saida}"
+```
+
+**O que ele desliga, e porquê.** Se o teu script aprende enquanto corre —
+memória de contexto que cresce, modelos que se retreinam ao fim de cada run —
+o runner força tudo isso a *off*, e recusa-se a correr se um ensaio tentar
+ligá-lo outra vez. Não é excesso de zelo. Com aprendizagem ligada o ensaio nº2
+já não corre contra o mesmo modelo que o nº1, portanto a diferença entre eles
+deixa de medir a hipótese que se queria testar; e a memória acumula trades das
+janelas seguintes, de modo que ao chegar ao holdout o modelo já viu o futuro.
+O Deflated Sharpe não apanha isto — corrige o número de tentativas, não a
+contaminação entre elas.
+
 Mesmas guardas: holdout protegido, lista branca de ficheiros editáveis, DSR, sem
 merge automático. O que perde face ao pacote: a suite de 120 testes (tem um
 `teste` embutido, mais curto) e a facilidade de manutenção quando crescer.

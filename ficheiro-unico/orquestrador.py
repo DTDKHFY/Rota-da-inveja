@@ -63,7 +63,7 @@ except ImportError:
 # Preferes nao ter o token no ficheiro?  Deixa "" e usa a variavel de ambiente:
 #     export TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_TOKEN = ""
-CHAT_ID = 6853762483          # so este chat pode dar ordens
+CHAT_ID = 0                   # so este chat pode dar ordens
 
 # --- Modelos (ve os nomes exatos com: ollama list) -------------------------
 # Um modelo por agente. MODELO_DESENVOLVIMENTO e passado ao programador.py.
@@ -84,6 +84,17 @@ PROJETO = "/caminho/para/o/teu/backtest"
 # {python} e o interpretador que esta a correr este ficheiro. Usa-o em vez de
 # escreveres "python": no Windows a palavra solta apanha o atalho da Microsoft
 # Store, que devolve o erro 9009 e nao corre nada.
+#
+# SE O TEU BACKTEST FOR CONTROLADO POR TELEGRAM (ou por qualquer outro chat),
+# ele nunca termina sozinho: fica a espera de um comando, e um ensaio que nao
+# termina da timeout em vez de dar resultado. Poe o orq_runner.py ao lado dele
+# e aponta para ai — o runner chama a funcao do backtest diretamente, sem
+# passar pelo bot, e o teu ficheiro nao e alterado:
+#
+#   COMANDO_BACKTEST = "{python} orq_runner.py --params {params} \
+#                       --start {inicio} --end {fim} --out {saida}"
+#
+# Confirma primeiro com:  python orq_runner.py --verificar
 COMANDO_BACKTEST = "{python} run_backtest.py --params {params} --start {inicio} --end {fim} --out {saida}"
 
 # Testes do teu projeto. Correm depois de alterar o codigo e ANTES do backtest:
@@ -4046,11 +4057,70 @@ PISTAS_ESTRATEGIA = ("estrateg", "strateg", "sinal", "signal", "indicador",
 # propor FUNCOES_PROTEGIDAS quando tudo vive no mesmo ficheiro.
 # Sinais de que o script nao termina sozinho: e um bot, um menu, um servidor.
 # Correr um destes num backtest automatico da timeout, nao resultado.
+# Pistas de que o script fica a ouvir em vez de terminar. Cada uma tem de ser
+# uma chamada ou um endereco — a palavra "telegram" solta apanhava qualquer
+# ficheiro que apenas FALE de Telegram, incluindo os que existem para lhe fugir.
 PISTAS_INTERATIVO = (
-    "telegram", "getupdates", "polling", "start_polling", "run_polling",
+    "api.telegram.org", "getupdates", "polling", "start_polling", "run_polling",
     "input(", "while true:", "app.run(", "uvicorn", "flask", "streamlit",
-    "bot.infinity_polling", "updater.start", "discord", "schedule.run_pending",
+    "bot.infinity_polling", "updater.start", "discord.com/api", "discordapp.com",
+    "schedule.run_pending",
 )
+
+def codigo_nu(fonte: str) -> str:
+    """A fonte sem comentarios nem docstrings, em minusculas.
+
+    As pistas de "isto e interativo" tem de ser procuradas no codigo que
+    corre, nao na prosa a volta dele: um ficheiro que EXPLICA como fugir ao
+    Telegram fala de Telegram em cada paragrafo, e a procura no texto todo
+    acusava-o de ser um bot.
+
+    Mas as OUTRAS strings ficam. E num "https://api.telegram.org/..." que se
+    ve um bot a serio, e esse e o achado que interessa nao perder.
+    """
+    import tokenize as _tk
+    from io import StringIO as _SIO
+    try:
+        arvore = ast.parse(fonte)
+    except SyntaxError:
+        return fonte.lower()                  # ficheiro estranho: melhor falso alarme
+
+    docs = set()
+    for no in ast.walk(arvore):
+        if not isinstance(no, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+            continue
+        corpo = getattr(no, "body", None)
+        if not corpo:
+            continue
+        p = corpo[0]
+        if (isinstance(p, ast.Expr) and isinstance(p.value, ast.Constant)
+                and isinstance(p.value.value, str)):
+            docs.update(range(p.lineno, (p.end_lineno or p.lineno) + 1))
+
+    # Apagar por intervalos, deixando o resto do texto como estava. Juntar
+    # tokens com espacos partia as pistas com forma de codigo: "while True:"
+    # ficava "while  true  :" e deixava de casar com nada.
+    linhas = fonte.splitlines(keepends=True)
+    try:
+        for tok in _tk.generate_tokens(_SIO(fonte).readline):
+            if not (tok.type == _tk.COMMENT
+                    or (tok.type == _tk.STRING and tok.start[0] in docs)):
+                continue
+            (l0, c0), (l1, c1) = tok.start, tok.end
+            for n in range(l0, l1 + 1):
+                linha = linhas[n - 1]
+                ini = c0 if n == l0 else 0
+                fim = c1 if n == l1 else len(linha)
+                fim = min(fim, len(linha))
+                if ini >= fim:
+                    continue
+                # o \n no fim tem de ficar, senao as linhas colam-se
+                linhas[n - 1] = linha[:ini] + " " * (fim - ini) + linha[fim:]
+    except (_tk.TokenError, IndentationError, ValueError):
+        return fonte.lower()
+    return "".join(linhas).lower()
+
 
 PISTAS_FUNCOES_METRICA = ("sharpe", "metric", "drawdown", "retorno", "return",
                           "pnl", "lucro", "profit", "equity", "resultado",
@@ -4164,7 +4234,7 @@ def cmd_configurar(escrever: bool) -> int:
     if entrada:
         print(f"  Script de backtest : {entrada.relative_to(projeto).as_posix()}")
         try:
-            corpo = entrada.read_text(encoding="utf-8", errors="replace").lower()
+            corpo = codigo_nu(entrada.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             corpo = ""
         encontrados = sorted({p for p in PISTAS_INTERATIVO if p in corpo})
@@ -4175,7 +4245,13 @@ def cmd_configurar(escrever: bool) -> int:
             print("     e um backtest que nao termina da timeout, nao da resultado.")
             print("     Precisas de um modo nao-interativo: um caminho no codigo que")
             print("     corra o backtest, escreva o JSON de metricas, e saia.")
-            print("     Confirma com:  python <script> --help")
+            print()
+            print("     E para isso que serve o orq_runner.py. Poe-no ao lado do teu")
+            print(f"     {entrada.name} e confirma que ele consegue correr offline:")
+            print("         python orq_runner.py --verificar")
+            print("     Se correr, aponta o COMANDO_BACKTEST para o runner:")
+            print('         COMANDO_BACKTEST = "{python} orq_runner.py --params {params} '
+                  '--start {inicio} --end {fim} --out {saida}"')
     else:
         print("  Script de backtest : NAO ENCONTRADO")
         print("     Procurei um .py com `__main__` e `add_argument`. Se o teu")
