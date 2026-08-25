@@ -492,6 +492,61 @@ def test_o_proprio_runner_nao_e_acusado():
     assert pistas_de(RUNNER.read_text(encoding="utf-8")) == []
 
 
+# ---------------------------------------------------------------------------
+#  O arnes entra no worktree sem passar pelo git
+# ---------------------------------------------------------------------------
+def repo_com_arnes(tmp_path: Path) -> Path:
+    """Um projeto git onde o orq_runner.py existe mas NAO esta versionado."""
+    import subprocess as sp
+    projeto = tmp_path / "projeto"
+    projeto.mkdir()
+    (projeto / "run_backtest.py").write_text(DUPLO, encoding="utf-8")
+    (projeto / ".gitignore").write_text("orq_runner.py\n", encoding="utf-8")
+    for cmd in (["init", "-q"], ["add", "-A"]):
+        sp.run(["git", *cmd], cwd=projeto, check=True, capture_output=True)
+    sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+            "commit", "-qm", "inicial"], cwd=projeto, check=True, capture_output=True)
+    (projeto / "orq_runner.py").write_text("# sou o arnes\n", encoding="utf-8")
+    return projeto
+
+
+def test_o_arnes_chega_ao_worktree_sem_estar_no_git(tmp_path):
+    """O worktree so traz o que esta no git. O arnes nao esta — e nao deve
+    estar, porque o que esta dentro do worktree e alteravel."""
+    orq = carregar_orquestrador()
+    projeto = repo_com_arnes(tmp_path)
+    with orq.Sandbox("ens_teste", projeto=projeto,
+                     worktrees=tmp_path / "wt") as caixa:
+        raiz = caixa.raiz
+        assert "orq_runner.py" not in orq.Sandbox(
+            "ens_x", projeto=projeto).ficheiros_versionados()
+        assert (raiz / "run_backtest.py").is_file()          # veio do git
+        assert (raiz / "orq_runner.py").is_file()            # veio da copia
+        assert (raiz / "orq_runner.py").read_text(encoding="utf-8") == "# sou o arnes\n"
+        # copia e nao atalho: um atalho deixava o ensaio mexer no teu original
+        assert not (raiz / "orq_runner.py").is_symlink()
+        (raiz / "orq_runner.py").write_text("# estragado\n", encoding="utf-8")
+
+    with orq.Sandbox("ens_dois", projeto=projeto,
+                     worktrees=tmp_path / "wt") as caixa:
+        raiz = caixa.raiz
+        assert (raiz / "orq_runner.py").read_text(encoding="utf-8") == "# sou o arnes\n"
+        assert (projeto / "orq_runner.py").read_text(encoding="utf-8") == "# sou o arnes\n"
+
+
+def test_alterar_o_arnes_e_sempre_recusado():
+    """Mesmo com FICHEIROS_EDITAVEIS = ["*"]. A copia fresca protege o ensaio
+    seguinte; nao protege ESTE, e e este que da a nota."""
+    orq = carregar_orquestrador()
+    with pytest.raises(orq.CaminhoProibido, match="arnes"):
+        orq.exigir_permitido("orq_runner.py", ["*"])
+
+
+def test_a_estrategia_continua_editavel():
+    orq = carregar_orquestrador()
+    orq.exigir_permitido("run_backtest.py", ["run_backtest.py"])   # nao levanta
+
+
 def test_verificar_diz_o_que_ha_no_cache(alvo):
     r = invocar(alvo, "--verificar")
     assert r.returncode == 0

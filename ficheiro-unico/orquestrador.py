@@ -105,6 +105,16 @@ FICHEIRO_PARAMS = "params.json"      # onde vivem os parametros em producao
 PASTAS_LIGADAS = ["dados"]           # dados fora do git, ligados por symlink
 BACKTEST_COM_REDE = False            # True so se o teu backtest precisar mesmo
 
+# Ficheiros que sao ARNES, nao projeto: copiados do teu projeto para cada
+# ensaio, sempre frescos, sem passar pelo git. O orq_runner.py e o caso tipico.
+#
+# Porque nao os versionar e acabou? Porque o que esta versionado esta dentro do
+# worktree, e o que esta dentro do worktree e alteravel se um dia poseres
+# FICHEIROS_EDITAVEIS = ["*"]. O runner e quem calcula o Sharpe. Deixa-lo de
+# fora do git e o que torna impossivel — nao improvavel, impossivel — que o
+# agente mexa na regua com que e medido.
+FICHEIROS_ARNES = ["orq_runner.py"]
+
 # --- Modo de trabalho ------------------------------------------------------
 MODO = "code"        # "code" = o agente altera codigo | "params" = so valores
 
@@ -997,6 +1007,14 @@ def exigir_permitido(rel: str, padroes: Sequence[str]) -> None:
     if PurePosixPath(rel).name == Path(__file__).name:
         raise CaminhoProibido(
             f"`{rel}` e o proprio orquestrador. Nunca podes altera-lo.")
+    # O arnes e recopiado a cada ensaio, por isso uma alteracao nunca passaria
+    # para o ensaio seguinte — mas passava para ESTE, e era este que dava a nota.
+    # A lista branca nao chega aqui: FICHEIROS_EDITAVEIS = ["*"] cobriria isto.
+    alvo = str(PurePosixPath(rel))
+    if any(alvo == str(PurePosixPath(a)) for a in FICHEIROS_ARNES):
+        raise CaminhoProibido(
+            f"`{rel}` e o arnes: e ele que corre o backtest e calcula as metricas. "
+            f"Alterar quem te da a nota nao e uma melhoria da estrategia.")
     if not caminho_permitido(rel, padroes):
         raise CaminhoProibido(
             f"`{rel}` nao esta na lista de ficheiros editaveis. So podes alterar: "
@@ -1898,6 +1916,16 @@ class Sandbox:
                     alvo = destino / filho.name
                     if not alvo.exists() and not alvo.is_symlink():
                         ligar(filho, alvo)
+
+        # O arnes entra por copia, nao por symlink: um atalho apontaria para o
+        # teu ficheiro verdadeiro, e um ensaio que lhe mexesse mexia no original.
+        for rel in FICHEIROS_ARNES:
+            origem = self.projeto / rel
+            if not origem.is_file():
+                continue
+            destino = self.raiz / rel
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(origem, destino)
         return self.raiz
 
     def limpar(self):
@@ -2056,6 +2084,17 @@ class Sandbox:
         # corre primeiro e rebentaria com um marcador que nao conhece.
         script = script_do_comando(COMANDO_BACKTEST)
         if script and not (self.raiz / script).exists():
+            if script in FICHEIROS_ARNES:
+                # Esta na lista do arnes, logo devia ter sido copiado. Se nao
+                # chegou ca, e porque nao esta na pasta do projeto.
+                return None, Resultado(False, -1, (
+                    f"[orq] Falta o ficheiro `{script}` na pasta do teu projeto.\n\n"
+                    f"    {self.projeto / script}\n\n"
+                    f"Ele esta em FICHEIROS_ARNES, por isso eu copio-o para cada "
+                    f"ensaio — mas so o consigo copiar se ele existir ai. Nao "
+                    f"precisa de estar no git; basta estar na pasta.\n"
+                    f"Confirma que o nome nao ficou `{script}.py` (o Explorador do "
+                    f"Windows esconde a extensao e acrescenta outra)."), 0.0)
             versionados = self.ficheiros_versionados()
             candidatos = [f for f in versionados if f.endswith(".py")][:8]
             return None, Resultado(False, -1, (
@@ -2065,8 +2104,8 @@ class Sandbox:
                 + "\n".join(f"  - {c}" for c in candidatos or ["(nenhum)"])
                 + "\n\nSe o teu script tem outro nome, corre `configurar --escrever` "
                   "ou corrige o COMANDO_BACKTEST a mao.\n"
-                  "Se o ficheiro existe mas nao esta versionado, faz `git add` e commit: "
-                  "o worktree so traz o que esta no git."), 0.0)
+                  "Se o ficheiro e arnes (mede, nao e estrategia), poe o nome em "
+                  "FICHEIROS_ARNES: eu copio-o para cada ensaio sem precisar de git."), 0.0)
 
         r = self.correr(COMANDO_BACKTEST.format(
             python=citar(interpretador()),
@@ -3903,6 +3942,17 @@ def doctor() -> int:
     else:
         aviso("nao percebi que ficheiro o COMANDO_BACKTEST manda correr — "
               "confere-o a mao")
+
+    if p.is_dir():
+        for rel in FICHEIROS_ARNES:
+            if (p / rel).is_file():
+                ok(f"arnes copiado a cada ensaio: {rel}")
+            elif rel == script:
+                erro(f"FICHEIROS_ARNES tem `{rel}`, e o COMANDO_BACKTEST manda "
+                     f"corre-lo, mas ele nao esta em {p}. Poe o ficheiro nessa "
+                     f"pasta — nao precisa de git, so de estar la.")
+            else:
+                aviso(f"FICHEIROS_ARNES tem `{rel}`, que nao existe em {p}")
 
     if p.is_dir() and e_repo_git(p):
         pesados = ficheiros_pesados(p)
