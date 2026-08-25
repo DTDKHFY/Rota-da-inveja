@@ -493,6 +493,68 @@ def test_o_proprio_runner_nao_e_acusado():
 
 
 # ---------------------------------------------------------------------------
+#  Um erro tem de dizer o que correu mal
+# ---------------------------------------------------------------------------
+class _AvisoFalso:
+    def __init__(self):
+        self.enviadas = []
+
+    def enviar(self, msg):
+        self.enviadas.append(msg)
+
+
+class _EstadoFalso:
+    def __init__(self):
+        self.guardado = {}
+
+    def acabar_ensaio(self, eid, **kw):
+        self.guardado[eid] = kw
+
+
+def falhar(erro, saida):
+    orq = carregar_orquestrador()
+    o = _OrqFalso([])
+    o.estado, o.aviso = _EstadoFalso(), _AvisoFalso()
+    orq.Orquestrador._falhar(o, "ens_1", erro, saida)
+    return o.aviso.enviadas[0], o.estado.guardado["ens_1"]
+
+
+def test_o_diagnostico_vai_junto_com_o_erro():
+    """`falhou: backtest de treino falhou` nao diz nada e nao da nada para
+    fazer a seguir. O diagnostico ja estava na base de dados — faltava
+    entrega-lo."""
+    msg, gravado = falhar("backtest de treino: saiu com codigo 2 em 5s",
+                          "erro: o motor avaliou os sinais e bloqueou-os todos\n"
+                          "  90000  fora_de_londres")
+    assert "fora_de_londres" in msg and "90000" in msg
+    assert gravado["saida"]              # continua a ir para a base de dados
+
+
+def test_erro_sem_saida_nao_poe_bloco_vazio():
+    msg, _ = falhar("sandbox: PROJETO nao existe", None)
+    assert "```" not in msg
+    assert "PROJETO nao existe" in msg
+
+
+def test_saida_gigante_e_cortada_pelo_fim():
+    """O fim, nao o principio: e ai que vive a mensagem de erro."""
+    orq = carregar_orquestrador()
+    msg, _ = falhar("x", "COMECO" + ("ruido " * 5000) + "A CAUSA REAL")
+    assert "A CAUSA REAL" in msg
+    assert "COMECO" not in msg
+    assert len(msg) < orq.LIMITE_ERRO_TELEGRAM + 300
+
+
+def test_o_timeout_distingue_se_de_um_rebentamento():
+    """Sem o resumo, um script que expirou e um que rebentou leem-se igual."""
+    orq = carregar_orquestrador()
+    expirou = orq.Resultado(False, -1, "", 1800.0, True)
+    rebentou = orq.Resultado(False, 2, "", 5.0, False)
+    assert "timeout" in expirou.resumo and "1800" in expirou.resumo
+    assert "codigo 2" in rebentou.resumo
+
+
+# ---------------------------------------------------------------------------
 #  Parametros que nao estao ligados a nada
 # ---------------------------------------------------------------------------
 class _OrqFalso:

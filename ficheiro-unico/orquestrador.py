@@ -191,6 +191,20 @@ MAX_ENSAIOS_POR_ESTUDO = 200               # trava de multiple testing
 # darem o mesmo numero ainda e coincidencia plausivel; tres nao e.
 MIN_ENSAIOS_PARA_SUSPEITA = 3
 
+# Quanto da saida do comando vai junto com um erro para o Telegram. O fim, nao
+# o principio: e no fim que esta a mensagem de erro.
+LIMITE_ERRO_TELEGRAM = 900
+
+# Quanto tempo um backtest pode demorar antes de eu desistir dele.
+#
+# Cada ensaio corre isto DUAS vezes (treino e validacao), por isso o custo real
+# de um estudo e ~2x este numero vezes o numero de ensaios. Antes de subires,
+# desconfia dos LIMITES dos parametros: um alvo de saida muito largo faz cada
+# trade ficar aberto muito mais tempo, e a simulacao percorre barra a barra ate
+# ele fechar. Em barras de 1 minuto isso multiplica-se depressa — um limite mal
+# escolhido transforma um backtest de 2 minutos num de 40.
+TIMEOUT_BACKTEST = 1800
+
 # --- Gate: todos os criterios tem de passar --------------------------------
 MIN_TRADES = 100
 MIN_SHARPE_OOS = 0.5
@@ -1863,7 +1877,8 @@ class Sandbox:
     """Um worktree descartavel para um ensaio. Usar com `with`."""
 
     def __init__(self, ensaio_id: str, projeto: Path | None = None,
-                 worktrees: Path | None = None, timeout: int = 1800):
+                 worktrees: Path | None = None, timeout: int | None = None):
+        timeout = TIMEOUT_BACKTEST if timeout is None else timeout
         self.projeto = Path(projeto or PROJETO)
         self.raiz = Path(worktrees or WORKTREES) / ensaio_id
         self.timeout = timeout
@@ -2898,11 +2913,13 @@ class Orquestrador:
 
                 bruto_treino, r1 = sb.backtest(params, *TREINO)
                 if bruto_treino is None:
-                    return self._falhar(eid, "backtest de treino falhou", r1.saida)
+                    # O `resumo` diz se expirou ou se saiu com erro. Sem ele,
+                    # um timeout e um rebentamento leem-se exatamente igual.
+                    return self._falhar(eid, f"backtest de treino: {r1.resumo}", r1.saida)
                 self.estado.pulso(eid)
                 bruto_val, r2 = sb.backtest(params, *VALIDACAO)
                 if bruto_val is None:
-                    return self._falhar(eid, "backtest de validacao falhou", r2.saida)
+                    return self._falhar(eid, f"backtest de validacao: {r2.resumo}", r2.saida)
         except ViolacaoHoldout as e:
             self.aviso.enviar(f"🚨 VIOLACAO DE HOLDOUT em `{eid}`: {e}")
             return self._falhar(eid, f"violacao de holdout: {e}")
@@ -3029,8 +3046,24 @@ class Orquestrador:
                 "periodos_ano": j.periodos_ano}
 
     def _falhar(self, eid, erro, saida=None) -> bool:
+        """Falhar em silencio nao ajuda ninguem.
+
+        A saida do comando ia toda para a base de dados e nada dela chegava ao
+        Telegram: o utilizador via `falhou: backtest de treino falhou`, que nao
+        diz nada e nao da nada para fazer a seguir. O diagnostico ja existia —
+        so nao era entregue.
+
+        Mostro o FIM da saida, nao o principio: e ai que vive a mensagem de
+        erro. O principio costuma ser o arranque do script.
+        """
         self.estado.acabar_ensaio(eid, estado="falhou", erro=erro, saida=saida)
-        self.aviso.enviar(f"⚠️ `{eid}` falhou: {erro}")
+        msg = f"⚠️ `{eid}` falhou: {erro}"
+        cauda = (saida or "").strip()
+        if cauda:
+            if len(cauda) > LIMITE_ERRO_TELEGRAM:
+                cauda = "[...]\n" + cauda[-LIMITE_ERRO_TELEGRAM:]
+            msg += f"\n\n```\n{cauda}\n```"
+        self.aviso.enviar(msg)
         return False
 
     # -- aprender: web e codigo --------------------------------------------
