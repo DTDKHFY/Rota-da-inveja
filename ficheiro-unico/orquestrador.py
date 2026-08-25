@@ -4,6 +4,7 @@
     python orquestrador.py             arranca (bot + worker)
     python orquestrador.py teste       verifica que funciona, sem Ollama nem Telegram
     python orquestrador.py configurar  olha para o teu projeto e propoe as definicoes
+    python orquestrador.py libertar    tira dados pesados do git (o que trava tudo)
     python orquestrador.py doctor      verifica a TUA configuracao
     python orquestrador.py ver         que ficheiros o agente pode e nao pode tocar
 
@@ -4246,6 +4247,97 @@ def cmd_configurar(escrever: bool) -> int:
     return 0
 
 
+def cmd_libertar(confirmar: bool) -> int:
+    """Tira os dados pesados do git, numa so operacao.
+
+    Existe porque a sequencia manual tem demasiados passos e um deles e uma
+    armadilha: correr `git add -A` depois do `git rm --cached`, sem a pasta
+    estar no .gitignore, volta a adicionar tudo e desfaz o trabalho em silencio.
+    """
+    projeto = Path(PROJETO)
+    if not projeto.is_dir() or not e_repo_git(projeto):
+        print(f"\n❌ {PROJETO} nao e um repositorio git.\n")
+        return 1
+
+    pesados = ficheiros_pesados(projeto)
+    if not pesados:
+        print("\n✅ Nao ha dados pesados versionados. Nada a fazer.\n")
+        return 0
+
+    pastas = sorted({f.split("/")[0] for f, _ in pesados if "/" in f})
+    soltos = [f for f, _ in pesados if "/" not in f]
+    total = sum(t for _, t in pesados) / 1e6
+
+    print(f"\nEncontrei {total:.0f} MB versionados em {projeto}:\n")
+    for f, t in pesados[:8]:
+        print(f"   {t/1e6:8.1f} MB  {f}")
+    if len(pesados) > 8:
+        print(f"   ... e mais {len(pesados) - 8} ficheiro(s)")
+
+    print("\nO que vou fazer:")
+    for pasta in pastas:
+        print(f"   • acrescentar `{pasta}/` ao .gitignore")
+        print(f"   • git rm -r --cached {pasta}")
+    for f in soltos[:5]:
+        print(f"   • acrescentar `{f}` ao .gitignore e tirar do git")
+    print("   • commitar\n")
+    print("Os ficheiros NAO sao apagados. Continuam no disco, onde estao.")
+    print("Saem so do controlo de versoes — que e onde nunca deviam ter entrado.\n")
+
+    if not confirmar:
+        print(f"Para fazer isto:  python {Path(__file__).name} libertar --sim\n")
+        return 0
+
+    # 1. .gitignore primeiro. Se for ao contrario, o proximo `git add` traz tudo
+    #    de volta e o trabalho desfaz-se sem ninguem dar por isso.
+    caminho_gi = projeto / ".gitignore"
+    atual = caminho_gi.read_text(encoding="utf-8") if caminho_gi.is_file() else ""
+    linhas_existentes = {l.strip().strip("/") for l in atual.splitlines()}
+    novas = [f"{x}/" for x in pastas if x not in linhas_existentes]
+    novas += [f for f in soltos if f not in linhas_existentes]
+    if novas:
+        prefixo = "" if (not atual or atual.endswith("\n")) else "\n"
+        caminho_gi.write_text(
+            atual + prefixo + "\n# dados: pesados demais para o git\n" + "\n".join(novas) + "\n",
+            encoding="utf-8")
+        print(f"✅ .gitignore: acrescentei {', '.join(novas)}")
+
+    # 2. tirar do indice
+    alvos = pastas + soltos
+    r = git(projeto, "rm", "-r", "--cached", "--quiet", *alvos, check=False, timeout=900)
+    if r.returncode != 0:
+        print(f"\n❌ git rm falhou: {r.stderr.strip()[:300]}\n")
+        return 1
+    print(f"✅ tirei do git: {', '.join(alvos)}")
+
+    # 3. commitar so o que interessa
+    git(projeto, "add", ".gitignore", check=False)
+    r = git(projeto, "-c", "user.email=orq@local", "-c", "user.name=orquestrador",
+            "commit", "-m", "tirar dados pesados do controlo de versoes",
+            check=False, timeout=900)
+    if r.returncode != 0 and "nothing to commit" not in (r.stdout + r.stderr):
+        print(f"\n❌ o commit falhou: {(r.stderr or r.stdout).strip()[:300]}\n")
+        return 1
+    print("✅ commitado")
+
+    # 4. e ligar as pastas, senao o backtest deixa de encontrar os dados
+    if pastas:
+        origem = Path(__file__)
+        try:
+            texto = origem.read_text(encoding="utf-8")
+            origem.with_suffix(".py.bak").write_text(texto, encoding="utf-8")
+            juntas = sorted(set(list(PASTAS_LIGADAS) + pastas))
+            novo, ok_ = _substituir_constante(texto, "PASTAS_LIGADAS", repr(juntas))
+            if ok_:
+                origem.write_text(novo, encoding="utf-8")
+                print(f"✅ PASTAS_LIGADAS = {juntas!r}")
+        except OSError as exc:
+            print(f"⚠️  nao consegui atualizar PASTAS_LIGADAS: {exc}")
+
+    print(f"\nFeito. Confere com:  python {Path(__file__).name} doctor\n")
+    return 0
+
+
 # ===========================================================================
 #  AUTOTESTE — prova que o ficheiro funciona, sem Ollama e sem Telegram
 # ===========================================================================
@@ -4744,10 +4836,12 @@ def main(argv=None) -> int:
         prog="orquestrador", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("comando", nargs="?", default="correr",
-                    choices=["correr", "teste", "doctor", "configurar", "ver", "estado",
-                             "bot", "worker"],
+                    choices=["correr", "teste", "doctor", "configurar", "libertar",
+                             "ver", "estado", "bot", "worker"],
                     help="sem argumento nenhum: arranca")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--sim", action="store_true",
+                    help="com `libertar`: faz mesmo, em vez de so mostrar")
     ap.add_argument("--escrever", action="store_true",
                     help="com `configurar`: grava as definicoes neste ficheiro")
     a = ap.parse_args(argv)
@@ -4760,6 +4854,8 @@ def main(argv=None) -> int:
         return autoteste()
     if a.comando == "doctor":
         return doctor()
+    if a.comando == "libertar":
+        return cmd_libertar(a.sim)
     if a.comando == "configurar":
         return cmd_configurar(a.escrever)
     if a.comando == "ver":
