@@ -4682,6 +4682,7 @@ def autoteste() -> int:
     """Monta um projeto de mentira e corre o ciclo completo com um modelo guionado."""
     global PROJETO, WORKTREES, BD, COMANDO_BACKTEST, COMANDO_TESTES
     global FICHEIROS_EDITAVEIS, PASTAS_LIGADAS, MODO, MIN_DSR
+    global TREINO, VALIDACAO, HOLDOUT
 
     falhas = []
 
@@ -4713,6 +4714,14 @@ def autoteste() -> int:
     PASTAS_LIGADAS = ["data"]
     MODO = "code"
     MIN_DSR = 0.90
+    # As janelas do projeto falso, e nao as tuas. Este teste responde a "o
+    # programa funciona?", e a resposta nao pode depender da configuracao que
+    # estas a experimentar: janelas fora do intervalo dos dados falsos davam um
+    # IndexError aqui dentro e faziam o programa parecer partido quando o que
+    # estava mal era o alcance do teste.
+    TREINO    = ("2018-01-01", "2020-12-31")
+    VALIDACAO = ("2021-01-01", "2021-12-31")
+    HOLDOUT   = ("2022-01-01", "2022-12-31")
 
     print("\n=== 1. Contas: o Deflated Sharpe aperta com o numero de ensaios ===")
     rng = random.Random(7)
