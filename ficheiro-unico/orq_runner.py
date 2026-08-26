@@ -355,6 +355,30 @@ def outros_simbolos(mod, atual: str) -> list[tuple[str, int, str, str]]:
     return achados
 
 
+def orcamento_de_tempo(segundos: float, dias: int, teto: int = 1800) -> str:
+    """Quantos dias de janela cabem no timeout, medidos e nao adivinhados.
+
+    "Da timeout" nao diz o que fazer. "A tua janela e 13x maior do que cabe"
+    diz. E o custo nao e linear apenas no numero de barras: enquanto um filtro
+    bloqueia tudo nao ha trade nenhum para simular, e o backtest parece rapido.
+    Assim que ele abre, cada trade passa a ser percorrido barra a barra ate
+    fechar — e o tempo salta de repente, sem nada no codigo ter mudado.
+    """
+    por_dia = segundos / max(1, dias)
+    cabem = int(teto * 0.8 / por_dia) if por_dia > 0 else 99999
+    linhas = [f"⏱  {segundos:.0f}s para {dias} dias  ({por_dia:.2f}s/dia)",
+              f"   No timeout de {teto}s cabem ~{cabem} dias por janela "
+              f"(~{cabem / 365:.1f} anos), com folga."]
+    if cabem < 365:
+        linhas.append("   ⚠ Isto e pouco. Cada ensaio corre DUAS janelas "
+                      "(treino e validacao),")
+        linhas.append("     por isso o custo real de um ensaio e o dobro. "
+                      "Ou encurtas as")
+        linhas.append("     janelas, ou sobes TIMEOUT_BACKTEST, ou corres em "
+                      "barras mais largas.")
+    return "\n".join(linhas)
+
+
 def porque_zero(res: dict, barras, mod, inicio: str, fim: str) -> str:
     """Um backtest sem trades nao e uma medicao. Diz porque.
 
@@ -575,11 +599,14 @@ def main() -> int:
             semear(mod, a.semente)
             barras, digits = carregar_barras(mod, simbolo,
                                              f"{ini:%Y-%m-%d}", f"{fim:%Y-%m-%d}")
+            t_ini = time.time()
             res, cfg = correr(mod, barras, digits, {}, "diagnostico", None)
+            demorou = time.time() - t_ini
             fechados = sum(1 for t in (res.get("trades") or [])
                            if int(t.get("close_ts") or 0) > 0)
+            print(orcamento_de_tempo(demorou, int(a.diagnostico)))
             if fechados:
-                print(f"✅ {fechados} trades fecharam nesta janela. O motor opera.")
+                print(f"\n✅ {fechados} trades fecharam nesta janela. O motor opera.")
                 funil = {**(res.get("context_blocks") or {}),
                          **(res.get("no_entry_diagnostics") or {})}
                 if funil:

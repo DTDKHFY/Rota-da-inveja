@@ -2003,16 +2003,32 @@ class Sandbox:
             parcial = e.stdout or b""
             if isinstance(parcial, bytes):
                 parcial = parcial.decode("utf-8", "replace")
-            aviso_timeout = (
-                f"\n\n[orq] Passou de {timeout or self.timeout}s sem terminar.\n"
-                "     Antes de subires o limite, confirma que o comando TERMINA:\n"
-                "     um script que arranca um bot, abre um menu, ou fica a ouvir\n"
-                "     comandos nunca sai, e nenhum timeout resolve isso.\n"
-                "     Testa a mao, na pasta do projeto:\n"
-                f"       {resolver_python(COMANDO_BACKTEST).split()[0]} <o teu script> --help\n"
-                "     Se ele nao aceitar argumentos e for interativo, precisas de um\n"
-                "     modo nao-interativo — ou de um pequeno script que chame a\n"
-                "     funcao do backtest diretamente e escreva o JSON de metricas.")
+            # Duas causas opostas, e o conselho para uma e inutil para a outra:
+            # ou o comando NUNCA termina (um bot a ouvir), ou termina mas nao
+            # neste tempo. Se ele ja escreveu alguma coisa, esta a trabalhar —
+            # mandar procurar um bot ai era mandar procurar o que nao existe.
+            trabalhou = bool(parcial.strip())
+            if trabalhou:
+                aviso_timeout = (
+                    f"\n\n[orq] Passou de {timeout or self.timeout}s a TRABALHAR "
+                    f"(ele escreveu para o ecra, portanto nao esta pendurado).\n"
+                    "     A janela e grande de mais para o tempo que ha.\n"
+                    "     Mede quanto custa mesmo, com uma janela curta:\n"
+                    "       python orq_runner.py --diagnostico\n"
+                    "     Ele diz-te quantos dias cabem no timeout. Depois:\n"
+                    "     encurta TREINO/VALIDACAO, ou sobe TIMEOUT_BACKTEST.\n"
+                    "     Atencao: um filtro que bloqueia tudo faz o backtest\n"
+                    "     parecer rapido, porque nao ha trade nenhum para simular.\n"
+                    "     Quando ele abre, o tempo salta sem nada ter mudado.")
+            else:
+                aviso_timeout = (
+                    f"\n\n[orq] Passou de {timeout or self.timeout}s sem escrever nada.\n"
+                    "     Um comando que nem arranca a trabalhar costuma estar a\n"
+                    "     espera de alguem: um bot a ouvir, um menu, um prompt.\n"
+                    "     Nenhum timeout resolve isso. Testa a mao, na pasta do projeto:\n"
+                    f"       {resolver_python(COMANDO_BACKTEST).split()[0]} <o teu script> --help\n"
+                    "     Se for interativo, precisas de um modo nao-interativo — ou\n"
+                    "     do orq_runner.py, que chama a funcao do backtest diretamente.")
             return Resultado(False, -1, cortar(parcial) + aviso_timeout,
                              time.monotonic() - t0, True)
         except FileNotFoundError as e:

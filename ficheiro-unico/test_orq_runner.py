@@ -493,6 +493,32 @@ def test_o_proprio_runner_nao_e_acusado():
 
 
 # ---------------------------------------------------------------------------
+#  Quanta janela cabe no tempo que ha
+# ---------------------------------------------------------------------------
+def test_o_orcamento_de_tempo_extrapola_da_medicao():
+    """"Da timeout" nao diz o que fazer; "a tua janela e 13x maior do que
+    cabe" diz."""
+    txt = runner.orcamento_de_tempo(90.0, 90, teto=1800)   # 1s por dia
+    assert "1.00s/dia" in txt
+    assert "~1440 dias" in txt          # 1800 * 0.8 / 1.0
+
+
+def test_janela_curta_de_mais_leva_aviso():
+    txt = runner.orcamento_de_tempo(900.0, 90, teto=1800)  # 10s por dia
+    assert "~144 dias" in txt
+    assert "DUAS janelas" in txt         # o custo de um ensaio e o dobro
+
+
+def test_janela_folgada_nao_leva_aviso():
+    txt = runner.orcamento_de_tempo(9.0, 90, teto=1800)    # 0.1s por dia
+    assert "DUAS janelas" not in txt
+
+
+def test_o_orcamento_aguenta_uma_medicao_instantanea():
+    assert "s/dia" in runner.orcamento_de_tempo(0.0, 90)
+
+
+# ---------------------------------------------------------------------------
 #  Um erro tem de dizer o que correu mal
 # ---------------------------------------------------------------------------
 class _AvisoFalso:
