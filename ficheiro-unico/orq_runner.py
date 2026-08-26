@@ -65,10 +65,25 @@ FORCAR_DESLIGADO = {
     "LSTM_TRAIN_AFTER_RUN": False,
     "POLICY_TRAIN_AFTER_RUN": False,
     "AI_BACKTEST_AUTO_LEARN": False,
-    "BT_DETAILED_NOTIFICATIONS": False,
-    "BT_MONTHLY_SUMMARY_NOTIFICATIONS": False,
     "FAST_BACKTEST": True,          # sem export CSV/JSON por mes
 }
+
+# Estes dois so mexem no que o Telegram recebe, nao no que e medido, por isso
+# sao os unicos que MENSAGENS_TELEGRAM pode reabrir.
+FORCAR_NOTIFICACOES = ("BT_DETAILED_NOTIFICATIONS",
+                       "BT_MONTHLY_SUMMARY_NOTIFICATIONS")
+
+# O que o TEU bot te manda enquanto o orquestrador corre os ensaios.
+#
+#   "resumo"   uma mensagem por ensaio: janela, parametros e resultado. Prova
+#              de vida sem te encher o chat.
+#   "todas"    tudo o que o teu run_backtest() diria num /run a mao. Sao ~19
+#              mensagens por ensaio, mais a lista de trades aos blocos de 30 —
+#              vezes dois (treino e validacao), vezes o numero de ensaios.
+#   "nenhuma"  silencio total (era o que estava, e foi um erro meu: tirou-te a
+#              unica janela que tinhas para o que se passava).
+MENSAGENS_TELEGRAM = "resumo"
+LIMITE_MENSAGEM_TG = 3500          # o Telegram corta acima de ~4096
 
 # Se um destes aparecer nos parametros do ensaio, paramos. Nao e um aviso.
 PROIBIDOS = {
@@ -124,16 +139,43 @@ def carregar_alvo(caminho: Path):
     return mod
 
 
-def calar(mod) -> None:
-    """Telegram mudo e sem escritas de estado entre ensaios."""
-    mod.tg_send = lambda *a, **k: None
-    if hasattr(mod, "tg_chunked"):
-        mod.tg_chunked = lambda *a, **k: None
+def calar(mod, modo: str = MENSAGENS_TELEGRAM):
+    """Regula o que o teu bot diz, e devolve por onde se fala com ele.
+
+    Calar tudo foi o que estava aqui, e foi um erro: durante um estudo o teu
+    codigo corre dezenas de vezes e nao dizia nada, por isso parecia que nem
+    estava a correr. A ausencia de mensagens era a prova de que ESTAVA — e nao
+    ha nada mais parecido com um sistema partido do que um sistema mudo.
+
+    Devolve a funcao ORIGINAL do teu bot, para o runner poder mandar o resumo
+    no fim pelo teu proprio canal, com o teu token e o teu chat.
+    """
+    original = getattr(mod, "tg_send", None)
+    if modo != "todas":
+        mod.tg_send = lambda *a, **k: None
+        if hasattr(mod, "tg_chunked"):
+            mod.tg_chunked = lambda *a, **k: None
     # last_signals.json chega a centenas de MB e e reescrito a cada run.
+    # Isto nao e Telegram, e escrita em disco: fica desligado sempre.
     if hasattr(mod, "_save_last_ai_signals"):
         mod._save_last_ai_signals = lambda *a, **k: None
     if hasattr(mod, "_state"):
         mod._state["offline_mode"] = True
+    return original if callable(original) else None
+
+
+def avisar(canal, texto: str, modo: str = MENSAGENS_TELEGRAM) -> None:
+    """Manda uma mensagem pelo bot DO UTILIZADOR. Nunca rebenta o ensaio.
+
+    Um ensaio que morresse por falha de rede ao mandar um aviso seria o
+    proprio aviso a estragar aquilo que devia estar so a relatar.
+    """
+    if modo == "nenhuma" or canal is None:
+        return
+    try:
+        canal(texto[:LIMITE_MENSAGEM_TG])
+    except Exception as e:
+        print(f"[tg] nao consegui avisar: {e}", file=sys.stderr)
 
 
 def semear(mod, semente: int) -> None:
@@ -222,6 +264,12 @@ def aplicar_params(mod, params: dict) -> dict:
     for nome, valor in FORCAR_DESLIGADO.items():
         if hasattr(mod, nome):
             setattr(mod, nome, valor)
+    # As notificacoes so decidem o que sai para o chat; nao mudam um numero
+    # que seja. Por isso seguem o MENSAGENS_TELEGRAM em vez de estarem sempre
+    # desligadas como o resto.
+    for nome in FORCAR_NOTIFICACOES:
+        if hasattr(mod, nome):
+            setattr(mod, nome, MENSAGENS_TELEGRAM == "todas")
     return aplicados
 
 
@@ -492,8 +540,9 @@ def correr(mod, barras, digits: int, params: dict, etiqueta: str, registo: Path 
     cfg["lstm_train_after_run"] = False
     cfg["policy_train_after_run"] = False
     cfg["fast_backtest"] = True
-    cfg["bt_detailed_notifications"] = False
-    cfg["bt_monthly_summary_notifications"] = False
+    tagarela = MENSAGENS_TELEGRAM == "todas"
+    cfg["bt_detailed_notifications"] = tagarela
+    cfg["bt_monthly_summary_notifications"] = tagarela
 
     if registo:
         with registo.open("w", encoding="utf-8", errors="replace") as f:
@@ -531,9 +580,13 @@ def main() -> int:
                          "ver o funil de bloqueios, e sai")
     a = ap.parse_args()
 
+    # Definidos antes do try: se a falha for logo no arranque, o tratamento de
+    # erro nao pode ser ele proprio a rebentar com um NameError.
+    canal, simbolo, aplicados = None, a.simbolo or "?", {}
+
     try:
         mod = carregar_alvo(Path(a.alvo).resolve())
-        calar(mod)
+        canal = calar(mod)
         simbolo = a.simbolo or str(getattr(mod, "SYMBOL_NAME", "ETHUSD"))
 
         if a.listar_params:
@@ -679,14 +732,23 @@ def main() -> int:
             var = sum((r - media) ** 2 for r in rets) / (len(rets) - 1)
             if var > 0:
                 sr = media / math.sqrt(var) * math.sqrt(saida["periods_per_year"])
-        print(f"{a.start} a {a.end} | {len(barras)} candles | {fechados} trades | "
-              f"Sharpe {sr:.2f} | drawdown {saida['max_drawdown'] * 100:.1f}% | "
-              f"PnL ${saida['pnl_usd']:.2f} | {demorou:.0f}s"
-              + ("  ⚠ RUINA" if ruina else ""))
+        resumo = (f"{a.start} a {a.end} | {len(barras)} candles | {fechados} trades | "
+                  f"Sharpe {sr:.2f} | drawdown {saida['max_drawdown'] * 100:.1f}% | "
+                  f"PnL ${saida['pnl_usd']:.2f} | {demorou:.0f}s"
+                  + ("  ⚠ RUINA" if ruina else ""))
+        print(resumo)
+        # Pelo TEU bot, com o teu token e o teu chat: e o teu codigo a dizer
+        # que correu. Os parametros vao juntos porque uma linha de resultado
+        # sem saber o que foi tentado nao serve para acompanhar nada.
+        avisar(canal, f"🧪 {simbolo} — ensaio\n{resumo}\n"
+                      + "\n".join(f"  {k} = {v}" for k, v in sorted(aplicados.items())))
         return 0
 
     except ErroRunner as e:
         print(f"erro: {e}", file=sys.stderr)
+        # O caso em que MAIS se quer saber. Foi por nao chegar nada aqui que
+        # dezenas de ensaios pareceram nao ter corrido de todo.
+        avisar(canal, f"⚠️ {simbolo} — ensaio falhou\n{e}")
         return 2
     except KeyboardInterrupt:
         print("interrompido", file=sys.stderr)

@@ -62,8 +62,15 @@ BOT_ARRANCOU = False
 
 _state = {"symbol_digits": 2, "offline_mode": False}
 
+DENTRO_DO_RUN = False
+
 def tg_send(text):
-    raise AssertionError("tg_send foi chamado: o Telegram nao foi calado")
+    # Falar DENTRO do backtest e o que enche o chat; falar no fim e a prova
+    # de vida. O duplo tem de saber distinguir as duas.
+    if DENTRO_DO_RUN:
+        raise AssertionError("tg_send foi chamado DENTRO do run_backtest")
+    with open(os.path.join(_script_dir(), "tg.log"), "a", encoding="utf-8") as f:
+        f.write(text + "\\n===\\n")
 
 def tg_chunked(*a, **k):
     raise AssertionError("tg_chunked foi chamado")
@@ -103,6 +110,14 @@ def _snapshot_runtime_config():
             "bt_detailed_notifications": bool(BT_DETAILED_NOTIFICATIONS)}
 
 def run_backtest(bars_raw, digits, label="", cfg=None):
+    global DENTRO_DO_RUN
+    DENTRO_DO_RUN = True
+    try:
+        return _run_backtest(bars_raw, digits, label, cfg)
+    finally:
+        DENTRO_DO_RUN = False
+
+def _run_backtest(bars_raw, digits, label="", cfg=None):
     cfg = cfg or {}
     if cfg.get("online_learning_enabled"):
         raise AssertionError("aprendizagem ligada num ensaio")
@@ -204,10 +219,86 @@ def test_o_relatorio_gigante_vai_para_o_registo(alvo):
 
 
 def test_telegram_calado_e_sem_escritas_de_estado(alvo):
-    """O duplo levanta AssertionError se tg_send ou _save_last_ai_signals
-    forem chamados. Passar aqui e a prova de que nao foram."""
+    """O duplo levanta AssertionError se tg_send for chamado DENTRO do
+    backtest, ou se _save_last_ai_signals escrever. Passar aqui e a prova
+    de que nao aconteceu."""
     r = ensaio(alvo, {}, "2024-02-01", "2024-03-31")
     assert r.returncode == 0, r.stderr
+
+
+def mensagens(pasta: Path) -> list[str]:
+    f = pasta / "tg.log"
+    if not f.exists():
+        return []
+    return [m for m in f.read_text(encoding="utf-8").split("===") if m.strip()]
+
+
+def test_o_teu_bot_manda_uma_mensagem_por_ensaio(alvo):
+    """Calar tudo tirou-lhe a unica janela para o que se passava, e dezenas
+    de ensaios pareceram nao ter corrido. Uma linha por ensaio resolve isso
+    sem devolver as 19 mensagens que enchiam o chat."""
+    assert ensaio(alvo, {"EMA_FAST": 7}, "2024-02-01", "2024-03-31").returncode == 0
+    msgs = mensagens(alvo)
+    assert len(msgs) == 1
+    assert "trades" in msgs[0] and "Sharpe" in msgs[0]
+    assert "EMA_FAST = 7" in msgs[0]        # o que foi tentado, nao so o resultado
+
+
+def test_um_ensaio_falhado_tambem_avisa(tmp_path):
+    """E o caso em que mais se quer saber."""
+    p = alvo_que_devolve(tmp_path, "{'total': 0, 'closed': 0, 'trades': [], "
+                         "'no_entry_diagnostics': {'spread_excedido': 900}}")
+    assert ensaio(p, {}, "2024-02-01", "2024-03-31").returncode != 0
+    msgs = mensagens(p)
+    assert len(msgs) == 1
+    assert "falhou" in msgs[0] and "spread_excedido" in msgs[0]
+
+
+def test_dois_ensaios_dao_duas_mensagens(alvo):
+    assert ensaio(alvo, {"EMA_FAST": 5}, "2024-02-01", "2024-03-31", "a.json").returncode == 0
+    assert ensaio(alvo, {"EMA_FAST": 9}, "2024-02-01", "2024-03-31", "b.json").returncode == 0
+    assert len(mensagens(alvo)) == 2
+
+
+def test_modo_todas_nao_amordaca_o_teu_bot(alvo):
+    mod = runner.carregar_alvo(alvo / "run_backtest.py")
+    antes = mod.tg_send
+    assert runner.calar(mod, "todas") is antes
+    assert mod.tg_send is antes             # intacta: fala como num /run a mao
+
+
+def test_modo_nenhuma_e_resumo_amordacam_durante_o_ensaio(alvo):
+    for modo in ("nenhuma", "resumo"):
+        mod = runner.carregar_alvo(alvo / "run_backtest.py")
+        antes = mod.tg_send
+        assert runner.calar(mod, modo) is antes    # devolve o canal original
+        assert mod.tg_send is not antes            # mas o backtest fica mudo
+
+
+def test_o_disco_fica_desligado_em_qualquer_modo(alvo):
+    """MENSAGENS_TELEGRAM regula o chat. Escrever estado entre ensaios e
+    outra coisa, e essa fica desligada sempre."""
+    for modo in ("nenhuma", "resumo", "todas"):
+        mod = runner.carregar_alvo(alvo / "run_backtest.py")
+        runner.calar(mod, modo)
+        mod._save_last_ai_signals([{"x": 1}])      # nao levanta
+        assert mod._state["offline_mode"] is True
+
+
+def test_uma_falha_de_rede_no_aviso_nao_mata_o_ensaio():
+    """O aviso a estragar aquilo que devia estar so a relatar seria o pior
+    dos mundos."""
+    def rebenta(_):
+        raise ConnectionError("sem rede")
+    runner.avisar(rebenta, "ola", "resumo")        # nao levanta
+
+
+def test_avisar_nao_fala_quando_o_modo_e_nenhuma():
+    ditas = []
+    runner.avisar(ditas.append, "ola", "nenhuma")
+    assert ditas == []
+    runner.avisar(ditas.append, "ola", "resumo")
+    assert ditas == ["ola"]
 
 
 # ---------------------------------------------------------------------------
