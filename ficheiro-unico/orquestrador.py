@@ -216,6 +216,26 @@ MAX_GAP_TREINO_VALIDACAO = 1.0
 # Teto do contexto enviado ao modelo, em caracteres.
 LIMITE_CONTEXTO = 60_000
 
+# --- Navegacao: como o agente ve o teu codigo ------------------------------
+# Um ficheiro de 19 mil linhas sao ~250 mil tokens. Nao cabe em janela nenhuma,
+# por isso o agente NAO recebe o ficheiro: recebe ferramentas para o pedir aos
+# pedacos — estrutura(), procurar(), ler(), funcao() — e escolhe ele o que ver.
+#
+# Nada e pre-enviado, nem o indice. Assim uma pergunta que nao e sobre codigo
+# nao paga os 6 mil tokens do indice.
+MAX_FERRAMENTAS = 12             # consultas por turno, antes de ter de responder
+ORCAMENTO_NAVEGACAO = 40_000     # caracteres de resultados acumulados
+TETO_FICHEIRO_INTEIRO = 120_000  # acima disto, so por pedaços (nunca em silencio)
+
+# Janela de contexto por modelo. O 8192 que estava aqui era conservador de mais
+# para os modelos de nuvem, e e neles que a navegacao corre.
+JANELA_MODELO = {"qwen2.5-coder:7b": 32_768}
+JANELA_PADRAO = 32_768
+
+# Quanto tempo um comando de EXPLORACAO pode demorar. Curto de proposito: nao e
+# a medicao, e uma pergunta ao codigo. A medicao oficial tem TIMEOUT_BACKTEST.
+TIMEOUT_EXPLORACAO = 120
+
 # --- Piloto automatico -----------------------------------------------------
 # A cerca dentro da qual ele decide sozinho. Estes limites sao verificados em
 # codigo, nao pedidos ao modelo: ele nao os pode ultrapassar por muito que ache
@@ -996,6 +1016,10 @@ class ErroEdicao(ValueError):
     """Edicao invalida. A mensagem e escrita para o modelo se poder corrigir."""
 
 
+class ErroNavegacao(ValueError):
+    """Pedido invalido ao codigo. Tambem escrito para o modelo se corrigir."""
+
+
 class CaminhoProibido(ErroEdicao):
     """Tentativa de tocar num ficheiro fora da lista branca."""
 
@@ -1282,7 +1306,8 @@ class Ollama:
             "messages": [{"role": "system", "content": sistema},
                          {"role": "user", "content": utilizador}],
             "stream": False,
-            "options": {"temperature": 0.2, "num_ctx": 8192},
+            "options": {"temperature": 0.2,
+                        "num_ctx": JANELA_MODELO.get(modelo, JANELA_PADRAO)},
         }
         if json_mode:
             carga["format"] = "json"
@@ -1350,6 +1375,119 @@ def correr_agente(llm, *, papel: str, modelo: str, sistema: str, prompt: str,
                      f"Ultimo erro: {ultimo}")
 
 
+def instrucoes_navegacao(nav: Navegador) -> str:
+    """O que o modelo precisa de saber para ir buscar o codigo sozinho."""
+    corre = "correr" in nav.ferramentas()
+    linhas = [
+        "PODES CONSULTAR O CODIGO ANTES DE RESPONDER.",
+        "",
+        f"Ficheiros: {', '.join(nav.ficheiros) or '(nenhum)'}",
+        "",
+        "Em vez da resposta final, devolve UM pedido de cada vez:",
+        '  {"ferramenta": "estrutura", "argumentos": {}}',
+        '  {"ferramenta": "procurar",  "argumentos": {"termo": "MAX_SPREAD"}}',
+        '  {"ferramenta": "ler",       "argumentos": {"inicio": 2300, "fim": 2360}}',
+        '  {"ferramenta": "funcao",    "argumentos": {"nome": "_sessao_sinal"}}',
+    ]
+    if corre:
+        linhas.append('  {"ferramenta": "correr", "argumentos": {"comando": '
+                      '"python3 -c \\"import run_backtest as m; print(m.SYMBOL_NAME)\\""}}')
+    linhas += [
+        "",
+        "Eu respondo, e tu podes pedir outra vez. Quando souberes o suficiente,",
+        "devolve a resposta final no formato pedido — nunca as duas coisas juntas.",
+        "",
+        f"Tens no maximo {MAX_FERRAMENTAS} consultas. Comeca por estrutura() se",
+        "nao souberes o que existe; nao adivinhes nomes.",
+    ]
+    if corre:
+        linhas += [
+            "",
+            "O `correr` acontece numa copia descartavel, e nada do que fizeres la",
+            "sobrevive a medicao: antes dela o worktree e reposto e so a alteracao",
+            "aprovada e reaplicada. Corre a vontade para PERCEBER — nao te da",
+            "maneira nenhuma de mexer no resultado.",
+        ]
+    return "\n".join(linhas)
+
+
+def correr_agente_navegando(llm, *, papel: str, modelo: str, sistema: str,
+                            prompt: str, validar: Callable, navegador: Navegador,
+                            tentativas: int = TENTATIVAS_JSON,
+                            max_ferramentas: int = MAX_FERRAMENTAS,
+                            orcamento: int = ORCAMENTO_NAVEGACAO):
+    """Como `correr_agente`, mas o modelo pode ir buscar o codigo primeiro.
+
+    `llm.conversar` e de um turno so, por isso o historico de consultas e
+    reconstruido na mensagem a cada volta. Quando o acumulado passa do
+    orcamento, os resultados mais antigos caem — com marca visivel, para ele
+    saber que nao pode contar com o que ja nao esta la.
+    """
+    historico: list[tuple[str, str]] = []      # (pedido, resultado)
+    descartados = 0
+    ultimo_erro = None
+    consultas = 0
+    falhadas = 0        # tentativas gastas a nao responder
+
+    # Duas contas separadas: as consultas ao codigo, e as tentativas de dar a
+    # resposta. Depois de gastar as consultas, insistir em pedir ferramentas E
+    # falhar a resposta — foi-lhe dito para responder e nao respondeu — por isso
+    # conta como tal, e um modelo teimoso nao gira aqui para sempre.
+    while consultas < max_ferramentas + 1 and falhadas < max(1, tentativas):
+        partes = [prompt, "", instrucoes_navegacao(navegador)]
+        if historico:
+            partes += ["", "--- O QUE JA CONSULTASTE ---"]
+            if descartados:
+                partes.append(f"[{descartados} consultas anteriores descartadas: "
+                              f"contexto cheio. Nao contes com elas.]")
+            for pedido, resultado in historico:
+                partes.append(f"\n>>> {pedido}\n{resultado}")
+        if consultas >= max_ferramentas:
+            partes += ["", f"Ja gastaste as {max_ferramentas} consultas. "
+                           f"Responde agora com o formato final."]
+        if ultimo_erro:
+            partes += ["", "--- A TUA RESPOSTA ANTERIOR FOI REJEITADA ---",
+                       f"Motivo: {ultimo_erro}",
+                       "Corrige e devolve APENAS o JSON pedido."]
+
+        try:
+            bruto = llm.conversar(sistema, "\n".join(partes), modelo=modelo,
+                                  json_mode=True)
+            dados = extrair_json(bruto)
+        except (ErroModelo, ValueError) as e:
+            ultimo_erro = str(e)
+            falhadas += 1
+            continue
+
+        pediu = isinstance(dados, dict) and dados.get("ferramenta")
+        if pediu and consultas < max_ferramentas:
+            consultas += 1
+            resultado = navegador.executar(dados)
+            historico.append((json.dumps(dados, ensure_ascii=False)[:200], resultado))
+            gasto = sum(len(p) + len(r) for p, r in historico)
+            while gasto > orcamento and len(historico) > 1:
+                p, r = historico.pop(0)
+                gasto -= len(p) + len(r)
+                descartados += 1
+            ultimo_erro = None
+            continue
+        if pediu:
+            ultimo_erro = (f"acabaram as {max_ferramentas} consultas; "
+                           f"responde no formato final")
+            falhadas += 1
+            continue
+
+        try:
+            return validar(dados)
+        except ValueError as e:
+            ultimo_erro = str(e)
+            falhadas += 1
+
+    raise ErroAgente(f"[{papel}] o modelo {modelo} nao chegou a uma resposta valida "
+                     f"em {consultas} consultas e {falhadas} tentativas. "
+                     f"Ultimo erro: {ultimo_erro}")
+
+
 # ===========================================================================
 #  O AGENTE DE DESENVOLVIMENTO
 # ===========================================================================
@@ -1375,6 +1513,298 @@ Formato exato da resposta:
  "edicoes": [{"procurar": "texto exato", "substituir": "texto novo"}],
  "justificacao": "uma ou duas frases"}
 """
+
+
+def _assinatura(no) -> str:
+    a = no.args
+    partes = [x.arg for x in list(a.posonlyargs) + list(a.args)]
+    if a.vararg:
+        partes.append("*" + a.vararg.arg)
+    partes += [x.arg for x in a.kwonlyargs]
+    if a.kwarg:
+        partes.append("**" + a.kwarg.arg)
+    return ", ".join(partes)
+
+
+class Navegador:
+    """Acesso ao codigo do alvo por PEDIDO, em vez de por despejo.
+
+    Um ficheiro de 19 mil linhas sao ~250 mil tokens; a janela de um modelo sao
+    8 a 32 mil. Nao ha versao disto em que o ficheiro caiba, e escolher eu a
+    fatia tem o defeito obvio: se a resposta estiver fora dela, o agente nunca
+    la chega — fica a raciocinar sobre o meu resumo, nao sobre o codigo.
+
+    Fatiar por regioes e dar cada fatia a um agente diferente tambem nao serve.
+    O que interessa num ficheiro grande sao as LIGACOES entre partes distantes:
+    uma constante definida na linha 2.000 e usada na 18.500. Cortar em pedacos
+    apaga exatamente essas ligacoes, e cada agente ve metade de uma incoerencia
+    e acha que esta tudo bem. A leitura pode espalhar-se; o raciocinio tem de
+    ficar num sitio so.
+
+    Sao quatro operacoes, pedidas quando ele quiser: ver o indice, procurar um
+    nome, ler um trecho, ler uma funcao inteira. So leitura — alterar continua
+    a passar pelo caminho validado de sempre.
+    """
+
+    def __init__(self, raiz: Path, ficheiros: Sequence[str]):
+        self.raiz = Path(raiz)
+        self.ficheiros = [str(PurePosixPath(str(f))) for f in ficheiros]
+        self._linhas_cache: dict[str, list[str]] = {}
+        self._arvores: dict[str, ast.AST | None] = {}
+        self.pedidos = 0
+
+    # -- acesso -----------------------------------------------------------
+    def linhas(self, rel: str) -> list[str]:
+        if rel not in self._linhas_cache:
+            try:
+                texto = (self.raiz / rel).read_text(encoding="utf-8", errors="replace")
+            except OSError as e:
+                raise ErroNavegacao(f"nao consegui ler {rel}: {e}") from e
+            self._linhas_cache[rel] = texto.splitlines()
+        return self._linhas_cache[rel]
+
+    def _arvore(self, rel: str):
+        if rel not in self._arvores:
+            try:
+                self._arvores[rel] = ast.parse("\n".join(self.linhas(rel)))
+            except (SyntaxError, ValueError):
+                self._arvores[rel] = None
+        return self._arvores[rel]
+
+    def resolver(self, rel: str | None) -> str:
+        """Com um alvo de ficheiro unico — o caso comum — nao ha o que escolher."""
+        if not self.ficheiros:
+            raise ErroNavegacao("nao ha nenhum ficheiro visivel para navegar")
+        if rel:
+            alvo = str(PurePosixPath(str(rel)))
+            if alvo in self.ficheiros:
+                return alvo
+            perto = [f for f in self.ficheiros if PurePosixPath(f).name == alvo]
+            if perto:
+                return perto[0]
+            raise ErroNavegacao(f"`{rel}` nao esta entre os ficheiros visiveis: "
+                                f"{', '.join(self.ficheiros[:8])}")
+        if len(self.ficheiros) == 1:
+            return self.ficheiros[0]
+        raise ErroNavegacao(f"ha varios ficheiros; diz qual em `ficheiro`. "
+                            f"Existem: {', '.join(self.ficheiros[:8])}")
+
+    # -- as quatro operacoes ----------------------------------------------
+    def estrutura(self, ficheiro: str | None = None, limite: int = 300) -> str:
+        """O indice: constantes e assinaturas, com o numero da linha."""
+        rel = self.resolver(ficheiro)
+        arvore, n = self._arvore(rel), len(self.linhas(rel))
+        if arvore is None:
+            return f"{rel}: {n} linhas, mas nao consegui analisar (erro de sintaxe)."
+
+        consts, defs = [], []
+        for no in arvore.body:
+            if (isinstance(no, ast.Assign) and len(no.targets) == 1
+                    and isinstance(no.targets[0], ast.Name)
+                    and no.targets[0].id.isupper()):
+                try:
+                    valor = ast.unparse(no.value).replace("\n", " ")
+                except Exception:
+                    valor = "..."
+                consts.append(f"{no.lineno:>6}  {no.targets[0].id} = {valor[:64]}")
+            elif isinstance(no, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defs.append(f"{no.lineno:>6}  def {no.name}({_assinatura(no)})")
+            elif isinstance(no, ast.ClassDef):
+                defs.append(f"{no.lineno:>6}  class {no.name}")
+                for m in no.body:
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        defs.append(f"{m.lineno:>6}      def {m.name}({_assinatura(m)})")
+
+        partes = [f"{rel} — {n} linhas", f"\nCONSTANTES ({len(consts)}):"]
+        partes += consts[:limite]
+        if len(consts) > limite:
+            partes.append(f"       [... mais {len(consts) - limite}. Usa procurar().]")
+        partes.append(f"\nFUNCOES E CLASSES ({len(defs)}):")
+        partes += defs[:limite]
+        if len(defs) > limite:
+            partes.append(f"       [... mais {len(defs) - limite}. Usa procurar().]")
+        return "\n".join(partes)
+
+    def procurar(self, termo: str, ficheiro: str | None = None,
+                 contexto: int = 2, max_ocorrencias: int = 20) -> str:
+        """Onde o nome aparece, com as linhas a volta. E o grep."""
+        termo = str(termo or "").strip()
+        if not termo:
+            raise ErroNavegacao("procurar() precisa de um termo")
+        alvos = ([self.resolver(ficheiro)] if (ficheiro or len(self.ficheiros) == 1)
+                 else list(self.ficheiros))
+
+        # Espacos colapsados dos dois lados. O alvo alinha as constantes com
+        # padding — `SYMBOL_NAME          = "ETHUSD"` — e procurar
+        # `SYMBOL_NAME =` a letra nao encontrava a DEFINICAO, so os usos. O
+        # agente concluia que a constante nao existia, que e precisamente o
+        # genero de engano que esta navegacao existe para acabar.
+        def liso(t: str) -> str:
+            return " ".join(t.lower().split())
+
+        achados, total, baixo = [], 0, liso(termo)
+        for rel in alvos:
+            linhas = self.linhas(rel)
+            for i, linha in enumerate(linhas):
+                if baixo not in liso(linha):
+                    continue
+                total += 1
+                if len(achados) >= max_ocorrencias:
+                    continue
+                a, b = max(1, i + 1 - contexto), min(len(linhas), i + 1 + contexto)
+                bloco = "\n".join(f"{k:>6}{'>' if k == i + 1 else ' '} {linhas[k - 1]}"
+                                  for k in range(a, b + 1))
+                achados.append(f"--- {rel}:{i + 1}\n{bloco}")
+        if not achados:
+            return (f"`{termo}` nao aparece em nenhum ficheiro visivel. "
+                    f"Confirma o nome com estrutura().")
+        cab = f"{total} ocorrencias de `{termo}`"
+        if total > max_ocorrencias:
+            cab += f" — mostro as primeiras {max_ocorrencias}"
+        return cab + ":\n" + "\n".join(achados)
+
+    def ler(self, inicio, fim, ficheiro: str | None = None,
+            max_linhas: int = 300) -> str:
+        rel = self.resolver(ficheiro)
+        linhas = self.linhas(rel)
+        try:
+            inicio, fim = int(inicio), int(fim)
+        except (TypeError, ValueError) as e:
+            raise ErroNavegacao(f"ler() quer dois numeros de linha: {e}") from e
+        inicio = max(1, inicio)
+        if fim < inicio:
+            raise ErroNavegacao(f"fim ({fim}) e antes do inicio ({inicio})")
+        if inicio > len(linhas):
+            raise ErroNavegacao(f"{rel} tem {len(linhas)} linhas; "
+                                f"pediste a partir da {inicio}")
+        cortado = fim > inicio + max_linhas - 1
+        fim = min(fim, len(linhas), inicio + max_linhas - 1)
+        corpo = "\n".join(f"{k:>6} | {linhas[k - 1]}" for k in range(inicio, fim + 1))
+        cab = f"{rel}  linhas {inicio}-{fim} (de {len(linhas)}):"
+        if cortado:
+            cab += f"\n[cortei em {max_linhas} linhas. Pede o resto noutro ler().]"
+        return f"{cab}\n{corpo}"
+
+    def funcao(self, nome: str, ficheiro: str | None = None) -> str:
+        """A funcao inteira, sem ter de adivinhar onde acaba."""
+        nome = str(nome or "").strip().strip("()")
+        if not nome:
+            raise ErroNavegacao("funcao() precisa de um nome")
+        alvos = ([self.resolver(ficheiro)] if (ficheiro or len(self.ficheiros) == 1)
+                 else list(self.ficheiros))
+        for rel in alvos:
+            arvore = self._arvore(rel)
+            if arvore is None:
+                continue
+            for no in ast.walk(arvore):
+                if (isinstance(no, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                    ast.ClassDef)) and no.name == nome):
+                    fim = getattr(no, "end_lineno", None) or no.lineno
+                    return self.ler(no.lineno, fim, ficheiro=rel, max_linhas=500)
+        return (f"nao encontrei `{nome}`. Ve os nomes que existem com estrutura(), "
+                f"ou usa procurar() se souberes so um pedaco.")
+
+    def existe(self, local: dict) -> str:
+        """Valida um `local` de hipotese. Devolve "" se serve, ou o que esta mal."""
+        if not isinstance(local, dict):
+            return "`local` tem de ser um objeto"
+        try:
+            rel = self.resolver(local.get("ficheiro"))
+        except ErroNavegacao as e:
+            return str(e)
+        if local.get("funcao"):
+            r = self.funcao(str(local["funcao"]), ficheiro=rel)
+            return "" if not r.startswith("nao encontrei") else r
+        if local.get("inicio") is not None:
+            try:
+                self.ler(local.get("inicio"), local.get("fim", local.get("inicio")),
+                         ficheiro=rel)
+            except ErroNavegacao as e:
+                return str(e)
+            return ""
+        return "`local` precisa de `funcao` ou de `inicio`/`fim`"
+
+    def trecho(self, local: dict) -> str:
+        """O codigo apontado por um `local` ja validado."""
+        rel = self.resolver(local.get("ficheiro"))
+        if local.get("funcao"):
+            return self.funcao(str(local["funcao"]), ficheiro=rel)
+        return self.ler(local.get("inicio", 1),
+                        local.get("fim", local.get("inicio", 1)), ficheiro=rel)
+
+    # -- despacho ---------------------------------------------------------
+    def executar(self, pedido: dict) -> str:
+        """Um pedido do modelo. Erro nunca levanta: volta como texto para ele se
+        corrigir, que e o mesmo ciclo que ja torna estes modelos usaveis."""
+        self.pedidos += 1
+        nome = str(pedido.get("ferramenta") or "").strip().lower()
+        args = pedido.get("argumentos")
+        args = args if isinstance(args, dict) else {}
+        try:
+            if nome == "estrutura":
+                return self.estrutura(args.get("ficheiro"))
+            if nome == "procurar":
+                return self.procurar(args.get("termo", ""), args.get("ficheiro"))
+            if nome == "ler":
+                return self.ler(args.get("inicio", 1), args.get("fim", 1),
+                                args.get("ficheiro"))
+            if nome == "funcao":
+                return self.funcao(args.get("nome", ""), args.get("ficheiro"))
+            if nome == "correr":
+                return self.correr(str(args.get("comando", "")))
+        except ErroNavegacao as e:
+            return f"ERRO: {e}"
+        return (f"ERRO: `{nome}` nao e uma ferramenta. Tens: "
+                f"{', '.join(self.ferramentas())}.")
+
+    def ferramentas(self) -> list[str]:
+        return ["estrutura", "procurar", "ler", "funcao"]
+
+    def correr(self, comando: str) -> str:
+        raise ErroNavegacao(
+            "nao posso correr comandos aqui — so leio. Isto e o projeto vivo, "
+            "nao uma copia descartavel.")
+
+
+class NavegadorComExecucao(Navegador):
+    """O navegador de dentro de um ensaio: le E corre.
+
+    Ler diz o que o codigo DIZ; correr diz o que ele FAZ. Num ficheiro cheio de
+    `cfg.get(x, GLOBAL)` os dois divergem, e a diferenca custa horas a descobrir
+    so por leitura.
+
+    Corre a vontade porque o worktree e descartavel — e porque, antes da medicao
+    oficial, ele e reposto e so a alteracao validada e reaplicada. Sem essa
+    reposicao isto seria o agente a escrever o proprio boletim: bastava um
+    `echo` para o ficheiro de metricas, ou reescrever o arnes por shell.
+    """
+
+    def __init__(self, raiz: Path, ficheiros: Sequence[str], sandbox,
+                 timeout: int | None = None):
+        super().__init__(raiz, ficheiros)
+        self.sandbox = sandbox
+        self.timeout = TIMEOUT_EXPLORACAO if timeout is None else timeout
+        self.corridas: list[dict] = []
+
+    def ferramentas(self) -> list[str]:
+        return ["estrutura", "procurar", "ler", "funcao", "correr"]
+
+    def correr(self, comando: str) -> str:
+        comando = str(comando or "").strip()
+        if not comando:
+            raise ErroNavegacao("correr() precisa de um comando")
+        try:
+            r = self.sandbox.correr(comando, timeout=self.timeout)
+        except ErroSandbox as e:
+            return f"ERRO: {e}"
+        # O ficheiro mudou por baixo dos pes: o cache tem de morrer, senao ele
+        # continua a ler a versao anterior e a raciocinar sobre um ficheiro que
+        # ja nao existe.
+        self._linhas_cache.clear()
+        self._arvores.clear()
+        self.corridas.append({"comando": comando, "codigo": r.codigo,
+                              "saida": r.saida[-2000:]})
+        return f"$ {comando}\n({r.resumo})\n{cortar(r.saida, 1500, 2500) or '(sem saida)'}"
 
 
 def render_ficheiros(ficheiros: dict[str, str], limite: int = LIMITE_CONTEXTO,
@@ -1406,7 +1836,8 @@ def propor_alteracao(ficheiros: dict[str, str], hipotese: dict, *,
                      editaveis: Sequence[str] | None = None,
                      max_linhas: int | None = None,
                      modelo: str = MODELO_DESENVOLVIMENTO, llm=None,
-                     tentativas: int = TENTATIVAS_JSON) -> dict:
+                     tentativas: int = TENTATIVAS_JSON,
+                     navegador: Navegador | None = None) -> dict:
     """Transforma uma hipotese numa alteracao concreta e validada.
 
     A validacao corre em Python, nao no modelo, e a edicao e experimentada em
@@ -1422,13 +1853,26 @@ def propor_alteracao(ficheiros: dict[str, str], hipotese: dict, *,
         raise ErroAgente("nao ha ficheiros editaveis: verifica a lista branca")
     llm = llm or Ollama()
 
+    # Com um `local` apontado pela pesquisa, o programador ve o trecho e nao o
+    # ficheiro: num alvo de 19 mil linhas o ficheiro nao cabe na janela dele, e
+    # a parte que interessa cabe de sobra. A VALIDACAO continua a aplicar a
+    # edicao contra o conteudo COMPLETO, mais abaixo — mostra-se o trecho,
+    # verifica-se o todo, e nenhuma garantia se perde.
+    local = hipotese.get("local") if navegador is not None else None
+    if local:
+        corpo = (f"TRECHO APONTADO (os numeros de linha sao so para te orientares "
+                 f"— nao os incluas nos blocos):\n{navegador.trecho(local)}\n\n"
+                 f"Se precisares de ver mais alguma coisa do ficheiro, pede.")
+    else:
+        corpo = (f"CONTEUDO (os numeros de linha sao so para te orientares — nao "
+                 f"os incluas nos blocos):\n"
+                 f"{render_ficheiros(ficheiros, editaveis=editaveis)}")
+
     prompt = (
         f"HIPOTESE A IMPLEMENTAR:\n{hipotese['nome']} — {hipotese.get('raciocinio', '')}\n\n"
         f"FICHEIROS QUE PODES ALTERAR: {', '.join(editaveis)}\n"
-        f"Os restantes aparecem para os leres e perceberes o sistema. Se "
-        f"propuseres uma alteracao a um deles, e recusada.\n\n"
-        f"CONTEUDO (os numeros de linha sao so para te orientares — nao os "
-        f"incluas nos blocos):\n{render_ficheiros(ficheiros, editaveis=editaveis)}\n\n"
+        f"Se propuseres uma alteracao a outro, e recusada.\n\n"
+        f"{corpo}\n\n"
         f"Limite: no maximo {max_linhas} linhas tocadas no total.\n\n"
         f"Devolve as edicoes.")
 
@@ -1464,6 +1908,11 @@ def propor_alteracao(ficheiros: dict[str, str], hipotese: dict, *,
         return {"ficheiro": ficheiro, "edicoes": edicoes, "conteudo_novo": novo,
                 "linhas": tam, "justificacao": str(dados.get("justificacao", ""))[:400]}
 
+    if navegador is not None:
+        return correr_agente_navegando(
+            llm, papel="programador", modelo=modelo, sistema=SISTEMA,
+            prompt=prompt, validar=validar, navegador=navegador,
+            tentativas=tentativas)
     return correr_agente(llm, papel="programador", modelo=modelo, sistema=SISTEMA,
                          prompt=prompt, validar=validar, tentativas=tentativas)
 
@@ -1942,6 +2391,13 @@ class Sandbox:
         # com um .gitkeep e o conteudo no .gitignore — ligar a pasta inteira e
         # impossivel. Nesse caso ligo o conteudo, ficheiro a ficheiro. Sem isto
         # a pasta chega vazia ao backtest e ele nao encontra os dados.
+        self._ligar_dados()
+        # O arnes entra por copia, nao por symlink: um atalho apontaria para o
+        # teu ficheiro verdadeiro, e um ensaio que lhe mexesse mexia no original.
+        self._copiar_arnes()
+        return self.raiz
+
+    def _ligar_dados(self):
         for rel in PASTAS_LIGADAS:
             origem = (self.projeto / rel).resolve()
             destino = self.raiz / rel
@@ -1956,8 +2412,7 @@ class Sandbox:
                     if not alvo.exists() and not alvo.is_symlink():
                         ligar(filho, alvo)
 
-        # O arnes entra por copia, nao por symlink: um atalho apontaria para o
-        # teu ficheiro verdadeiro, e um ensaio que lhe mexesse mexia no original.
+    def _copiar_arnes(self):
         for rel in FICHEIROS_ARNES:
             origem = self.projeto / rel
             if not origem.is_file():
@@ -1965,7 +2420,32 @@ class Sandbox:
             destino = self.raiz / rel
             destino.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(origem, destino)
-        return self.raiz
+
+    def repor(self):
+        """Desfaz tudo o que foi mexido, e devolve o arnes original.
+
+        E isto que torna seguro deixar o agente correr comandos a vontade. Com
+        shell no worktree ele contorna a lista branca inteira — `exigir_permitido`
+        guarda o caminho da PROPOSTA de edicao, nao o sistema de ficheiros. Um
+        `echo` bastava para reescrever o ficheiro que calcula as metricas, ou
+        para plantar um resultado no `.orq/metricas.json`.
+
+        Hoje a exploracao ja corre noutro worktree que nao o da medicao, por
+        isso isto e cinto a somar aos suspensorios. Existe na mesma porque a
+        garantia passa a ser explicita em vez de acidental: se um dia a
+        exploracao passar para dentro do ensaio, continua a valer.
+
+        Ele pode correr codigo para APRENDER, nunca o codigo que o avalia.
+        """
+        if not self.criado:
+            raise ErroSandbox("sandbox nao criado")
+        git(self.raiz, "checkout", "--", ".", check=False)
+        git(self.raiz, "clean", "-fdq", check=False)
+        shutil.rmtree(self.raiz / ".orq", ignore_errors=True)
+        # O `clean` pode ter levado os atalhos das pastas de dados; sem eles o
+        # backtest correria sem encontrar candles e o resultado seria vazio.
+        self._ligar_dados()
+        self._copiar_arnes()
 
     def limpar(self):
         if not self.raiz.exists() and not self.criado:
@@ -2075,12 +2555,23 @@ class Sandbox:
         for rel in versionados[:MAX_FICHEIROS_VISIVEIS]:
             caminho = self.raiz / rel
             try:
-                if caminho.stat().st_size > 120_000:
+                tamanho = caminho.stat().st_size
+                # Um ficheiro grande de mais para o contexto era descartado em
+                # SILENCIO, e o agente ficava a propor alteracoes a um ficheiro
+                # que nunca viu — a inventar nomes e funcoes. Agora entra na
+                # mesma, com o tamanho e a instrucao de o pedir aos pedacos.
+                if tamanho > TETO_FICHEIRO_INTEIRO:
+                    saida[rel] = (
+                        f"[{tamanho // 1024} KB — grande de mais para caber aqui.\n"
+                        f" NAO adivinhes o que esta la dentro: pede com "
+                        f"estrutura(), procurar(), ler() ou funcao().]")
                     continue
                 texto = caminho.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
                 continue
             if gasto + len(texto) > limite_bytes:
+                saida[rel] = ("[omitido: contexto esgotado. Pede o que precisares "
+                              "com procurar() ou funcao().]")
                 continue
             gasto += len(texto)
             saida[rel] = texto
@@ -2367,12 +2858,18 @@ class Agentes:
 
     # -- Agente Pesquisa -------------------------------------------------
     def pesquisar(self, objetivo: str, historico: list[dict], n=3,
-                  memoria: str = "") -> list[dict]:
+                  memoria: str = "", navegador: Navegador | None = None) -> list[dict]:
         contexto = (f"PARAMETROS DISPONIVEIS:\n{descrever_limites()}\n\n"
                     if MODO == "params" else "")
+        aponta = ("\nPara cada hipotese, diz ONDE mexer em `local`: "
+                  '{"ficheiro": ..., "funcao": ...} ou {"ficheiro": ..., '
+                  '"inicio": ..., "fim": ...}. Quem escreve o codigo recebe so '
+                  "esse trecho, por isso aponta o sitio certo.\n"
+                  if navegador else "")
         prompt = (f"OBJETIVO DO ESTUDO:\n{objetivo}\n\n{contexto}"
                   f"{memoria}"
-                  f"ENSAIOS JA FEITOS NESTE ESTUDO:\n{descrever_historico(historico)}\n\n"
+                  f"ENSAIOS JA FEITOS NESTE ESTUDO:\n{descrever_historico(historico)}\n"
+                  f"{aponta}\n"
                   f"Propoe exatamente {n} hipoteses distintas para o proximo ensaio.")
 
         def validar(dados):
@@ -2392,16 +2889,31 @@ class Agentes:
                 if d not in {"aumentar", "diminuir", "explorar"}:
                     raise ValueError(f"hipotese {i}: direcao {d!r} invalida "
                                      "(usa aumentar, diminuir ou explorar)")
-                saida.append({"nome": str(h["nome"])[:120],
-                              "raciocinio": str(h["raciocinio"])[:600], "direcao": d})
+                nova = {"nome": str(h["nome"])[:120],
+                        "raciocinio": str(h["raciocinio"])[:600], "direcao": d}
+                # Validar o `local` AQUI, e nao la a frente: uma funcao que nao
+                # existe descoberta agora e uma linha de erro que o modelo
+                # corrige; descoberta no programador e um ensaio perdido.
+                if navegador is not None and h.get("local"):
+                    mal = navegador.existe(h["local"])
+                    if mal:
+                        raise ValueError(f"hipotese {i}: `local` nao serve — {mal}")
+                    nova["local"] = h["local"]
+                saida.append(nova)
             return saida
 
+        if navegador is not None:
+            return correr_agente_navegando(
+                self.llm, papel="pesquisa", modelo=MODELO_PESQUISA,
+                sistema=SISTEMA_PESQUISA, prompt=prompt, validar=validar,
+                navegador=navegador, tentativas=TENTATIVAS_JSON)
         return correr_agente(self.llm, papel="pesquisa", modelo=MODELO_PESQUISA,
                               sistema=SISTEMA_PESQUISA, prompt=prompt, validar=validar,
                               tentativas=TENTATIVAS_JSON)
 
     # -- Agente Desenvolvimento: delegado ao programador.py --------------
-    def desenvolver(self, hipotese: dict, ficheiros: dict[str, str]) -> dict:
+    def desenvolver(self, hipotese: dict, ficheiros: dict[str, str],
+                    navegador: Navegador | None = None) -> dict:
         """Transforma a hipotese numa alteracao de codigo ja validada.
 
         A separacao que importa nao e entre ficheiros — e entre o que o agente
@@ -2415,6 +2927,7 @@ class Agentes:
             modelo=MODELO_DESENVOLVIMENTO,
             llm=self.llm,
             tentativas=TENTATIVAS_JSON,
+            navegador=navegador,
         )
 
     # -- Agente Desenvolvimento (modo params) ----------------------------
@@ -2528,8 +3041,15 @@ class Agentes:
             return None      # a memoria e um extra; nunca trava um ensaio
 
     # -- conversa ---------------------------------------------------------
-    def conversar(self, pergunta: str, estado_txt: str) -> dict:
-        """Responde a uma mensagem em linguagem normal, e pode propor trabalho."""
+    def conversar(self, pergunta: str, estado_txt: str,
+                  navegador: Navegador | None = None) -> dict:
+        """Responde a uma mensagem em linguagem normal, e pode propor trabalho.
+
+        Com navegador ele pode ir ver o codigo antes de responder — que e a
+        diferenca entre dizer "nao sei qual e o mercado" e ir buscar o
+        SYMBOL_NAME. Le, nunca corre: isto aponta para o projeto vivo, e projeto
+        vivo nao e sitio para um modelo executar comandos.
+        """
         prompt = (f"ESTADO ATUAL DO SISTEMA:\n{estado_txt}\n\n"
                   f"MENSAGEM DELE:\n{pergunta}\n\nResponde.")
 
@@ -2544,6 +3064,11 @@ class Agentes:
             return {"resposta": str(dados["resposta"])[:1500],
                     "tarefa": tarefa.strip()[:400] if tarefa else None}
 
+        if navegador is not None:
+            return correr_agente_navegando(
+                self.llm, papel="conversa", modelo=MODELO_PESQUISA,
+                sistema=SISTEMA_CONVERSA, prompt=prompt, validar=validar,
+                navegador=navegador, tentativas=TENTATIVAS_JSON)
         return correr_agente(self.llm, papel="conversa", modelo=MODELO_PESQUISA,
                              sistema=SISTEMA_CONVERSA, prompt=prompt, validar=validar,
                              tentativas=TENTATIVAS_JSON)
@@ -2728,6 +3253,24 @@ class Orquestrador:
         except (json.JSONDecodeError, OSError):
             return {}
 
+    def navegador_do_projeto(self) -> Navegador | None:
+        """Leitura do projeto vivo, para a conversa. Sem worktree e sem correr:
+        criar uma copia a cada mensagem do Telegram seria lento, e executar
+        comandos no projeto verdadeiro nao se faz."""
+        projeto = Path(PROJETO)
+        if not projeto.is_dir():
+            return None
+        try:
+            r = git(projeto, "ls-files", check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode != 0:
+            return None
+        visiveis = [l for l in r.stdout.splitlines()
+                    if l and l.endswith(".py")
+                    and caminho_permitido(l, FICHEIROS_VISIVEIS)]
+        return Navegador(projeto, visiveis[:MAX_FICHEIROS_VISIVEIS]) if visiveis else None
+
     def _baseline(self, estudo_id: str) -> Janela | None:
         est = self.estado.estudo(estudo_id)
         if not est or not est["baseline"]:
@@ -2839,15 +3382,33 @@ class Orquestrador:
         historico = self._historico(eid)
         # Um lote pede mais hipoteses de uma vez; sem lote, tres chegam.
         quantas = max(1, min(int(tarefa["lote"] or 0) or 3, 12))
-        try:
-            hipoteses = self.agentes.pesquisar(objetivo, historico, n=quantas,
-                                               memoria=self.memoria())
-        except ErroAgente as e:
-            self.aviso.enviar(f"⚠️ O agente de pesquisa nao produziu hipoteses: {e}")
-            return 0
 
-        n, nomes = (self._fila_codigo(eid, tarefa, hipoteses) if MODO == "code"
-                    else self._fila_params(eid, tarefa, hipoteses, historico))
+        # Um worktree so para a fase de pensar: a pesquisa navega no codigo,
+        # o programador recebe o trecho apontado, e no fim isto e deitado fora.
+        # A medicao corre noutro worktree, criado do HEAD — por isso nada do que
+        # o agente fizer aqui pode chegar aos numeros.
+        if MODO == "code":
+            with Sandbox(f"{tarefa['id']}_leitura") as sb:
+                nav = NavegadorComExecucao(
+                    sb.raiz, [r for r in sb.ficheiros_versionados()
+                              if caminho_permitido(r, FICHEIROS_VISIVEIS)], sb)
+                try:
+                    hipoteses = self.agentes.pesquisar(
+                        objetivo, historico, n=quantas, memoria=self.memoria(),
+                        navegador=nav)
+                except ErroAgente as e:
+                    self.aviso.enviar(f"⚠️ O agente de pesquisa nao produziu "
+                                      f"hipoteses: {e}")
+                    return 0
+                n, nomes = self._fila_codigo(eid, tarefa, hipoteses, sb, nav)
+        else:
+            try:
+                hipoteses = self.agentes.pesquisar(objetivo, historico, n=quantas,
+                                                   memoria=self.memoria())
+            except ErroAgente as e:
+                self.aviso.enviar(f"⚠️ O agente de pesquisa nao produziu hipoteses: {e}")
+                return 0
+            n, nomes = self._fila_params(eid, tarefa, hipoteses, historico)
         if n == 0:
             self.aviso.enviar(f"⚠️ Nenhuma das {len(hipoteses)} hipoteses deu proposta "
                               "aplicavel. Nada foi para a fila.")
@@ -2871,11 +3432,10 @@ class Orquestrador:
                 self.estado.evento("params.recurso", ens)
         return n, nomes
 
-    def _fila_codigo(self, eid, tarefa, hipoteses):
-        """Le os ficheiros uma unica vez: todas as hipoteses partem do mesmo HEAD."""
+    def _fila_codigo(self, eid, tarefa, hipoteses, sb, nav):
+        """Todas as hipoteses partem do mesmo HEAD, no worktree de leitura."""
         params = self._params_vivos()
-        with Sandbox(f"{tarefa['id']}_leitura") as sb:
-            ficheiros = sb.ler_visiveis()      # ve tudo; edita so o permitido
+        ficheiros = sb.ler_visiveis()      # ve tudo; edita so o permitido
         editaveis = {r for r in ficheiros if caminho_permitido(r, FICHEIROS_EDITAVEIS)}
         if not editaveis:
             self.aviso.enviar(
@@ -2888,7 +3448,7 @@ class Orquestrador:
             if self.estado.n_ensaios(eid) + n >= MAX_ENSAIOS_POR_ESTUDO:
                 break
             try:
-                prop = self.agentes.desenvolver(h, ficheiros)
+                prop = self.agentes.desenvolver(h, ficheiros, nav)
             except ErroAgente as e:
                 self.estado.evento("desenvolvimento.falhou", None, hipotese=h["nome"])
                 self.aviso.enviar(f"⚠️ Nao consegui implementar _{h['nome']}_: {e}")
@@ -3865,7 +4425,8 @@ class Bot:
                 contexto += ("\n\nDA MEMORIA, SOBRE O QUE ELE PERGUNTOU:\n"
                              + "\n".join(f"- [{r['tipo']}] {r['titulo'][:50]}: "
                                           f"{r['trecho'][:200]}" for r in relevante))
-            saida = self.orq.agentes.conversar(texto, contexto)
+            saida = self.orq.agentes.conversar(texto, contexto,
+                                               navegador=self.orq.navegador_do_projeto())
         except ErroAgente as exc:
             return self._resp(chat, f"⚠️ Nao consegui responder: {exc}\n\n"
                                     "Para mandar fazer alguma coisa sem passar por mim: "

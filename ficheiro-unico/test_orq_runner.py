@@ -905,3 +905,357 @@ def test_verificar_sem_cache_falha(tmp_path):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ===========================================================================
+#  NAVEGACAO — o agente vai buscar o codigo em vez de o receber picotado
+# ===========================================================================
+FICHEIRO_GRANDE = '''
+"""Um alvo com a forma do real: constantes no topo, uso 200 linhas abaixo."""
+SYMBOL_NAME = "ETHUSD"
+MAX_SPREAD_PIPS = 1.2
+ESTRATEGIA = "sessao"
+''' + "\n".join(f"_ENCHIMENTO_{i} = {i}" for i in range(200)) + '''
+
+def _sessao_sinal(preco, faixa, limiar):
+    """A decisao de entrada, isolada para ser testavel."""
+    if not faixa:
+        return None, "sem_faixa"
+    return "BUY", ""
+
+
+def calcular(x):
+    return x * MAX_SPREAD_PIPS
+'''
+
+
+@pytest.fixture
+def alvo_grande(tmp_path: Path) -> Path:
+    (tmp_path / "alvo.py").write_text(FICHEIRO_GRANDE, encoding="utf-8")
+    return tmp_path
+
+
+def nav_de(pasta: Path):
+    orq = carregar_orquestrador()
+    return orq, orq.Navegador(pasta, ["alvo.py"])
+
+
+def test_estrutura_da_o_indice_com_linhas(alvo_grande):
+    _, nav = nav_de(alvo_grande)
+    est = nav.estrutura()
+    assert "SYMBOL_NAME = 'ETHUSD'" in est or 'SYMBOL_NAME = "ETHUSD"' in est
+    assert "def _sessao_sinal(preco, faixa, limiar)" in est
+    assert "CONSTANTES" in est and "FUNCOES" in est
+
+
+def test_procurar_liga_partes_distantes(alvo_grande):
+    """E para isto que a navegacao existe: a constante esta no topo e o uso
+    duzentas linhas abaixo, e as duas aparecem no mesmo resultado."""
+    _, nav = nav_de(alvo_grande)
+    r = nav.procurar("MAX_SPREAD_PIPS")
+    assert "= 1.2" in r and "x * MAX_SPREAD_PIPS" in r
+
+
+def test_funcao_devolve_o_corpo_inteiro(alvo_grande):
+    _, nav = nav_de(alvo_grande)
+    r = nav.funcao("_sessao_sinal")
+    assert "sem_faixa" in r and 'return "BUY"' in r
+
+
+def test_ler_respeita_o_teto_de_linhas(alvo_grande):
+    _, nav = nav_de(alvo_grande)
+    r = nav.ler(1, 9999, max_linhas=10)
+    assert "cortei em 10 linhas" in r
+    assert len([l for l in r.splitlines() if " | " in l]) == 10
+
+
+def test_erros_voltam_como_texto_nunca_como_excecao(alvo_grande):
+    """O modelo tem de poder corrigir-se; excecao aqui matava o turno."""
+    _, nav = nav_de(alvo_grande)
+    for pedido in ({"ferramenta": "ler", "argumentos": {"inicio": 99999, "fim": 99999}},
+                   {"ferramenta": "ler", "argumentos": {"inicio": 50, "fim": 10}},
+                   {"ferramenta": "procurar", "argumentos": {"termo": ""}},
+                   {"ferramenta": "voar", "argumentos": {}},
+                   {"ferramenta": "ler", "argumentos": {"ficheiro": "nao_ha.py",
+                                                        "inicio": 1, "fim": 2}}):
+        r = nav.executar(pedido)
+        assert r.startswith("ERRO:"), pedido
+
+
+def test_funcao_inexistente_sugere_o_caminho(alvo_grande):
+    _, nav = nav_de(alvo_grande)
+    r = nav.funcao("nao_existe")
+    assert "nao encontrei" in r and "estrutura()" in r
+
+
+def test_o_navegador_de_leitura_recusa_correr(alvo_grande):
+    """Projeto vivo nao e sitio para um modelo executar comandos."""
+    _, nav = nav_de(alvo_grande)
+    assert nav.executar({"ferramenta": "correr",
+                         "argumentos": {"comando": "ls"}}).startswith("ERRO:")
+    assert "correr" not in nav.ferramentas()
+
+
+# ---------------------------------------------------------------------------
+#  Correr codigo: o que a reposicao tem de garantir
+# ---------------------------------------------------------------------------
+def projeto_git(tmp_path: Path) -> Path:
+    """Um projeto versionado, com arnes fora do git e dados ignorados."""
+    import subprocess as sp
+    p = tmp_path / "projeto"
+    (p / "data").mkdir(parents=True)
+    (p / "estrategia.py").write_text("LIMIAR = 1.0\n", encoding="utf-8")
+    (p / "arnes.py").write_text("# calcula as metricas\nVERDADE = 42\n", encoding="utf-8")
+    (p / ".gitignore").write_text("data/\narnes.py\n.orq/\n", encoding="utf-8")
+    for cmd in (["init", "-q"], ["add", "-A"]):
+        sp.run(["git", *cmd], cwd=p, check=True, capture_output=True)
+    sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "i"],
+           cwd=p, check=True, capture_output=True)
+    return p
+
+
+def sandbox_de(tmp_path: Path):
+    orq = carregar_orquestrador()
+    orq.FICHEIROS_ARNES = ["arnes.py"]
+    orq.PASTAS_LIGADAS = ["data"]
+    orq.FICHEIROS_EDITAVEIS = ["estrategia.py"]
+    return orq, projeto_git(tmp_path)
+
+
+def test_repor_desfaz_o_que_o_agente_fez_por_shell(tmp_path):
+    """Com shell no worktree ele contorna a lista branca inteira. A reposicao e
+    o que impede isso de chegar aos numeros."""
+    orq, projeto = sandbox_de(tmp_path)
+    with orq.Sandbox("ens_1", projeto=projeto, worktrees=tmp_path / "wt") as sb:
+        (sb.raiz / "estrategia.py").write_text("LIMIAR = 999\n", encoding="utf-8")
+        (sb.raiz / "intruso.py").write_text("nada\n", encoding="utf-8")
+        sb.repor()
+        assert (sb.raiz / "estrategia.py").read_text() == "LIMIAR = 1.0\n"
+        assert not (sb.raiz / "intruso.py").exists()
+
+
+def test_repor_devolve_o_arnes_original(tmp_path):
+    """O arnes calcula as metricas. Reescreve-lo por shell seria o agente a
+    redigir o proprio boletim."""
+    orq, projeto = sandbox_de(tmp_path)
+    with orq.Sandbox("ens_2", projeto=projeto, worktrees=tmp_path / "wt") as sb:
+        (sb.raiz / "arnes.py").write_text("VERDADE = 'mentira'\n", encoding="utf-8")
+        sb.repor()
+        assert "VERDADE = 42" in (sb.raiz / "arnes.py").read_text()
+
+
+def test_repor_apaga_metricas_plantadas(tmp_path):
+    """Um `echo` para o .orq/metricas.json bastava, se ele sobrevivesse."""
+    orq, projeto = sandbox_de(tmp_path)
+    with orq.Sandbox("ens_3", projeto=projeto, worktrees=tmp_path / "wt") as sb:
+        (sb.raiz / ".orq").mkdir(exist_ok=True)
+        (sb.raiz / ".orq" / "metricas.json").write_text('{"sharpe": 99}', encoding="utf-8")
+        sb.repor()
+        assert not (sb.raiz / ".orq" / "metricas.json").exists()
+
+
+def test_repor_nao_leva_os_atalhos_dos_dados(tmp_path):
+    """Sem os dados o backtest correria vazio, e a defesa quebrava o produto."""
+    orq, projeto = sandbox_de(tmp_path)
+    (projeto / "data" / "candles.bin").write_bytes(b"x" * 10)
+    with orq.Sandbox("ens_4", projeto=projeto, worktrees=tmp_path / "wt") as sb:
+        sb.repor()
+        assert (sb.raiz / "data" / "candles.bin").exists()
+
+
+def test_a_alteracao_aprovada_sobrevive_a_reposicao(tmp_path):
+    """A ordem importa: repor primeiro, aplicar depois. Ao contrario, a defesa
+    apagava exatamente aquilo que se queria medir."""
+    orq, projeto = sandbox_de(tmp_path)
+    with orq.Sandbox("ens_5", projeto=projeto, worktrees=tmp_path / "wt") as sb:
+        (sb.raiz / "estrategia.py").write_text("LIXO\n", encoding="utf-8")
+        sb.repor()
+        ok, _ = sb.aplicar("estrategia.py",
+                           [{"procurar": "LIMIAR = 1.0", "substituir": "LIMIAR = 2.5"}])
+        assert ok
+        assert "LIMIAR = 2.5" in (sb.raiz / "estrategia.py").read_text()
+
+
+def test_o_navegador_do_ensaio_corre_e_ve_o_resultado(tmp_path):
+    """Ler diz o que o codigo DIZ; correr diz o que ele FAZ."""
+    orq, projeto = sandbox_de(tmp_path)
+    with orq.Sandbox("ens_6", projeto=projeto, worktrees=tmp_path / "wt") as sb:
+        nav = orq.NavegadorComExecucao(sb.raiz, ["estrategia.py"], sb)
+        assert "correr" in nav.ferramentas()
+        r = nav.executar({"ferramenta": "correr", "argumentos": {
+            "comando": "python3 -c \"import estrategia; print('LIMIAR', estrategia.LIMIAR)\""}})
+        assert "LIMIAR 1.0" in r
+        assert nav.corridas and nav.corridas[0]["codigo"] == 0
+
+
+def test_correr_invalida_o_cache_de_leitura(tmp_path):
+    """Depois de um comando mexer no ficheiro, continuar a servir a versao
+    antiga poria o agente a raciocinar sobre codigo que ja nao existe."""
+    orq, projeto = sandbox_de(tmp_path)
+    with orq.Sandbox("ens_7", projeto=projeto, worktrees=tmp_path / "wt") as sb:
+        nav = orq.NavegadorComExecucao(sb.raiz, ["estrategia.py"], sb)
+        assert "1.0" in nav.ler(1, 5)
+        nav.executar({"ferramenta": "correr", "argumentos": {
+            "comando": "python3 -c \"open('estrategia.py','w').write('LIMIAR = 7.0')\""}})
+        assert "7.0" in nav.ler(1, 5)
+
+
+# ---------------------------------------------------------------------------
+#  O ciclo: pedir codigo, depois responder
+# ---------------------------------------------------------------------------
+def ciclo(alvo_grande: Path, respostas: list[str], **kw):
+    orq, nav = nav_de(alvo_grande)
+    llm = orq.ModeloFalso(respostas)
+    saida = orq.correr_agente_navegando(
+        llm, papel="teste", modelo="m", sistema="s", prompt="p",
+        validar=lambda d: d["ok"], navegador=nav, **kw)
+    return saida, llm, nav
+
+
+def test_o_agente_consulta_e_so_depois_responde(alvo_grande):
+    saida, llm, nav = ciclo(alvo_grande, [
+        '{"ferramenta": "estrutura", "argumentos": {}}',
+        '{"ferramenta": "funcao", "argumentos": {"nome": "_sessao_sinal"}}',
+        '{"ok": "pronto"}'])
+    assert saida == "pronto"
+    assert nav.pedidos == 2
+    # o resultado da consulta anterior tem de estar na mensagem seguinte,
+    # senao ele nao acumula nada e cada volta comeca do zero
+    assert "sem_faixa" in llm.chamadas[-1]["utilizador"]
+
+
+def test_nada_e_pre_enviado(alvo_grande):
+    """Nem o indice. Uma pergunta que nao e sobre codigo nao paga 6 mil tokens."""
+    _, llm, _ = ciclo(alvo_grande, ['{"ok": 1}'])
+    primeira = llm.chamadas[0]["utilizador"]
+    assert "_ENCHIMENTO_100" not in primeira
+    assert "estrutura" in primeira          # sabe que PODE pedir
+
+
+def test_um_erro_do_navegador_nao_mata_o_turno(alvo_grande):
+    saida, _, _ = ciclo(alvo_grande, [
+        '{"ferramenta": "ler", "argumentos": {"inicio": 99999, "fim": 99999}}',
+        '{"ok": "recuperou"}'])
+    assert saida == "recuperou"
+
+
+def test_resposta_invalida_volta_com_o_motivo(alvo_grande):
+    orq, nav = nav_de(alvo_grande)
+    llm = orq.ModeloFalso(['{"errado": 1}', '{"ok": "agora sim"}'])
+
+    def validar(d):
+        if "ok" not in d:
+            raise ValueError("falta a chave `ok`")
+        return d["ok"]
+
+    saida = orq.correr_agente_navegando(llm, papel="t", modelo="m", sistema="s",
+                                        prompt="p", validar=validar, navegador=nav)
+    assert saida == "agora sim"
+    assert "falta a chave `ok`" in llm.chamadas[-1]["utilizador"]
+
+
+def test_o_teto_de_consultas_e_respeitado(alvo_grande):
+    pedido = '{"ferramenta": "estrutura", "argumentos": {}}'
+    saida, _, nav = ciclo(alvo_grande, [pedido] * 4 + ['{"ok": "fim"}'],
+                          max_ferramentas=3)
+    assert saida == "fim"
+    assert nav.pedidos == 3
+
+
+def test_insistir_em_pedir_depois_do_teto_gasta_as_tentativas(alvo_grande):
+    """Depois de lhe dizerem para responder, cada pedido novo E uma resposta
+    falhada. Sem isso, um modelo teimoso girava aqui para sempre."""
+    orq, nav = nav_de(alvo_grande)
+    pedido = '{"ferramenta": "estrutura", "argumentos": {}}'
+    llm = orq.ModeloFalso([pedido] * 30)
+    with pytest.raises(orq.ErroAgente, match="tentativas"):
+        orq.correr_agente_navegando(
+            llm, papel="t", modelo="m", sistema="s", prompt="p", navegador=nav,
+            validar=lambda d: d["ok"], max_ferramentas=2, tentativas=3)
+    assert nav.pedidos == 2
+    assert len(llm.chamadas) == 5          # 2 consultas + 3 tentativas, e para
+
+
+def test_estourar_o_orcamento_deixa_marca(alvo_grande):
+    """Ele tem de SABER que perdeu consultas, senao raciocina sobre o que ja
+    nao esta la."""
+    saida, llm, _ = ciclo(alvo_grande, [
+        '{"ferramenta": "estrutura", "argumentos": {}}',
+        '{"ferramenta": "estrutura", "argumentos": {}}',
+        '{"ferramenta": "estrutura", "argumentos": {}}',
+        '{"ok": "fim"}'], orcamento=500)
+    assert saida == "fim"
+    assert "descartadas" in llm.chamadas[-1]["utilizador"]
+
+
+def test_sem_resposta_valida_rebenta_com_o_motivo(alvo_grande):
+    orq, nav = nav_de(alvo_grande)
+    llm = orq.ModeloFalso(['{"nao": 1}'] * 40)
+    with pytest.raises(orq.ErroAgente, match="falta"):
+        orq.correr_agente_navegando(
+            llm, papel="t", modelo="m", sistema="s", prompt="p", navegador=nav,
+            validar=lambda d: d["ok"] if "ok" in d else (_ for _ in ()).throw(
+                ValueError("falta `ok`")))
+
+
+# ---------------------------------------------------------------------------
+#  Ficheiro grande de mais: entra com aviso, nunca em silencio
+# ---------------------------------------------------------------------------
+def test_ficheiro_grande_nao_desaparece(tmp_path):
+    """Era descartado sem aviso, e o agente propunha alteracoes a um ficheiro
+    que nunca tinha visto — inventando nomes e funcoes."""
+    orq, projeto = sandbox_de(tmp_path)
+    orq.TETO_FICHEIRO_INTEIRO = 50
+    (projeto / "gordo.py").write_text("X = 1\n" * 200, encoding="utf-8")
+    import subprocess as sp
+    sp.run(["git", "add", "-A"], cwd=projeto, check=True, capture_output=True)
+    sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "g"],
+           cwd=projeto, check=True, capture_output=True)
+    with orq.Sandbox("ens_g", projeto=projeto, worktrees=tmp_path / "wt") as sb:
+        vistos = sb.ler_visiveis()
+        assert "gordo.py" in vistos
+        assert "grande de mais" in vistos["gordo.py"]
+        assert "procurar()" in vistos["gordo.py"]
+
+
+# ---------------------------------------------------------------------------
+#  O `local` da hipotese
+# ---------------------------------------------------------------------------
+def test_local_valido_e_aceite(alvo_grande):
+    _, nav = nav_de(alvo_grande)
+    assert nav.existe({"funcao": "_sessao_sinal"}) == ""
+    assert nav.existe({"inicio": 1, "fim": 5}) == ""
+
+
+def test_local_inventado_e_recusado_cedo(alvo_grande):
+    """Uma funcao que nao existe descoberta agora e uma linha de erro que o
+    modelo corrige; descoberta no programador e um ensaio perdido."""
+    _, nav = nav_de(alvo_grande)
+    assert "nao encontrei" in nav.existe({"funcao": "inventada"})
+    assert nav.existe({"ficheiro": "outro.py", "funcao": "x"})
+    assert nav.existe({}) and nav.existe("nao e dict")
+
+
+def test_trecho_devolve_so_a_regiao(alvo_grande):
+    _, nav = nav_de(alvo_grande)
+    t = nav.trecho({"funcao": "_sessao_sinal"})
+    assert "sem_faixa" in t
+    assert "_ENCHIMENTO_100" not in t
+
+
+def test_procurar_encontra_constantes_alinhadas_com_espacos(alvo_grande):
+    """O alvo real alinha as constantes com padding:
+
+        SYMBOL_NAME          = "ETHUSD"
+
+    Procurar `SYMBOL_NAME =` a letra encontrava so os USOS, nunca a definicao —
+    e o agente concluia que a constante nao existia. Que e exatamente o engano
+    que esta navegacao existe para acabar."""
+    (alvo_grande / "alvo.py").write_text(
+        'SYMBOL_NAME          = "ETHUSD"\n'
+        'MAX_SPREAD_PIPS      = 1.2\n'
+        'def f():\n    return SYMBOL_NAME\n', encoding="utf-8")
+    _, nav = nav_de(alvo_grande)
+    r = nav.procurar("SYMBOL_NAME =")
+    assert "ETHUSD" in r
+    assert "MAX_SPREAD" in nav.procurar("MAX_SPREAD_PIPS = 1.2")
