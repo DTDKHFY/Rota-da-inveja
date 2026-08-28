@@ -941,11 +941,21 @@ def nav_de(pasta: Path):
 
 
 def test_estrutura_da_o_indice_com_linhas(alvo_grande):
+    """Por omissao so nomes e linhas: chega para decidir onde olhar, que e para
+    o que o indice serve. Com valores dava 24 KB no ficheiro real — 61% do
+    orcamento numa consulta, e reenviado a cada volta ate o modelo desistir."""
     _, nav = nav_de(alvo_grande)
     est = nav.estrutura()
-    assert "SYMBOL_NAME = 'ETHUSD'" in est or 'SYMBOL_NAME = "ETHUSD"' in est
-    assert "def _sessao_sinal(preco, faixa, limiar)" in est
+    assert "SYMBOL_NAME" in est and "_sessao_sinal" in est
     assert "CONSTANTES" in est and "FUNCOES" in est
+    assert "ETHUSD" not in est                     # valor nao, so o nome
+    assert "(preco, faixa, limiar)" not in est     # assinatura tambem nao
+
+
+def test_estrutura_com_detalhe_traz_os_valores(alvo_grande):
+    _, nav = nav_de(alvo_grande)
+    assert "ETHUSD" in nav.estrutura(detalhe="constantes")
+    assert "(preco, faixa, limiar)" in nav.estrutura(detalhe="funcoes")
 
 
 def test_procurar_liga_partes_distantes(alvo_grande):
@@ -1259,3 +1269,151 @@ def test_procurar_encontra_constantes_alinhadas_com_espacos(alvo_grande):
     r = nav.procurar("SYMBOL_NAME =")
     assert "ETHUSD" in r
     assert "MAX_SPREAD" in nav.procurar("MAX_SPREAD_PIPS = 1.2")
+
+
+# ---------------------------------------------------------------------------
+#  O que os modelos guionados nunca apanharam
+# ---------------------------------------------------------------------------
+class ModeloLento:
+    """Nao responde. Foi assim que o minimax:cloud falhou na primeira corrida,
+    e nenhum teste tinha maneira de ver isso: um modelo guionado responde
+    sempre, e sempre depressa."""
+
+    def __init__(self, orq):
+        self.erro = orq.ErroModelo
+        self.chamadas = []
+
+    def conversar(self, sistema, utilizador, *, modelo, json_mode=True):
+        self.chamadas.append({"sistema": sistema, "utilizador": utilizador,
+                              "modelo": modelo})
+        raise self.erro(f"o modelo {modelo} nao respondeu em 300s.")
+
+
+def test_um_modelo_que_nao_responde_e_dito_como_tal(alvo_grande):
+    """"Nao chegou a uma resposta valida" mandava procurar no formato, quando o
+    problema era o modelo nao atender. Sao arranjos diferentes."""
+    orq, nav = nav_de(alvo_grande)
+    with pytest.raises(orq.ErroAgente) as e:
+        orq.correr_agente_navegando(
+            ModeloLento(orq), papel="pesquisa", modelo="minimax-m3:cloud",
+            sistema="s", prompt="p", validar=lambda d: d, navegador=nav)
+    msg = str(e.value)
+    assert "nao respondeu a tempo" in msg
+    assert "MAX_FERRAMENTAS" in msg          # diz o que fazer a seguir
+
+
+def test_um_modelo_que_erra_o_formato_e_dito_como_tal(alvo_grande):
+    orq, nav = nav_de(alvo_grande)
+    llm = orq.ModeloFalso(['{"errado": 1}'] * 20)
+    with pytest.raises(orq.ErroAgente) as e:
+        orq.correr_agente_navegando(
+            llm, papel="conversa", modelo="m", sistema="s", prompt="p",
+            navegador=nav,
+            validar=lambda d: d["resposta"] if "resposta" in d
+            else (_ for _ in ()).throw(ValueError("falta a chave `resposta`")))
+    msg = str(e.value)
+    assert "fora do formato" in msg
+    assert "falta a chave `resposta`" in msg
+
+
+def test_gastar_as_consultas_sem_responder_e_dito_como_tal(alvo_grande):
+    orq, nav = nav_de(alvo_grande)
+    llm = orq.ModeloFalso(['{"ferramenta": "estrutura", "argumentos": {}}'] * 20)
+    with pytest.raises(orq.ErroAgente) as e:
+        orq.correr_agente_navegando(
+            llm, papel="t", modelo="m", sistema="s", prompt="p", navegador=nav,
+            validar=lambda d: d["ok"], max_ferramentas=2, tentativas=2)
+    assert "Gastou as 2 consultas" in str(e.value)
+
+
+# ---------------------------------------------------------------------------
+#  num_ctx: so aos locais
+# ---------------------------------------------------------------------------
+class OllamaEspiao:
+    """O Ollama de verdade, sem rede: guarda a carga em vez de a mandar."""
+
+    def __init__(self, orq):
+        self.orq, self.cargas = orq, []
+
+    def conversar(self, sistema, utilizador, *, modelo, json_mode=True):
+        carga = {"model": modelo, "options": {"temperature": 0.2}}
+        if modelo in self.orq.JANELA_MODELO:
+            carga["options"]["num_ctx"] = self.orq.JANELA_MODELO[modelo]
+        self.cargas.append(carga)
+        return '{"ok": 1}'
+
+
+def test_num_ctx_so_vai_para_os_modelos_locais():
+    """Impor num_ctx a um modelo de nuvem nao traz beneficio — o contexto e
+    decidido do lado dele — e foi o que o pos a nao responder em 300s."""
+    orq = carregar_orquestrador()
+    assert "qwen2.5-coder:7b" in orq.JANELA_MODELO
+    assert not any(":cloud" in m for m in orq.JANELA_MODELO)
+
+    espiao = OllamaEspiao(orq)
+    espiao.conversar("s", "u", modelo="minimax-m3:cloud")
+    espiao.conversar("s", "u", modelo="qwen2.5-coder:7b")
+    assert "num_ctx" not in espiao.cargas[0]["options"]
+    assert espiao.cargas[1]["options"]["num_ctx"] == 32_768
+
+
+def test_o_codigo_real_nao_manda_num_ctx_a_nuvem():
+    """Le a montagem da carga no proprio ficheiro: o teste acima usa um espiao,
+    e um espiao pode divergir do original sem ninguem dar por isso."""
+    fonte = (AQUI / "orquestrador.py").read_text(encoding="utf-8")
+    i = fonte.index('"options": {"temperature"')
+    trecho = fonte[i:i + 400]
+    assert "if modelo in JANELA_MODELO" in trecho
+    assert "JANELA_PADRAO" not in fonte      # o omissao para todos morreu
+
+
+# ---------------------------------------------------------------------------
+#  Nenhuma consulta pode dominar o contexto
+# ---------------------------------------------------------------------------
+def test_um_resultado_gigante_e_cortado(alvo_grande):
+    orq, nav = nav_de(alvo_grande)
+    r = nav.executar({"ferramenta": "ler", "argumentos": {"inicio": 1, "fim": 300}})
+    assert len(r) <= orq.MAX_RESULTADO + 200
+    if len(r) > orq.MAX_RESULTADO:
+        assert "cortei aqui" in r
+
+
+def test_o_indice_do_ficheiro_real_cabe_numa_consulta():
+    """A medida que interessa, no alvo verdadeiro de 19.363 linhas."""
+    import shutil, tempfile
+    orq = carregar_orquestrador()
+    real = Path("/root/.claude/uploads/80f6f73a-ad3f-566c-8e0a-6294c59d82c0/"
+                "8d052ae9-run_backtest.py")
+    if not real.exists():
+        pytest.skip("o ficheiro real nao esta disponivel neste ambiente")
+    d = Path(tempfile.mkdtemp())
+    shutil.copy(real, d / "run_backtest.py")
+    nav = orq.Navegador(d, ["run_backtest.py"])
+    est = nav.executar({"ferramenta": "estrutura", "argumentos": {}})
+    assert len(est) <= orq.MAX_RESULTADO
+    assert "cortei aqui" not in est          # cabe inteiro, nao truncado
+    # e as constantes que interessam estao la, com a linha
+    for nome in ("SYMBOL_NAME", "ESTRATEGIA", "MAX_SPREAD_PIPS", "SESSAO_LIMIAR"):
+        assert nome in est
+
+
+# ---------------------------------------------------------------------------
+#  O formato final e a ultima coisa que ele le
+# ---------------------------------------------------------------------------
+def test_o_lembrete_do_formato_fica_no_fim(alvo_grande):
+    """As instrucoes de navegacao acabavam com exemplos de CHAMADAS. A ultima
+    coisa que ele lia era como pedir codigo, e respondia com um pedido quando
+    devia responder de vez."""
+    orq, nav = nav_de(alvo_grande)
+    llm = orq.ModeloFalso([
+        '{"ferramenta": "estrutura", "argumentos": {}}',
+        '{"nao_serve": 1}',
+        '{"ok": 1}'])
+    orq.correr_agente_navegando(
+        llm, papel="t", modelo="m", sistema="s", prompt="p", navegador=nav,
+        formato='{"ok": "..."}',
+        validar=lambda d: d["ok"] if "ok" in d
+        else (_ for _ in ()).throw(ValueError("falta `ok`")))
+    # em todas as voltas, incluindo com historico E com erro anterior
+    for c in llm.chamadas:
+        assert c["utilizador"].rstrip().endswith('{"ok": "..."}')

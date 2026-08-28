@@ -227,10 +227,15 @@ MAX_FERRAMENTAS = 12             # consultas por turno, antes de ter de responde
 ORCAMENTO_NAVEGACAO = 40_000     # caracteres de resultados acumulados
 TETO_FICHEIRO_INTEIRO = 120_000  # acima disto, so por pedaços (nunca em silencio)
 
-# Janela de contexto por modelo. O 8192 que estava aqui era conservador de mais
-# para os modelos de nuvem, e e neles que a navegacao corre.
+# Janela de contexto, SO para os modelos locais. Um modelo de nuvem decide o
+# contexto do lado dele, e impor-lhe um valor nao traz beneficio nenhum — pode
+# so atrasa-lo. Modelo que nao esteja aqui nao leva `num_ctx` nenhum.
 JANELA_MODELO = {"qwen2.5-coder:7b": 32_768}
-JANELA_PADRAO = 32_768
+
+# Nenhum resultado de ferramenta pode dominar o contexto sozinho. Sem isto,
+# uma estrutura() de 24 KB comia 61% do orcamento numa consulta, e a partir da
+# cada volta reenviava esses 24 KB — ate o modelo de nuvem deixar de responder.
+MAX_RESULTADO = 8_000
 
 # Quanto tempo um comando de EXPLORACAO pode demorar. Curto de proposito: nao e
 # a medicao, e uma pergunta ao codigo. A medicao oficial tem TIMEOUT_BACKTEST.
@@ -1306,9 +1311,12 @@ class Ollama:
             "messages": [{"role": "system", "content": sistema},
                          {"role": "user", "content": utilizador}],
             "stream": False,
-            "options": {"temperature": 0.2,
-                        "num_ctx": JANELA_MODELO.get(modelo, JANELA_PADRAO)},
+            "options": {"temperature": 0.2},
         }
+        # So os locais. Ver JANELA_MODELO: impor isto a um modelo de nuvem foi
+        # o que o pos a nao responder em 300s.
+        if modelo in JANELA_MODELO:
+            carga["options"]["num_ctx"] = JANELA_MODELO[modelo]
         if json_mode:
             carga["format"] = "json"
         try:
@@ -1413,7 +1421,7 @@ def instrucoes_navegacao(nav: Navegador) -> str:
 
 def correr_agente_navegando(llm, *, papel: str, modelo: str, sistema: str,
                             prompt: str, validar: Callable, navegador: Navegador,
-                            tentativas: int = TENTATIVAS_JSON,
+                            formato: str = "", tentativas: int = TENTATIVAS_JSON,
                             max_ferramentas: int = MAX_FERRAMENTAS,
                             orcamento: int = ORCAMENTO_NAVEGACAO):
     """Como `correr_agente`, mas o modelo pode ir buscar o codigo primeiro.
@@ -1449,6 +1457,11 @@ def correr_agente_navegando(llm, *, papel: str, modelo: str, sistema: str,
             partes += ["", "--- A TUA RESPOSTA ANTERIOR FOI REJEITADA ---",
                        f"Motivo: {ultimo_erro}",
                        "Corrige e devolve APENAS o JSON pedido."]
+        # O lembrete do formato fica SEMPRE no fim — depois do historico, depois
+        # do erro. Antes, a ultima coisa que ele lia eram exemplos de chamadas de
+        # ferramenta, e respondia com uma quando devia responder de vez.
+        if formato:
+            partes += ["", "--- O QUE TENS DE DEVOLVER, SE JA SOUBERES ---", formato]
 
         try:
             bruto = llm.conversar(sistema, "\n".join(partes), modelo=modelo,
@@ -1483,9 +1496,27 @@ def correr_agente_navegando(llm, *, papel: str, modelo: str, sistema: str,
             ultimo_erro = str(e)
             falhadas += 1
 
-    raise ErroAgente(f"[{papel}] o modelo {modelo} nao chegou a uma resposta valida "
-                     f"em {consultas} consultas e {falhadas} tentativas. "
-                     f"Ultimo erro: {ultimo_erro}")
+    # Nao respondeu, respondeu torto, ou nao chegou a decidir — sao tres
+    # problemas com tres arranjos diferentes, e dizer so "nao chegou a uma
+    # resposta valida" mandava-te procurar no sitio errado.
+    ultimo = str(ultimo_erro or "")
+    if "nao respondeu" in ultimo or "timeout" in ultimo.lower():
+        pista = (f"O modelo nao respondeu a tempo. Costuma ser contexto a mais: "
+                 f"baixa MAX_FERRAMENTAS (esta em {max_ferramentas}) ou "
+                 f"ORCAMENTO_NAVEGACAO (esta em {orcamento}). Confirma tambem "
+                 f"que o Ollama responde: `ollama list`.")
+    elif "nao consegui falar" in ultimo or "nao conhece" in ultimo:
+        pista = "O Ollama nao esta a atender, ou nao tem este modelo."
+    elif consultas >= max_ferramentas:
+        pista = (f"Gastou as {max_ferramentas} consultas a explorar e nunca "
+                 f"respondeu. Sobe MAX_FERRAMENTAS, ou da-lhe um objetivo mais "
+                 f"estreito.")
+    else:
+        pista = ("Respondeu, mas fora do formato pedido. Se persistir, este "
+                 "modelo nao esta a aguentar navegar — troca-o por outro.")
+    raise ErroAgente(f"[{papel}] {modelo}: {consultas} consultas, "
+                     f"{falhadas} tentativas, sem resposta valida.\n"
+                     f"Ultimo erro: {ultimo_erro}\n{pista}")
 
 
 # ===========================================================================
@@ -1513,6 +1544,19 @@ Formato exato da resposta:
  "edicoes": [{"procurar": "texto exato", "substituir": "texto novo"}],
  "justificacao": "uma ou duas frases"}
 """
+
+
+def cortar_resultado(texto: str, teto: int = MAX_RESULTADO) -> str:
+    """Nenhuma consulta pode dominar o contexto sozinha.
+
+    O total ja era limitado, mas um unico resultado gigante passava — e depois
+    era reenviado a cada volta, porque o historico e reconstruido na mensagem.
+    Uma consulta cara envenenava todas as seguintes.
+    """
+    if len(texto) <= teto:
+        return texto
+    return (texto[:teto] + f"\n[... cortei aqui: {len(texto) - teto} caracteres a "
+            f"mais do que cabe numa consulta. Pede mais estreito.]")
 
 
 def _assinatura(no) -> str:
@@ -1590,40 +1634,64 @@ class Navegador:
                             f"Existem: {', '.join(self.ficheiros[:8])}")
 
     # -- as quatro operacoes ----------------------------------------------
-    def estrutura(self, ficheiro: str | None = None, limite: int = 300) -> str:
-        """O indice: constantes e assinaturas, com o numero da linha."""
+    def estrutura(self, ficheiro: str | None = None, detalhe: str = "",
+                  limite: int = 140) -> str:
+        """O indice, com o numero da linha.
+
+        Por omissao so os NOMES. Com os valores e as assinaturas isto dava 24 KB
+        no ficheiro real — 61% do orcamento de contexto numa unica consulta, e
+        depois reenviado a cada volta ate o modelo deixar de responder. O nome e
+        a linha chegam para decidir onde olhar a seguir, que e para o que o
+        indice serve; o resto pede-se com funcao() ou ler().
+
+        `detalhe="constantes"` traz os valores, `detalhe="funcoes"` traz as
+        assinaturas — para quando interessa mesmo.
+        """
         rel = self.resolver(ficheiro)
         arvore, n = self._arvore(rel), len(self.linhas(rel))
         if arvore is None:
             return f"{rel}: {n} linhas, mas nao consegui analisar (erro de sintaxe)."
+        detalhe = str(detalhe or "").strip().lower()
 
         consts, defs = [], []
         for no in arvore.body:
             if (isinstance(no, ast.Assign) and len(no.targets) == 1
                     and isinstance(no.targets[0], ast.Name)
                     and no.targets[0].id.isupper()):
-                try:
-                    valor = ast.unparse(no.value).replace("\n", " ")
-                except Exception:
-                    valor = "..."
-                consts.append(f"{no.lineno:>6}  {no.targets[0].id} = {valor[:64]}")
+                nome = no.targets[0].id
+                if detalhe == "constantes":
+                    try:
+                        valor = ast.unparse(no.value).replace("\n", " ")
+                    except Exception:
+                        valor = "..."
+                    consts.append(f"{no.lineno:>6}  {nome} = {valor[:64]}")
+                else:
+                    consts.append(f"{no.lineno}:{nome}")
             elif isinstance(no, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                defs.append(f"{no.lineno:>6}  def {no.name}({_assinatura(no)})")
+                defs.append(f"{no.lineno:>6}  def {no.name}({_assinatura(no)})"
+                            if detalhe == "funcoes" else f"{no.lineno}:{no.name}")
             elif isinstance(no, ast.ClassDef):
-                defs.append(f"{no.lineno:>6}  class {no.name}")
+                defs.append(f"{no.lineno:>6}  class {no.name}"
+                            if detalhe == "funcoes" else f"{no.lineno}:{no.name}")
                 for m in no.body:
                     if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        defs.append(f"{m.lineno:>6}      def {m.name}({_assinatura(m)})")
+                        defs.append(f"{m.lineno:>6}      def {m.name}({_assinatura(m)})"
+                                    if detalhe == "funcoes"
+                                    else f"{m.lineno}:{no.name}.{m.name}")
 
-        partes = [f"{rel} — {n} linhas", f"\nCONSTANTES ({len(consts)}):"]
-        partes += consts[:limite]
-        if len(consts) > limite:
-            partes.append(f"       [... mais {len(consts) - limite}. Usa procurar().]")
-        partes.append(f"\nFUNCOES E CLASSES ({len(defs)}):")
-        partes += defs[:limite]
-        if len(defs) > limite:
-            partes.append(f"       [... mais {len(defs) - limite}. Usa procurar().]")
-        return "\n".join(partes)
+        def bloco(titulo, itens):
+            corpo = ("\n".join(itens[:limite]) if detalhe
+                     else "  ".join(itens[:limite]))
+            extra = (f"\n  [... mais {len(itens) - limite}. Usa procurar().]"
+                     if len(itens) > limite else "")
+            return f"\n{titulo} ({len(itens)}), como linha:nome:\n{corpo}{extra}"
+
+        return (f"{rel} — {n} linhas"
+                + bloco("CONSTANTES", consts) + bloco("FUNCOES E CLASSES", defs)
+                + ("" if detalhe else
+                   "\n\nPara ver valores: estrutura(detalhe='constantes'). "
+                   "Para assinaturas: estrutura(detalhe='funcoes'). "
+                   "Para o corpo: funcao('nome')."))
 
     def procurar(self, termo: str, ficheiro: str | None = None,
                  contexto: int = 2, max_ocorrencias: int = 20) -> str:
@@ -1737,12 +1805,15 @@ class Navegador:
         """Um pedido do modelo. Erro nunca levanta: volta como texto para ele se
         corrigir, que e o mesmo ciclo que ja torna estes modelos usaveis."""
         self.pedidos += 1
+        return cortar_resultado(self._despachar(pedido))
+
+    def _despachar(self, pedido: dict) -> str:
         nome = str(pedido.get("ferramenta") or "").strip().lower()
         args = pedido.get("argumentos")
         args = args if isinstance(args, dict) else {}
         try:
             if nome == "estrutura":
-                return self.estrutura(args.get("ficheiro"))
+                return self.estrutura(args.get("ficheiro"), args.get("detalhe", ""))
             if nome == "procurar":
                 return self.procurar(args.get("termo", ""), args.get("ficheiro"))
             if nome == "ler":
@@ -1912,7 +1983,10 @@ def propor_alteracao(ficheiros: dict[str, str], hipotese: dict, *,
         return correr_agente_navegando(
             llm, papel="programador", modelo=modelo, sistema=SISTEMA,
             prompt=prompt, validar=validar, navegador=navegador,
-            tentativas=tentativas)
+            tentativas=tentativas,
+            formato='{"ficheiro": "caminho.py", "edicoes": [{"procurar": '
+                    '"texto exato", "substituir": "texto novo"}], '
+                    '"justificacao": "uma frase"}')
     return correr_agente(llm, papel="programador", modelo=modelo, sistema=SISTEMA,
                          prompt=prompt, validar=validar, tentativas=tentativas)
 
@@ -2906,7 +2980,11 @@ class Agentes:
             return correr_agente_navegando(
                 self.llm, papel="pesquisa", modelo=MODELO_PESQUISA,
                 sistema=SISTEMA_PESQUISA, prompt=prompt, validar=validar,
-                navegador=navegador, tentativas=TENTATIVAS_JSON)
+                navegador=navegador, tentativas=TENTATIVAS_JSON,
+                formato='{"hipoteses": [{"nome": "...", "raciocinio": "...", '
+                        '"direcao": "aumentar|diminuir|explorar"'
+                        + (', "local": {"ficheiro": "...", "funcao": "..."}'
+                           if navegador is not None else '') + '}]}')
         return correr_agente(self.llm, papel="pesquisa", modelo=MODELO_PESQUISA,
                               sistema=SISTEMA_PESQUISA, prompt=prompt, validar=validar,
                               tentativas=TENTATIVAS_JSON)
@@ -3068,7 +3146,8 @@ class Agentes:
             return correr_agente_navegando(
                 self.llm, papel="conversa", modelo=MODELO_PESQUISA,
                 sistema=SISTEMA_CONVERSA, prompt=prompt, validar=validar,
-                navegador=navegador, tentativas=TENTATIVAS_JSON)
+                navegador=navegador, tentativas=TENTATIVAS_JSON,
+                formato='{"resposta": "o que lhe dizes", "tarefa": null}')
         return correr_agente(self.llm, papel="conversa", modelo=MODELO_PESQUISA,
                              sistema=SISTEMA_CONVERSA, prompt=prompt, validar=validar,
                              tentativas=TENTATIVAS_JSON)
