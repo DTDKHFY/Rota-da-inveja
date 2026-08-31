@@ -2077,3 +2077,228 @@ def test_a_tabela_leituras_aparece_numa_base_que_ja_existia(tmp_path):
     primeiro.c.close()
     segundo = orq.Estado(caminho)
     assert segundo.placar()["total"] == 0
+
+
+# ===========================================================================
+#  O ERRO TEM DE DIZER A VERDADE
+#
+#  Um 402 do Ollama ("this model requires a subscription") chegou ao Telegram
+#  vestido de "respondeu, mas fora do formato pedido — troca-o por outro". Nao
+#  respondeu, nao foi formato, e o conselho mandava trocar um modelo de nuvem
+#  por outro da MESMA conta. Estes testes existem por causa disso.
+# ===========================================================================
+class RespostaFalsa:
+    """O minimo do requests.Response que o erro_de_estado usa."""
+
+    def __init__(self, status, texto=""):
+        self.status_code = status
+        self.text = texto
+        self.ok = 200 <= status < 300
+
+
+CORPO_402 = ('{"error":"this model requires a subscription or extra usage, '
+             'upgrade for access at https://ollama.com/upgrade"}')
+
+
+def test_o_402_e_dito_como_cobranca_e_nao_como_formato():
+    orq = carregar_orquestrador()
+    e = orq.erro_de_estado(RespostaFalsa(402, CORPO_402), "minimax-m3:cloud")
+    assert e.permanente is True
+    texto = f"{e} {e.pista}".lower()
+    assert "conta" in texto and "acesso" in texto
+    assert "formato" not in texto
+    assert "ollama.com/upgrade" in texto
+    assert "local" in texto              # diz a alternativa que nao custa nada
+
+
+def test_a_frase_do_ollama_aparece_sem_o_json_a_volta():
+    """Despejar {"error": ...} fazia parecer avaria minha, quando la dentro
+    esta uma frase clara sobre a conta de quem a le."""
+    orq = carregar_orquestrador()
+    e = orq.erro_de_estado(RespostaFalsa(402, CORPO_402), "m:cloud")
+    assert "requires a subscription" in str(e)
+    assert '{"error"' not in str(e)
+
+
+def test_um_corpo_que_nao_e_json_passa_a_mesma():
+    orq = carregar_orquestrador()
+    e = orq.erro_de_estado(RespostaFalsa(500, "Bad Gateway"), "m:cloud")
+    assert "Bad Gateway" in str(e)
+
+
+@pytest.mark.parametrize("estado,permanente", [
+    (401, True), (402, True), (403, True), (404, True),
+    (429, False), (500, False), (503, False),
+])
+def test_o_que_vale_a_pena_repetir_e_o_que_nao_vale(estado, permanente):
+    orq = carregar_orquestrador()
+    e = orq.erro_de_estado(RespostaFalsa(estado, '{"error":"x"}'), "m:cloud")
+    assert e.permanente is permanente
+
+
+def test_o_404_continua_a_mandar_fazer_pull():
+    orq = carregar_orquestrador()
+    e = orq.erro_de_estado(RespostaFalsa(404, '{"error":"model not found"}'), "gemma4:26b")
+    assert "ollama pull gemma4:26b" in e.pista
+
+
+class ModeloQueRecusa:
+    """Levanta sempre o mesmo erro. Conta as chamadas."""
+
+    def __init__(self, orq, **kw):
+        self.erro = orq.ErroModelo
+        self.kw = kw
+        self.chamadas = 0
+
+    def conversar(self, sistema, utilizador, *, modelo, json_mode=True):
+        self.chamadas += 1
+        raise self.erro("a tua conta Ollama nao tem acesso", **self.kw)
+
+
+def test_um_erro_permanente_gasta_uma_tentativa_e_nao_tres():
+    """Repetir um 402 tres vezes so multiplica a espera pelo mesmo erro."""
+    orq = carregar_orquestrador()
+    llm = ModeloQueRecusa(orq, permanente=True, pista="paga ou usa um local")
+    with pytest.raises(orq.ErroAgente) as e:
+        orq.correr_agente(llm, papel="p", modelo="m:cloud", sistema="s",
+                          prompt="p", validar=lambda d: d, tentativas=3)
+    assert llm.chamadas == 1
+    assert "paga ou usa um local" in str(e.value)
+    assert "repetir nao ia mudar nada" in str(e.value)
+
+
+def test_um_erro_temporario_continua_a_gastar_as_tentativas():
+    """O ciclo de correcao e o que torna os modelos pequenos utilizaveis. Nao
+    pode ser sacrificado para arranjar o caso do 402."""
+    orq = carregar_orquestrador()
+    llm = ModeloQueRecusa(orq, permanente=False)
+    with pytest.raises(orq.ErroAgente):
+        orq.correr_agente(llm, papel="p", modelo="m", sistema="s", prompt="p",
+                          validar=lambda d: d, tentativas=3)
+    assert llm.chamadas == 3
+
+
+def test_a_pista_do_erro_chega_intacta_e_nao_e_reescrita():
+    """Quem levantou o erro sabia a causa; quem o apanha so a pode adivinhar."""
+    orq = carregar_orquestrador()
+    e = orq.ErroModelo("seja o que for", permanente=True, pista="FAZ ISTO E MAIS NADA")
+    assert orq.pista_do_erro(e, houve_resposta=False) == "FAZ ISTO E MAIS NADA"
+    assert orq.pista_do_erro(e, houve_resposta=True, consultas=99,
+                             max_ferramentas=1) == "FAZ ISTO E MAIS NADA"
+
+
+def test_sem_resposta_nenhuma_o_erro_nao_diz_que_respondeu():
+    """Este e o ramo que mentiu: dizia "respondeu, mas fora do formato" sobre
+    um modelo que nunca abriu a boca."""
+    orq = carregar_orquestrador()
+    pista = orq.pista_do_erro(orq.ErroModelo("qualquer coisa"), houve_resposta=False)
+    assert "nao chegou a responder" in pista.lower()
+    assert "fora do formato" not in pista
+
+
+def test_com_resposta_torta_o_erro_diz_que_foi_o_formato():
+    orq = carregar_orquestrador()
+    pista = orq.pista_do_erro(ValueError("falta a chave x"), houve_resposta=True)
+    assert "fora do formato" in pista
+
+
+def test_o_402_a_navegar_nao_e_relatado_como_problema_de_formato(alvo_grande):
+    """O caso real, de ponta a ponta: 0 consultas, e a mensagem tem de falar
+    de conta, nao de formato nem de trocar de modelo."""
+    orq, nav = nav_de(alvo_grande)
+    llm = ModeloQueRecusa(orq, permanente=True,
+                          pista="Isto e cobranca, nao codigo — poe creditos ou usa um local.")
+    with pytest.raises(orq.ErroAgente) as e:
+        orq.correr_agente_navegando(
+            llm, papel="conversa", modelo="minimax-m3:cloud", sistema="s",
+            prompt="p", validar=lambda d: d, navegador=nav)
+    msg = str(e.value)
+    assert llm.chamadas == 1
+    assert "cobranca" in msg
+    assert "fora do formato" not in msg
+    assert "aguentar" not in msg          # nada de "nao esta a aguentar navegar"
+
+
+# -- o doctor tem de testar o que so se descobre a testar --------------------
+def test_testar_modelo_devolve_none_quando_o_modelo_corre(monkeypatch):
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq.Ollama, "conversar",
+                        lambda self, s, u, *, modelo, json_mode=True: "ok")
+    assert orq.testar_modelo("gemma4:26b") is None
+
+
+def test_testar_modelo_devolve_o_erro_quando_a_conta_nao_tem_acesso(monkeypatch):
+    orq = carregar_orquestrador()
+
+    def recusa(self, s, u, *, modelo, json_mode=True):
+        raise orq.erro_de_estado(RespostaFalsa(402, CORPO_402), modelo)
+
+    monkeypatch.setattr(orq.Ollama, "conversar", recusa)
+    falha = orq.testar_modelo("minimax-m3:cloud")
+    assert falha is not None and falha.permanente
+    assert "402" in str(falha)
+
+
+def test_cada_papel_diz_o_que_se_perde_com_ele():
+    """Um ❌ sozinho a dizer 402 nao te diz se ainda podes trabalhar."""
+    orq = carregar_orquestrador()
+    for papel in ("pesquisa", "desenvolvimento", "params", "relatorio", "contexto"):
+        assert orq.COMANDOS_POR_PAPEL.get(papel), papel
+    assert "/contexto" in orq.COMANDOS_POR_PAPEL["contexto"][0]
+    assert "/tarefa" in orq.COMANDOS_POR_PAPEL["pesquisa"][0]
+
+
+def test_o_doctor_apanha_o_402_em_vez_de_dar_visto_verde(tmp_path, monkeypatch, capsys):
+    """O caso que passou despercebido: o modelo esta na lista do `ollama list`
+    e da 402 em todas as chamadas. O doctor existe para isto nao chegar ao
+    Telegram a meio de uma pergunta."""
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq, "BD", tmp_path / "orq.sqlite")
+    monkeypatch.setattr(orq, "PROJETO", str(tmp_path / "nao_existe"))
+    monkeypatch.setattr(orq, "MODELO_PESQUISA", "minimax-m3:cloud")
+    monkeypatch.setattr(orq, "MODELO_DESENVOLVIMENTO", "dcxglm-5.2:cloud")
+    monkeypatch.setattr(orq, "MODELO_RELATORIO", "gemma4:26b")
+    monkeypatch.setattr(orq, "MODELO_CONTEXTO", "gemma4:26b")
+    monkeypatch.setattr(orq, "MODO", "code")
+    monkeypatch.setattr(orq, "procurar_web",
+                        lambda *a, **k: (_ for _ in ()).throw(orq.ErroWeb("sem rede")))
+    monkeypatch.setattr(orq.Ollama, "modelos",
+                        lambda self: ["gemma4:26b", "minimax-m3:cloud",
+                                      "dcxglm-5.2:cloud"])
+
+    pedidos = []
+
+    def conversar(self, s, u, *, modelo, json_mode=True):
+        pedidos.append(modelo)
+        raise orq.erro_de_estado(RespostaFalsa(402, CORPO_402), modelo)
+
+    monkeypatch.setattr(orq.Ollama, "conversar", conversar)
+    orq.doctor()
+    saida = capsys.readouterr().out
+
+    # Os dois de nuvem foram mesmo chamados; o local NAO — sabe-se pela lista,
+    # e um pedido a serio carregava um 26b para a memoria por nada.
+    assert sorted(pedidos) == ["dcxglm-5.2:cloud", "minimax-m3:cloud"]
+    assert "❌ pesquisa: minimax-m3:cloud" in saida
+    assert "❌ desenvolvimento: dcxglm-5.2:cloud" in saida
+    assert "✅ relatorio+contexto: gemma4:26b" in saida
+    assert "/tarefa" in saida                      # o que se perde
+    assert "/contexto e /placar" not in saida      # esse nao se perdeu
+    assert "MESMA conta" in saida                  # trocar um pelo outro nao serve
+    assert "Locais que ja tens: gemma4:26b" in saida
+
+
+def test_o_doctor_nao_incomoda_um_modelo_local_que_esta_na_lista(tmp_path, monkeypatch, capsys):
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq, "BD", tmp_path / "orq.sqlite")
+    monkeypatch.setattr(orq, "PROJETO", str(tmp_path / "nao_existe"))
+    for nome in ("MODELO_PESQUISA", "MODELO_DESENVOLVIMENTO",
+                 "MODELO_RELATORIO", "MODELO_CONTEXTO"):
+        monkeypatch.setattr(orq, nome, "qwen2.5-coder:7b")
+    monkeypatch.setattr(orq, "procurar_web",
+                        lambda *a, **k: (_ for _ in ()).throw(orq.ErroWeb("sem rede")))
+    monkeypatch.setattr(orq.Ollama, "modelos", lambda self: ["qwen2.5-coder:7b"])
+    monkeypatch.setattr(orq.Ollama, "conversar",
+                        lambda *a, **k: pytest.fail("nao devia chamar um modelo local"))
+    orq.doctor()
+    assert "qwen2.5-coder:7b" in capsys.readouterr().out

@@ -1087,7 +1087,25 @@ class Estado:
 # ===========================================================================
 
 class ErroModelo(Exception):
-    """O modelo nao respondeu, ou respondeu algo inutilizavel."""
+    """O modelo nao respondeu, ou respondeu algo inutilizavel.
+
+    Dois campos, e ambos existem por causa do mesmo erro meu: quem apanhava
+    este erro la a frente tentava descobrir a causa comparando pedacos de
+    texto na mensagem — e um 402 do Ollama nao casava com pedaco nenhum, por
+    isso era relatado como "respondeu fora do formato" quando o modelo nunca
+    tinha chegado a responder.
+
+    `permanente`  repetir nao muda nada. Uma conta sem acesso continua sem
+                  acesso a terceira tentativa: gastar tres pedidos so
+                  multiplica a espera pelo mesmo erro.
+    `pista`       o passo seguinte concreto, escrito por quem SABE a causa,
+                  em vez de adivinhado por quem apanha a excecao.
+    """
+
+    def __init__(self, mensagem, *, permanente: bool = False, pista: str = ""):
+        super().__init__(mensagem)
+        self.permanente = permanente
+        self.pista = pista
 
 
 class ErroAgente(Exception):
@@ -1374,6 +1392,64 @@ def _candidatos(texto: str):
                     break
 
 
+def _motivo_do_ollama(texto: str) -> str:
+    """A frase do Ollama, sem o JSON a volta.
+
+    Despejar 300 caracteres de `{"error": "..."}` para o Telegram fazia a
+    mensagem parecer avaria do meu codigo, quando o que la esta dentro e uma
+    frase em ingles perfeitamente clara sobre a conta de quem a le.
+    """
+    try:
+        corpo = json.loads(texto)
+        if isinstance(corpo, dict) and corpo.get("error"):
+            return str(corpo["error"]).strip()
+    except (ValueError, TypeError):
+        pass
+    return (texto or "").strip()[:300]
+
+
+def erro_de_estado(r, modelo: str) -> ErroModelo:
+    """Traduz o estado HTTP do Ollama num erro que diz o que fazer a seguir.
+
+    O 402 e o que faltava, e e o que partiu tudo: um modelo de nuvem sem
+    subscricao devolve 402 em todas as chamadas, e isso nao e um problema de
+    formato nem de navegacao — nao ha prompt nenhum que o resolva.
+    """
+    motivo = _motivo_do_ollama(r.text)
+    local = ":cloud" not in modelo
+
+    if r.status_code == 402:
+        return ErroModelo(
+            f"a tua conta Ollama nao tem acesso a {modelo} (402): {motivo}",
+            permanente=True,
+            pista=(f"Isto e cobranca, nao codigo — nenhum prompt resolve. Ou pos "
+                   f"subscricao/creditos em ollama.com/upgrade, ou troca {modelo} "
+                   f"por um modelo LOCAL (sem `:cloud`). Ve quais tens com "
+                   f"`ollama list`, e confirma com `orquestrador.py doctor`."))
+    if r.status_code in (401, 403):
+        return ErroModelo(
+            f"o Ollama recusou as credenciais para {modelo} ({r.status_code}): {motivo}",
+            permanente=True,
+            pista=("A chave do Ollama esta em falta ou expirou. Corre `ollama signin`, "
+                   "ou usa um modelo local, que nao precisa de chave."))
+    if r.status_code == 404:
+        return ErroModelo(
+            f"o Ollama nao conhece {modelo!r} (404): {motivo}",
+            permanente=True,
+            pista=f"Corre `ollama pull {modelo}`.")
+    if r.status_code == 429:
+        return ErroModelo(
+            f"o Ollama poe {modelo} em espera (429): {motivo}",
+            pista="Limite de pedidos atingido. Espera e tenta outra vez.")
+    if r.status_code >= 500:
+        return ErroModelo(
+            f"o servidor do Ollama falhou com {modelo} ({r.status_code}): {motivo}",
+            pista=("A falha e do lado do servidor, nao do teu pedido."
+                   if not local else
+                   "A falha e do servidor local. Ve o log do Ollama."))
+    return ErroModelo(f"Ollama devolveu {r.status_code} para {modelo}: {motivo}")
+
+
 class Ollama:
     """Cliente HTTP do Ollama. Sem SDK — a API sao dois endpoints."""
 
@@ -1403,10 +1479,8 @@ class Ollama:
                              "Esta a correr? Testa com `ollama list`.") from e
         except requests.exceptions.Timeout as e:
             raise ErroModelo(f"o modelo {modelo} nao respondeu em {self.timeout}s.") from e
-        if r.status_code == 404:
-            raise ErroModelo(f"o Ollama nao conhece {modelo!r}. Corre `ollama pull {modelo}`.")
         if not r.ok:
-            raise ErroModelo(f"Ollama devolveu {r.status_code}: {r.text[:300]}")
+            raise erro_de_estado(r, modelo)
         try:
             return r.json()["message"]["content"]
         except (ValueError, KeyError) as e:
@@ -1435,6 +1509,43 @@ class ModeloFalso:
         return self.respostas.pop(0)
 
 
+def pista_do_erro(erro, *, houve_resposta: bool = False, consultas: int = 0,
+                  max_ferramentas: int = 0, orcamento: int = 0) -> str:
+    """O que fazer a seguir, a partir do que aconteceu MESMO.
+
+    A pista que vem dentro do erro ganha sempre: quem o levantou sabia a causa,
+    e quem o apanha aqui so a pode adivinhar. Foi a adivinhacao — comparar
+    pedacos de texto na mensagem — que fez um 402 de cobranca chegar ao
+    utilizador vestido de erro de formato, com o conselho errado colado.
+
+    E nada aqui afirma que o modelo respondeu sem que `houve_resposta` o diga.
+    """
+    pista = getattr(erro, "pista", "")
+    if pista:
+        return pista
+
+    texto = str(erro or "")
+    if "nao respondeu" in texto or "timeout" in texto.lower():
+        if max_ferramentas:
+            return (f"O modelo nao respondeu a tempo. Costuma ser contexto a mais: "
+                    f"baixa MAX_FERRAMENTAS (esta em {max_ferramentas}) ou "
+                    f"ORCAMENTO_NAVEGACAO (esta em {orcamento}). Confirma tambem "
+                    f"que o Ollama responde: `ollama list`.")
+        return ("O modelo nao respondeu a tempo. Confirma que o Ollama atende "
+                "(`ollama list`), e sobe o TIMEOUT_MODELO se o modelo for grande.")
+    if "nao consegui falar" in texto:
+        return "O Ollama nao esta a atender. Testa com `ollama list`."
+    if max_ferramentas and consultas >= max_ferramentas:
+        return (f"Gastou as {max_ferramentas} consultas a explorar e nunca "
+                f"respondeu. Sobe MAX_FERRAMENTAS, ou da-lhe um objetivo mais "
+                f"estreito.")
+    if not houve_resposta:
+        return ("Nao chegou a responder uma unica vez — o problema esta antes do "
+                "prompt, nao dentro dele. Ve o erro acima.")
+    return ("Respondeu, mas fora do formato pedido. Se persistir, este modelo "
+            "nao esta a aguentar a tarefa — troca-o por outro.")
+
+
 def correr_agente(llm, *, papel: str, modelo: str, sistema: str, prompt: str,
                   validar: Callable, tentativas: int = TENTATIVAS_JSON,
                   json_mode: bool = True):
@@ -1445,19 +1556,36 @@ def correr_agente(llm, *, papel: str, modelo: str, sistema: str, prompt: str,
     isso ele corrige quase sempre a tentativa seguinte. Sem isso, precisarias
     de um modelo muito maior para a mesma taxa de sucesso.
     """
-    ultimo = None
+    ultimo = ultimo_exc = None
+    houve_resposta = False
+    gastas = 0
     for _ in range(max(1, tentativas)):
         msg = prompt if ultimo is None else (
             f"{prompt}\n\n--- A TUA RESPOSTA ANTERIOR FOI REJEITADA ---\n"
             f"Motivo: {ultimo}\n"
             f"Corrige e devolve APENAS o JSON no formato pedido, sem texto a volta.")
+        gastas += 1
         try:
             bruto = llm.conversar(sistema, msg, modelo=modelo, json_mode=json_mode)
+        except ErroModelo as e:
+            ultimo, ultimo_exc = str(e), e
+            # Repetir um erro permanente e so multiplicar a espera pelo mesmo
+            # erro: uma conta sem acesso continua sem acesso a terceira vez.
+            if e.permanente:
+                break
+            continue
+        houve_resposta = True
+        try:
             return validar(extrair_json(bruto) if json_mode else bruto)
         except (ErroModelo, ValueError) as e:
-            ultimo = str(e)
-    raise ErroAgente(f"[{papel}] o modelo {modelo} falhou {tentativas} tentativas. "
-                     f"Ultimo erro: {ultimo}")
+            ultimo, ultimo_exc = str(e), e
+
+    quantas = ("parou a primeira tentativa — repetir nao ia mudar nada"
+               if getattr(ultimo_exc, "permanente", False)
+               else f"falhou {gastas} tentativas")
+    raise ErroAgente(
+        f"[{papel}] o modelo {modelo} {quantas}.\nUltimo erro: {ultimo}\n"
+        f"{pista_do_erro(ultimo_exc, houve_resposta=houve_resposta)}")
 
 
 def instrucoes_navegacao(nav: Navegador) -> str:
@@ -1510,9 +1638,14 @@ def correr_agente_navegando(llm, *, papel: str, modelo: str, sistema: str,
     """
     historico: list[tuple[str, str]] = []      # (pedido, resultado)
     descartados = 0
-    ultimo_erro = None
+    ultimo_erro = ultimo_exc = None
     consultas = 0
     falhadas = 0        # tentativas gastas a nao responder
+    # Saber se ALGUMA resposta chegou a chegar. Sem isto, o ramo de recurso
+    # afirmava "respondeu, mas fora do formato" sobre um modelo que nunca
+    # tinha aberto a boca — que foi exatamente o que aconteceu com o 402.
+    houve_resposta = False
+    parou_cedo = False
 
     # Duas contas separadas: as consultas ao codigo, e as tentativas de dar a
     # resposta. Depois de gastar as consultas, insistir em pedir ferramentas E
@@ -1543,10 +1676,14 @@ def correr_agente_navegando(llm, *, papel: str, modelo: str, sistema: str,
         try:
             bruto = llm.conversar(sistema, "\n".join(partes), modelo=modelo,
                                   json_mode=True)
+            houve_resposta = True
             dados = extrair_json(bruto)
         except (ErroModelo, ValueError) as e:
-            ultimo_erro = str(e)
+            ultimo_erro, ultimo_exc = str(e), e
             falhadas += 1
+            if getattr(e, "permanente", False):
+                parou_cedo = True
+                break
             continue
 
         pediu = isinstance(dados, dict) and dados.get("ferramenta")
@@ -1564,35 +1701,26 @@ def correr_agente_navegando(llm, *, papel: str, modelo: str, sistema: str,
         if pediu:
             ultimo_erro = (f"acabaram as {max_ferramentas} consultas; "
                            f"responde no formato final")
+            ultimo_exc = None
             falhadas += 1
             continue
 
         try:
             return validar(dados)
         except ValueError as e:
-            ultimo_erro = str(e)
+            ultimo_erro, ultimo_exc = str(e), e
             falhadas += 1
 
     # Nao respondeu, respondeu torto, ou nao chegou a decidir — sao tres
     # problemas com tres arranjos diferentes, e dizer so "nao chegou a uma
     # resposta valida" mandava-te procurar no sitio errado.
-    ultimo = str(ultimo_erro or "")
-    if "nao respondeu" in ultimo or "timeout" in ultimo.lower():
-        pista = (f"O modelo nao respondeu a tempo. Costuma ser contexto a mais: "
-                 f"baixa MAX_FERRAMENTAS (esta em {max_ferramentas}) ou "
-                 f"ORCAMENTO_NAVEGACAO (esta em {orcamento}). Confirma tambem "
-                 f"que o Ollama responde: `ollama list`.")
-    elif "nao consegui falar" in ultimo or "nao conhece" in ultimo:
-        pista = "O Ollama nao esta a atender, ou nao tem este modelo."
-    elif consultas >= max_ferramentas:
-        pista = (f"Gastou as {max_ferramentas} consultas a explorar e nunca "
-                 f"respondeu. Sobe MAX_FERRAMENTAS, ou da-lhe um objetivo mais "
-                 f"estreito.")
-    else:
-        pista = ("Respondeu, mas fora do formato pedido. Se persistir, este "
-                 "modelo nao esta a aguentar navegar — troca-o por outro.")
-    raise ErroAgente(f"[{papel}] {modelo}: {consultas} consultas, "
-                     f"{falhadas} tentativas, sem resposta valida.\n"
+    pista = pista_do_erro(ultimo_exc, houve_resposta=houve_resposta,
+                          consultas=consultas, max_ferramentas=max_ferramentas,
+                          orcamento=orcamento)
+    conta = (f"{consultas} consultas, 1 tentativa (parou a primeira — repetir "
+             f"nao ia mudar nada)" if parou_cedo
+             else f"{consultas} consultas, {falhadas} tentativas, sem resposta valida")
+    raise ErroAgente(f"[{papel}] {modelo}: {conta}.\n"
                      f"Ultimo erro: {ultimo_erro}\n{pista}")
 
 
@@ -5291,6 +5419,37 @@ class Bot:
 #  DOCTOR — verifica tudo antes de arrancar
 # ===========================================================================
 
+# O que deixa de funcionar quando um papel fica sem modelo. Um ❌ sozinho a
+# dizer 402 nao te diz se ainda podes trabalhar; isto diz.
+COMANDOS_POR_PAPEL = {
+    "pesquisa": ("conversa normal, /tarefa, /auto, /explorar, /pesquisar, "
+                 "/ler, /estudar",),
+    "desenvolvimento": ("o agente deixa de escrever codigo — /tarefa e /auto "
+                        "morrem a meio",),
+    "params": ("o agente deixa de escolher parametros — /tarefa e /auto morrem "
+               "a meio",),
+    "relatorio": ("o comentario de leitura dos ensaios",),
+    "contexto": ("/contexto e /placar",),
+}
+
+
+def testar_modelo(modelo: str, timeout: int = 60) -> ErroModelo | None:
+    """Manda um pedido minusculo. Devolve o erro, ou None se o modelo correr.
+
+    E a UNICA maneira de ver um 402: a lista do Ollama diz o que esta
+    instalado, nao o que a tua conta te deixa correr. Um modelo de nuvem sem
+    subscricao aparece na lista e falha em todas as chamadas — e assim passou
+    por aqui com um visto verde e so deu erro no Telegram, a meio de uma
+    pergunta tua.
+    """
+    try:
+        Ollama(timeout=timeout).conversar(
+            "Responde com uma palavra.", "diz: ok", modelo=modelo, json_mode=False)
+        return None
+    except ErroModelo as e:
+        return e
+
+
 def doctor() -> int:
     problemas = 0
 
@@ -5481,15 +5640,52 @@ def doctor() -> int:
         erro(f"o Ollama nao respondeu em {OLLAMA_URL} (esta a correr?)")
     else:
         ok(f"Ollama tem: {', '.join(disponiveis)}")
+        locais = [d for d in disponiveis if ":cloud" not in d]
         precisos = [("pesquisa", MODELO_PESQUISA), ("relatorio", MODELO_RELATORIO)]
         precisos.append(("desenvolvimento", MODELO_DESENVOLVIMENTO) if MODO == "code"
                         else ("params", MODELO_PARAMS))
+        precisos.append(("contexto", MODELO_CONTEXTO))
+
+        # Agrupar por MODELO, nao por papel: o mesmo modelo em dois papeis nao
+        # merece duas linhas nem, sobretudo, dois pedidos a nuvem.
+        por_modelo: dict[str, list[str]] = {}
         for papel, m in precisos:
-            if m in disponiveis or any(d.startswith(m) for d in disponiveis):
-                nuvem = " (na nuvem — o teu codigo sai da maquina)" if ":cloud" in m else ""
-                ok(f"{papel}: {m}{nuvem}")
-            else:
+            if papel not in por_modelo.setdefault(m, []):
+                por_modelo[m].append(papel)
+
+        bloqueados = []
+        for m, papeis in por_modelo.items():
+            papel = "+".join(papeis)
+            if not (m in disponiveis or any(d.startswith(m) for d in disponiveis)):
                 erro(f"{papel}: {m} nao esta instalado (`ollama pull {m}`)")
+                continue
+            if ":cloud" not in m:
+                # Um modelo local que esta na lista corre. Nao vale a pena
+                # mandar-lhe um pedido a serio: carregava um 26b para a memoria
+                # e demorava meio minuto para confirmar o que a lista ja diz.
+                ok(f"{papel}: {m}")
+                continue
+            # Um modelo de nuvem aparece na lista mesmo sem a conta ter acesso,
+            # e so falha quando e chamado a serio. O 402 do minimax-m3:cloud
+            # passou por aqui com um ✅ e so apareceu no Telegram, a meio de uma
+            # pergunta. Um pedido minusculo e o que separa as duas coisas.
+            falha = testar_modelo(m)
+            if falha is None:
+                ok(f"{papel}: {m} (na nuvem — o teu codigo sai da maquina)")
+                continue
+            bloqueados.append(m)
+            erro(f"{papel}: {m} — {falha}")
+            perdidos = [t for pp in papeis for t in COMANDOS_POR_PAPEL.get(pp, ())]
+            if perdidos:
+                print(f"       sem ele: {'; '.join(perdidos)}")
+            if falha.pista:
+                print(f"       {falha.pista}")
+
+        if len(bloqueados) > 1:
+            print(f"\n     Os {len(bloqueados)} bloqueados saem todos da MESMA conta "
+                  f"Ollama — trocar um pelo outro nao resolve nada.")
+        if bloqueados:
+            print(f"     Locais que ja tens: {', '.join(locais) or '(nenhum)'}")
 
     print(f"\n{'Tudo pronto.' if problemas == 0 else f'{problemas} problema(s) a resolver.'}\n")
     return 0 if problemas == 0 else 1
