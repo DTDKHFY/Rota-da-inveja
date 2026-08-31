@@ -75,6 +75,30 @@ MODELO_PARAMS = "qwen2.5-coder:7b"      # so usado em MODO = "params"
 TIMEOUT_MODELO = 300
 TENTATIVAS_JSON = 3
 
+# --- Leitura de contexto (/contexto e /placar) -----------------------------
+# O modelo aqui nao decide nada e nao le codigo: recebe uma tabela de numeros
+# que o orq_runner calculou e escreve a frase. Por isso um modelo pequeno
+# chega — e um pequeno ate e melhor, porque elabora menos para la da prova.
+MODELO_CONTEXTO = MODELO_RELATORIO
+TIMEOUT_CONTEXTO = 180          # importar o teu ficheiro demora, ler candles nao
+
+# Quantas horas depois se confere uma leitura contra o preco que houve mesmo.
+HORAS_PARA_AVALIAR = 4
+
+# Quanto se aceita falhar essa hora. Os fechos sao horarios, por isso o
+# primeiro a seguir ao alvo esta a menos de uma hora; a folga a mais e para
+# um mercado que estava fechado. Passado isto e "sem dados" — avaliar uma
+# leitura de 4h contra o preco de dois dias depois nao mede a leitura.
+FOLGA_AVALIACAO_MIN = 120
+
+# Quantas leituras conferidas antes de eu dizer uma percentagem. Abaixo disto
+# o placar da os numeros brutos e diz que nao chega — porque nao chega.
+MINIMO_LEITURAS_PARA_PLACAR = 20
+
+# O ficheiro do teu projeto que o /contexto importa para chegar aos candles e a
+# ligacao do broker. Vazio = descubro-o a partir do COMANDO_BACKTEST.
+ALVO_CONTEXTO = ""
+
 # --- O teu projeto de backtest --------------------------------------------
 # Tem de ser um repositorio git. Ha um projeto de exemplo pronto a usar, com a
 # separacao arnes/estrategia ja feita, em ../projeto-backtest/
@@ -614,6 +638,16 @@ CREATE TABLE IF NOT EXISTS notas (
 CREATE TABLE IF NOT EXISTS documentos (
     id TEXT PRIMARY KEY, tipo TEXT NOT NULL, titulo TEXT NOT NULL,
     fonte TEXT, texto TEXT NOT NULL, criado REAL NOT NULL);
+-- Leituras de contexto, guardadas para serem CORRIGIDAS depois.
+-- Uma leitura que ninguem confere e entretenimento: nao ha maneira de saber
+-- se vale alguma coisa sem um placar que conte os erros ao lado dos acertos.
+CREATE TABLE IF NOT EXISTS leituras (
+    id TEXT PRIMARY KEY, simbolo TEXT NOT NULL, preco REAL NOT NULL,
+    ts_min INTEGER NOT NULL, fonte TEXT, limiar REAL,
+    leitura TEXT, hipotese TEXT, invalidacao TEXT, direcao TEXT, confianca TEXT,
+    criado REAL NOT NULL, avaliado REAL, resultado TEXT,
+    preco_depois REAL, horas_depois REAL);
+CREATE INDEX IF NOT EXISTS i_leituras ON leituras(resultado, ts_min);
 CREATE INDEX IF NOT EXISTS i_ensaios ON ensaios(estado, criado);
 CREATE INDEX IF NOT EXISTS i_tarefas ON tarefas(estado, criado);
 """
@@ -851,6 +885,49 @@ class Estado:
     def notas(self, n=40):
         return list(self.c.execute(
             "SELECT * FROM notas ORDER BY criado DESC LIMIT ?", (n,)))
+
+    # -- leituras de contexto ---------------------------------------------
+    def nova_leitura(self, simbolo: str, preco: float, ts_min: int, fonte: str,
+                     limiar: float, leitura: dict) -> str:
+        lid = novo_id("lei")
+        self.c.execute(
+            "INSERT INTO leituras (id, simbolo, preco, ts_min, fonte, limiar, "
+            "leitura, hipotese, invalidacao, direcao, confianca, criado) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (lid, simbolo, float(preco), int(ts_min), fonte, float(limiar or 0),
+             leitura.get("leitura"), leitura.get("hipotese"),
+             leitura.get("invalidacao"), leitura.get("direcao"),
+             leitura.get("confianca"), time.time()))
+        return lid
+
+    def leituras_por_avaliar(self) -> list:
+        return list(self.c.execute(
+            "SELECT * FROM leituras WHERE resultado IS NULL ORDER BY ts_min"))
+
+    def marcar_leitura(self, lid: str, resultado: str,
+                       preco_depois=None, horas=None) -> None:
+        self.c.execute(
+            "UPDATE leituras SET resultado=?, preco_depois=?, horas_depois=?, "
+            "avaliado=? WHERE id=?",
+            (resultado, preco_depois, horas, time.time(), lid))
+
+    def placar(self) -> dict:
+        """Acertos, erros e indecisos — brutos. A prudencia esta na formatacao."""
+        fora = {"total": 0, "acertou": 0, "falhou": 0, "indeciso": 0,
+                "por_decidir": 0, "por_confianca": {}}
+        for r in self.c.execute("SELECT resultado, confianca FROM leituras"):
+            fora["total"] += 1
+            res = r["resultado"]
+            if res is None:
+                fora["por_decidir"] += 1
+                continue
+            if res in ("acertou", "falhou", "indeciso"):
+                fora[res] += 1
+            if res in ("acertou", "falhou"):
+                d = fora["por_confianca"].setdefault(
+                    r["confianca"] or "?", {"acertou": 0, "falhou": 0})
+                d[res] += 1
+        return fora
 
     def apagar_nota(self, nid: str) -> bool:
         if self.fts:
@@ -3173,6 +3250,382 @@ class Agentes:
             return None   # o relatorio nunca falha por causa do comentario
 
 
+    # -- Agente Mercado ---------------------------------------------------
+    def ler_mercado(self, dados: dict) -> dict:
+        """O modelo narra a fotografia; o guarda confirma que nao inventou nada.
+
+        O prompt e exatamente o texto que TU recebes, e nao uma versao dele
+        so para o modelo. Assim, quando ele escrever uma frase estranha, tens
+        a entrada dele a frente dos olhos para veres de onde ela saiu.
+        """
+        permitidos = numeros_dos_dados(dados)
+        return correr_agente(
+            self.llm, papel="mercado", modelo=MODELO_CONTEXTO,
+            sistema=SISTEMA_MERCADO,
+            prompt=f"{formatar_contexto(dados)}\n\nEscreve a tua leitura, so o JSON.",
+            validar=lambda d: _validar_leitura(d, permitidos),
+            tentativas=TENTATIVAS_JSON)
+
+
+# ===========================================================================
+#  LEITURA DE CONTEXTO
+#
+#  Um agente a ler um ficheiro de 19 mil linhas nao cabe em janela nenhuma.
+#  Um agente a narrar numeros que o codigo ja calculou cabe em 300 tokens —
+#  e e a unica das duas coisas que da para verificar. E o que se faz aqui:
+#  o orq_runner mede, isto formata, o modelo escreve a frase, e o guarda
+#  rejeita qualquer numero que ele tenha inventado pelo caminho.
+# ===========================================================================
+
+def _pt(x, casas: int = 2, sinal: bool = False) -> str:
+    """Numero a portuguesa: milhar com ponto, decimal com virgula."""
+    if x is None:
+        return "—"
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return "—"
+    s = f"{abs(v):,.{casas}f}".replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+    if v < 0:
+        return "-" + s
+    return ("+" + s) if sinal else s
+
+
+def _posicao(pct) -> str:
+    """Onde esta o preco dentro da faixa. Fora dela e informacao, nao erro."""
+    if pct is None:
+        return "—"
+    if pct > 100:
+        return "acima"
+    if pct < 0:
+        return "abaixo"
+    return f"{pct:.0f}%"
+
+
+def _juntar_degraus(degraus: list[dict]) -> list[dict]:
+    """Dois niveis no mesmo preco sao um degrau com dois nomes, nao dois degraus."""
+    saida: list[dict] = []
+    for d in degraus:
+        if saida and abs(saida[-1]["preco"] - d["preco"]) < 1e-9:
+            anterior = saida[-1]
+            anterior["etiqueta"] = f"{anterior['etiqueta']}/{d['etiqueta']}"
+            anterior["marca"] = anterior["marca"] or d["marca"]
+            continue
+        saida.append(dict(d))
+    return saida
+
+
+def formatar_contexto(d: dict) -> str:
+    """A tabela e a regua, em texto, para o Telegram e para o modelo.
+
+    Todos os numeros vem do JSON do runner. Nenhum e calculado aqui — se
+    fossem, haveria duas fontes de verdade e um dia dariam numeros
+    diferentes na mesma mensagem.
+    """
+    fonte = d.get("fonte") or "?"
+    idade = d.get("idade_min")
+    selo = f"{fonte} · candle de ha {idade} min" if idade is not None else fonte
+    if fonte == "cache" and (idade or 0) >= 180:
+        selo += " ⚠️"
+
+    linhas = [
+        f"*{d.get('simbolo','?')}*   agora {_pt(d.get('preco'))}",
+        f"_{d.get('agora_utc','?')} UTC · {selo}_",
+        "```",
+        f"{'':<10}{'maxima':>11}{'minima':>12}{'pos':>7}   amplitude",
+    ]
+    for h in d.get("horizontes") or []:
+        amp = h.get("amplitude_atr")
+        amp_txt = (f"{_pt(amp, 1)}x ATR {h.get('atr_tf','')}"
+                   if amp is not None else "\u2014")
+        linhas.append(f"{h['nome']:<10}{_pt(h.get('maxima')):>11}{_pt(h.get('minima')):>12}"
+                      f"{_posicao(h.get('posicao_pct')):>7}   {amp_txt}")
+    linhas.append("```")
+
+    fechos = d.get("fechos_1h_pct") or []
+    if fechos:
+        linhas.append("fechos 1h : " + " ".join(_pt(v, 2, True) + "%" for v in fechos))
+    mov = d.get("movimento_2h") or {}
+    if mov.get("pct") is not None:
+        normal = (f"   (normal em 2h: {_pt(mov['normal_atr'], 1)} ATR)"
+                  if mov.get("normal_atr") is not None else "")
+        atr_txt = f" = {_pt(mov['atr'], 1)} ATR" if mov.get("atr") is not None else ""
+        linhas.append(f"em 2h     : {_pt(mov['pct'], 2, True)}%{atr_txt}{normal}")
+    serie = d.get("velas_seguidas_1h") or 0
+    if serie:
+        linhas.append(f"velas de 1h seguidas {'a subir' if serie > 0 else 'a descer'}: "
+                      f"{abs(serie)}")
+    m24 = d.get("maior_movimento_24h") or {}
+    if m24.get("pontos"):
+        atr_txt = f" = {_pt(m24['atr'], 1)} ATR" if m24.get("atr") is not None else ""
+        linhas.append(f"maior movimento continuo em 24h: {_pt(m24['pontos'])} pts{atr_txt}")
+
+    notavel = d.get("notavel") or []
+    if notavel:
+        linhas.append("\n*NOTAVEL*")
+        linhas += [f"  · {t}" for t in notavel]
+
+    linhas.append(formatar_regua(d))
+    return "\n".join(linhas)
+
+
+def formatar_regua(d: dict) -> str:
+    """A escada de precos com o take e o stop no meio dos niveis."""
+    r = d.get("regua") or {}
+    degraus = _juntar_degraus(r.get("degraus") or [])
+    if not degraus:
+        return ""
+    atr_ref, tem_stop = r.get("atr_ref"), bool(r.get("stop_pts"))
+    cabeca = f"\n*REGUA DE PONTOS*   preco {_pt(r.get('preco'))}"
+    if atr_ref:
+        cabeca += f" \u00b7 ATR 1h = {_pt(atr_ref)} pts"
+    if tem_stop:
+        cabeca += f" · {r.get('lado')}"
+
+    cab = f"{'':<20}{'preco':>10}{'pontos':>9}{'ATR':>6}" + (f"{'R':>7}" if tem_stop else "")
+    linhas = [cabeca, "```", cab]
+    for g in degraus:
+        marca = "\u25ba" if g.get("marca") else " "
+        nome = (g["etiqueta"][:16] + "\u2026") if len(g["etiqueta"]) > 17 else g["etiqueta"]
+        em_atr = "\u2014" if g.get("atr") is None else _pt(g["atr"], 1)
+        em_r = "\u2014" if g.get("R") is None else _pt(g["R"], 2, True)
+        linha = (f"{marca} {nome:<18}{_pt(g['preco']):>10}"
+                 f"{_pt(g['pontos'], 1, True):>9}{em_atr:>6}")
+        if tem_stop:
+            linha += f"{em_r:>7}"
+        linhas.append(linha)
+    linhas.append("```")
+
+    alem = r.get("take_alem_de")
+    if alem:
+        linhas.append(f"o TAKE fica {_pt(alem['pontos'], 1)} pts alem da *{alem['nivel']}* "
+                      f"— o preco tem de romper")
+    dentro = r.get("stop_dentro_de") or []
+    if dentro:
+        faixa = next((x for x in dentro if x["faixa"] == "Asia"), dentro[0])
+        linhas.append(f"o STOP cai DENTRO da faixa *{faixa['faixa']}* "
+                      f"({_pt(faixa['minima'])} a {_pt(faixa['maxima'])}) "
+                      f"— e a zona que a varrida apanha")
+    if r.get("R") is not None:
+        conta = (f"R = {_pt(r['take_pts'], 0)}/{_pt(r['stop_pts'], 0)} = "
+                 f"{_pt(r['R'], 2)} \u00b7 acerto de equilibrio "
+                 f"{_pt(r['equilibrio_pct'], 1)}%")
+        if r.get("equilibrio_com_spread_pct") is not None:
+            conta += (f" \u00b7 com spread ({_pt(r.get('spread_pts'), 0)} pts) "
+                      f"{_pt(r['equilibrio_com_spread_pct'], 1)}%")
+        linhas.append(conta)
+    return "\n".join(linhas)
+
+
+# ---------------------------------------------------------------------------
+#  O guarda: nenhum numero que nao tenha vindo dos dados
+# ---------------------------------------------------------------------------
+# Inteiros pequenos passam sempre: sao contagens, horas, "1 a 3 frases". Nao ha
+# preco nem taxa a esconder-se aqui, e rejeita-los sO daria falsos alarmes.
+LIVRES_ATE = 24
+
+# Um numero e aceite se bater com algum dos dados a menos disto. Sem tolerancia
+# nenhuma, "1,92" seria rejeitado por o dado ser 1.916279 — e o guarda passaria
+# a vida a rejeitar aritmetica correta.
+TOLERANCIA_REL = 0.005
+TOLERANCIA_ABS = 0.005
+
+_RE_NUMERO = re.compile(r"-?\d+(?:[.   ]\d{3})*(?:[.,]\d+)?")
+
+
+def numeros_dos_dados(obj, saida: set | None = None) -> set:
+    """Todos os numeros que o codigo produziu. E o universo permitido."""
+    saida = set() if saida is None else saida
+    if isinstance(obj, bool):
+        return saida
+    if isinstance(obj, (int, float)):
+        if math.isfinite(float(obj)):
+            saida.add(float(obj))
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            numeros_dos_dados(v, saida)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            numeros_dos_dados(v, saida)
+    return saida
+
+
+def _leituras_do_numero(bruto: str) -> list[float]:
+    """Como se le "3.159": pode ser tres mil, pode ser tres virgula um.
+
+    Devolvo as duas leituras possiveis e o guarda aceita se QUALQUER uma bater.
+    Ser rigoroso nesta ambiguidade nao apanharia mais invencoes — apanharia
+    numeros certos escritos a portuguesa.
+    """
+    t = bruto.replace(" ", "").replace(" ", "").replace(" ", "")
+    saida = []
+    if "," in t:                      # virgula decimal: os pontos sao milhares
+        saida.append(t.replace(".", "").replace(",", "."))
+    elif t.count(".") > 1:            # 1.234.567 so pode ser milhares
+        saida.append(t.replace(".", ""))
+    elif "." in t:                    # ambiguo
+        saida.append(t)               # decimal
+        saida.append(t.replace(".", ""))
+    else:
+        saida.append(t)
+    valores = []
+    for s in saida:
+        try:
+            valores.append(float(s))
+        except ValueError:
+            pass
+    return valores
+
+
+def numero_inventado(texto: str, permitidos: set) -> str | None:
+    """O primeiro numero do texto que nao veio dos dados, tal como escrito.
+
+    Devolver o numero COMO ELE O ESCREVEU e o que faz o ciclo de correcao
+    funcionar: "o numero 3.500 nao esta nos dados" e uma instrucao; "numero
+    invalido" nao e nada.
+    """
+    inteiro = str(texto or "")
+    for achado in _RE_NUMERO.finditer(inteiro):
+        bruto = achado.group(0)
+        valores = _leituras_do_numero(bruto)
+        if not valores:
+            continue
+        # Uma percentagem e sempre uma afirmacao sobre os dados, por pequena
+        # que seja: "subiu 12%" tem de vir de algum lado. O passe livre dos
+        # inteiros pequenos e para contagens, nao para taxas.
+        e_taxa = inteiro[achado.end():achado.end() + 2].lstrip().startswith("%")
+        if not e_taxa and any(abs(v) <= LIVRES_ATE and float(v).is_integer()
+                              for v in valores):
+            continue
+        if any(any(abs(v - p) <= max(TOLERANCIA_ABS, TOLERANCIA_REL * abs(p))
+                   for p in permitidos) for v in valores):
+            continue
+        return bruto
+    return None
+
+
+SISTEMA_MERCADO = """Les uma fotografia do mercado e escreves o que la vês.
+
+Regras, e sao mesmo regras:
+
+1. NAO INVENTES NUMEROS. Todos os numeros que escreveres tem de aparecer nos
+   dados que te dou. Se quiseres dizer um numero que nao esta la, nao digas.
+   Nao ha aqui nada para arredondar de cabeca: a conta ja foi feita.
+2. Nao digas "provavelmente sobe" sem dizer o que te faz pensar isso, e sem
+   dizer o que te faria mudar de ideias.
+3. Um mercado sem nada de especial e uma leitura legitima. Nao procures um
+   padrao onde a tabela nao mostra nenhum — dizer "nao ha nada aqui" e
+   melhor do que inventar uma historia.
+4. Portugues, direto, sem entusiasmo e sem avisos legais.
+
+Responde SO com JSON:
+{"leitura": "o que esta a acontecer, 1 a 3 frases",
+ "hipotese": "o que pode acontecer a seguir, e porque",
+ "invalidacao": "o nivel ou a condicao que mata a hipotese",
+ "direcao": "subir" | "descer" | "lateral",
+ "confianca": "baixa" | "media" | "alta"}"""
+
+
+def _validar_leitura(d, permitidos: set) -> dict:
+    """O formato, e depois o guarda dos numeros."""
+    if not isinstance(d, dict):
+        raise ValueError(f"esperava um objeto JSON, veio {type(d).__name__}")
+    chaves = ("leitura", "hipotese", "invalidacao", "direcao", "confianca")
+    faltam = [k for k in chaves if not str(d.get(k) or "").strip()]
+    if faltam:
+        raise ValueError("faltam as chaves: " + ", ".join(faltam))
+    direcao = str(d["direcao"]).strip().lower()
+    if direcao not in ("subir", "descer", "lateral"):
+        raise ValueError(f"direcao tem de ser subir, descer ou lateral — mandaste {direcao!r}")
+    confianca = str(d["confianca"]).strip().lower().replace("é", "e")
+    if confianca not in ("baixa", "media", "alta"):
+        raise ValueError(f"confianca tem de ser baixa, media ou alta — mandaste {confianca!r}")
+    junto = " ".join(str(d[k]) for k in ("leitura", "hipotese", "invalidacao"))
+    mau = numero_inventado(junto, permitidos)
+    if mau:
+        raise ValueError(
+            f"o numero {mau} nao esta nos dados que te dei. So podes usar numeros "
+            f"que apareçam na tabela ou na regua. Reescreve sem ele.")
+    return {"leitura": str(d["leitura"]).strip(), "hipotese": str(d["hipotese"]).strip(),
+            "invalidacao": str(d["invalidacao"]).strip(),
+            "direcao": direcao, "confianca": confianca}
+
+
+def alvo_do_contexto(projeto: Path) -> Path:
+    """Que ficheiro do teu projeto o /contexto importa para chegar aos candles.
+
+    E o teu run_backtest.py, nao o orq_runner.py: o runner e a ponte, o alvo e
+    quem tem a ligacao ao broker e o cache.
+    """
+    if ALVO_CONTEXTO:
+        return projeto / ALVO_CONTEXTO
+    script = script_do_comando(COMANDO_BACKTEST) or "run_backtest.py"
+    if Path(script).name == "orq_runner.py":
+        script = "run_backtest.py"
+    return projeto / script
+
+
+def _fmt_leitura(leitura: dict, lid: str = "") -> str:
+    """A parte que o modelo escreveu, marcada como sendo dele."""
+    seta = {"subir": "↑", "descer": "↓", "lateral": "→"}.get(leitura.get("direcao"), "·")
+    cabeca = (f"🧠 *Leitura* {seta} {leitura.get('direcao','?')} "
+              f"· confianca {leitura.get('confianca','?')}")
+    if lid:
+        cabeca += f" · `{lid}`"
+    return "\n".join([
+        cabeca,
+        leitura.get("leitura", ""),
+        f"\n*Hipotese* — {leitura.get('hipotese','')}",
+        f"*Invalida-se se* — {leitura.get('invalidacao','')}",
+    ])
+
+
+def _fmt_placar(p: dict) -> str:
+    """O placar diz o n antes de dizer a taxa. Sempre.
+
+    Uma percentagem sobre seis leituras nao e um resultado, e uma maneira de
+    ganhar confianca sem ter ganho nada.
+    """
+    total = int(p.get("total") or 0)
+    if not total:
+        return ("📊 *Placar* — ainda nao ha leituras.\n\n"
+                f"Cada `/contexto` guarda a leitura e vai conferi-la "
+                f"{HORAS_PARA_AVALIAR}h depois, contra o preco que houve mesmo.")
+    acertou, falhou = int(p.get("acertou") or 0), int(p.get("falhou") or 0)
+    decididas = acertou + falhou
+    linhas = ["📊 *Placar*",
+              f"{total} leitura{'s' if total != 1 else ''} · "
+              f"{decididas} ja conferida{'s' if decididas != 1 else ''} · "
+              f"{int(p.get('por_decidir') or 0)} a espera"]
+
+    if not decididas:
+        linhas.append(f"\n_Nenhuma foi conferida ainda. Cada leitura fica pronta "
+                      f"para ser conferida {HORAS_PARA_AVALIAR}h depois de ser "
+                      f"feita, contra o preco que houve mesmo._")
+        return "\n".join(linhas)
+
+    if decididas < MINIMO_LEITURAS_PARA_PLACAR:
+        linhas += [
+            f"\n{acertou} acertaram a direcao, {falhou} falharam.",
+            f"_Nao te dou percentagem com {decididas}: faltam "
+            f"{MINIMO_LEITURAS_PARA_PLACAR - decididas} para o numero querer "
+            f"dizer alguma coisa. Ate la e ruido com casas decimais._"]
+        return "\n".join(linhas)
+
+    linhas.append(f"\nAcertou a direcao em *{acertou} de {decididas}* "
+                  f"({100.0 * acertou / decididas:.0f}%)")
+    detalhe = [(c, d) for c, d in (p.get("por_confianca") or {}).items()
+               if (d.get("acertou", 0) + d.get("falhou", 0)) >= 5]
+    if detalhe:
+        linhas.append("\nPor confianca declarada:")
+        for conf, d in sorted(detalhe):
+            n = d["acertou"] + d["falhou"]
+            linhas.append(f"  {conf:<6} {d['acertou']}/{n}  ({100.0 * d['acertou'] / n:.0f}%)")
+        linhas.append("_Se a confianca alta nao bater a baixa, a confianca dele "
+                      "nao esta a medir nada._")
+    return "\n".join(linhas)
+
+
 # ===========================================================================
 #  RELATORIO
 #
@@ -3786,6 +4239,116 @@ class Orquestrador:
                 lidos += 1
         return lidos
 
+    # -- leitura de contexto -----------------------------------------------
+    def ler_contexto(self, stop=None, take=None, lado: str = "compra",
+                     ao_vivo: bool | None = None) -> dict:
+        """Corre o orq_runner contra o teu projeto e devolve os numeros.
+
+        Sem worktree e sem escrever nada la dentro: isto e uma leitura, nao um
+        ensaio. O runner e o mesmo ficheiro protegido que ja mede os ensaios,
+        corrido a partir daqui, nunca a partir de uma copia que alguem possa
+        ter alterado.
+        """
+        projeto = Path(PROJETO)
+        if not projeto.is_dir():
+            raise ErroSandbox(f"PROJETO nao existe: {projeto}")
+        runner = Path(__file__).resolve().parent / "orq_runner.py"
+        if not runner.exists():
+            raise ErroSandbox(
+                f"nao encontrei o orq_runner.py ao lado do orquestrador.\n"
+                f"Procurei em: {runner}")
+        alvo = alvo_do_contexto(projeto)
+        if not alvo.exists():
+            raise ErroSandbox(
+                f"o /contexto precisa do teu ficheiro de backtest para chegar aos "
+                f"candles, e {alvo.name} nao existe em {projeto}.\n"
+                f"Se tem outro nome, poe-o no ALVO_CONTEXTO.")
+
+        with tempfile.TemporaryDirectory(prefix="orq_ctx_") as tmp:
+            saida = Path(tmp) / "contexto.json"
+            argv = [interpretador(), str(runner), "--alvo", str(alvo),
+                    "--contexto", "--out", str(saida), "--lado", lado]
+            if stop:
+                argv += ["--stop", str(float(stop))]
+            if take:
+                argv += ["--take", str(float(take))]
+            if ao_vivo is True:
+                argv.append("--ao-vivo")
+            elif ao_vivo is False:
+                argv.append("--do-cache")
+            try:
+                r = subprocess.run(argv, cwd=projeto, env=ambiente_limpo(),
+                                   capture_output=True, text=True,
+                                   stdin=subprocess.DEVNULL,
+                                   timeout=TIMEOUT_CONTEXTO, check=False)
+            except subprocess.TimeoutExpired as e:
+                raise ErroSandbox(
+                    f"o runner passou de {TIMEOUT_CONTEXTO}s a ler o contexto. "
+                    f"Importar o teu ficheiro demora — sobe o TIMEOUT_CONTEXTO "
+                    f"se for esse o caso.") from e
+            if r.returncode != 0 or not saida.exists():
+                raise ErroSandbox(
+                    "o runner nao conseguiu ler o contexto:\n"
+                    + cortar((r.stdout or "") + (r.stderr or "")).strip())
+            return json.loads(saida.read_text(encoding="utf-8"))
+
+    def guardar_leitura(self, dados: dict, leitura: dict) -> str:
+        """Guarda a leitura para o placar poder conferi-la mais tarde.
+
+        O limiar de acerto e um ATR de 1h, congelado no momento da leitura:
+        decidir depois quanto conta como "subiu" seria escolher a regua ja
+        depois de saber o resultado.
+        """
+        ts = int(dados.get("ts_min") or 0)
+        if not ts:
+            raise ValueError("o contexto veio sem ts_min — nao da para conferir depois")
+        limiar = (dados.get("atr") or {}).get("1h") or 0.0
+        return self.estado.nova_leitura(
+            dados.get("simbolo") or "?", float(dados.get("preco") or 0), ts,
+            dados.get("fonte") or "?", float(limiar), leitura)
+
+    def avaliar_leituras(self, dados: dict) -> int:
+        """Confere as leituras antigas contra o preco que houve mesmo.
+
+        Por codigo, contra os fechos horarios reais — nao perguntando ao modelo
+        se ele acha que acertou. Um modelo a corrigir-se a si proprio da sempre
+        o mesmo resultado, e nao e o verdadeiro.
+        """
+        hist = {int(t): float(c) for t, c in (dados.get("historico_1h") or [])}
+        if not hist:
+            return 0
+        mais_antigo = min(hist)
+        feitas = 0
+        for r in self.estado.leituras_por_avaliar():
+            alvo_ts = int(r["ts_min"]) + HORAS_PARA_AVALIAR * 60
+            limite = alvo_ts + FOLGA_AVALIACAO_MIN
+            dentro = sorted(t for t in hist if alvo_ts <= t <= limite)
+            if not dentro:
+                if mais_antigo > limite:
+                    # A janela ja passou e o historico nao chega la. Marcar em
+                    # vez de deixar pendurado para sempre: uma leitura eterna
+                    # por decidir seria um acerto que nunca se cobra.
+                    self.estado.marcar_leitura(r["id"], "sem dados")
+                    feitas += 1
+                continue
+            t = dentro[0]
+            preco_depois = hist[t]
+            limiar = abs(float(r["limiar"] or 0))
+            delta = preco_depois - float(r["preco"])
+            direcao = r["direcao"]
+            if direcao == "lateral":
+                res = "acertou" if abs(delta) < limiar else "falhou"
+            elif direcao == "subir":
+                res = ("acertou" if delta >= limiar else
+                       "falhou" if delta <= -limiar else "indeciso")
+            else:
+                res = ("acertou" if delta <= -limiar else
+                       "falhou" if delta >= limiar else "indeciso")
+            self.estado.marcar_leitura(
+                r["id"], res, preco_depois, (t - int(r["ts_min"])) / 60.0)
+            feitas += 1
+        return feitas
+
     # -- piloto automatico -------------------------------------------------
     def pilotar(self, tarefa, parar_evento=None) -> int:
         """Corre sozinho: pesquisa, implementa, testa, reflete, decide.
@@ -4127,6 +4690,9 @@ Para mandar fazer diretamente, sem discussao: `/tarefa <o que queres>`
 /estado — estudo atual, fila, ensaios gastos
 /ensaios — ultimos ensaios e o que deram
 /baseline — mede a estrategia atual (referencia de comparacao)
+/contexto [stop] [take] [venda] — fotografia do mercado agora: maximas, minimas,
+  ATR, regua de pontos ate ao teu take e stop, e a leitura do modelo
+/placar — quantas leituras acertaram a direcao (e se ja ha amostra que chegue)
 /auto <objetivo> — piloto automatico: investigo, testo, decido sozinho quando
   mudar de direcao ou parar. Os limites estao no topo do ficheiro (AUTO_*).
 /auto parar — interrompe o piloto
@@ -4326,6 +4892,10 @@ class Bot:
             self._novo_estudo(chat, arg)
         elif cmd == "baseline":
             self._baseline(chat)
+        elif cmd in ("contexto", "ctx"):
+            self._contexto(chat, arg)
+        elif cmd == "placar":
+            self._placar(chat)
         elif cmd == "aprovar":
             self._decidir(chat, arg, True)
         elif cmd == "rejeitar":
@@ -4582,6 +5152,61 @@ class Bot:
                          f"Drawdown: {j.drawdown * 100:.1f}%\nTrades: {j.trades}\n\n"
                          f"E este numero que qualquer proposta tem de bater em pelo menos "
                          f"{MIN_MELHORIA_PCT:.0f}%.")
+
+    def _contexto(self, chat, arg):
+        """A fotografia do mercado agora, e o que o modelo le nela.
+
+        A tabela vai SEMPRE, com ou sem modelo. Se ele falhar, perdes a frase e
+        ficas com os numeros — que e a parte que decide. Hoje, um modelo em
+        baixo matava o comando inteiro; aqui nao mata.
+        """
+        stop, take, lado = self._ler_pedido(arg)
+        self._resp(chat, "⏳ A ler o mercado...")
+        try:
+            dados = self.orq.ler_contexto(stop, take, lado)
+        except (ErroSandbox, ValueError, json.JSONDecodeError) as e:
+            return self._resp(chat, f"⚠️ {e}")
+
+        tabela = formatar_contexto(dados)
+        try:
+            self.orq.avaliar_leituras(dados)
+        except Exception:
+            log.exception("falhei a avaliar leituras antigas")
+
+        try:
+            leitura = self.orq.agentes.ler_mercado(dados)
+        except ErroAgente as e:
+            return self._resp(chat, tabela + f"\n\n_(sem leitura: {e})_")
+        try:
+            lid = self.orq.guardar_leitura(dados, leitura)
+        except ValueError:
+            lid = ""
+        self._resp(chat, tabela + "\n\n" + _fmt_leitura(leitura, lid))
+
+    @staticmethod
+    def _ler_pedido(arg: str):
+        """`/contexto 215 412 venda` — numeros pela ordem stop, take."""
+        numeros, lado = [], "compra"
+        for pedaco in (arg or "").split():
+            try:
+                numeros.append(float(pedaco.replace(",", ".")))
+            except ValueError:
+                baixo = pedaco.lower()
+                if baixo.startswith(("v", "s")):        # venda / short
+                    lado = "venda"
+                elif baixo.startswith(("c", "l", "b")):  # compra / long / buy
+                    lado = "compra"
+        return (numeros[0] if numeros else None,
+                numeros[1] if len(numeros) > 1 else None, lado)
+
+    def _placar(self, chat):
+        """Quantas leituras acertaram. E, se forem poucas, que sao poucas."""
+        try:
+            dados = self.orq.ler_contexto()
+            self.orq.avaliar_leituras(dados)
+        except (ErroSandbox, ValueError, json.JSONDecodeError) as e:
+            self._resp(chat, f"_(nao consegui atualizar os precos: {e})_")
+        self._resp(chat, _fmt_placar(self.estado.placar()))
 
     def _aviso_holdout(self, eid) -> str:
         return (f"⚠️ *Correr o holdout em* `{eid}`\n\nJanela: {HOLDOUT[0]} a {HOLDOUT[1]}\n\n"

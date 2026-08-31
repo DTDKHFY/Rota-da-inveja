@@ -1417,3 +1417,663 @@ def test_o_lembrete_do_formato_fica_no_fim(alvo_grande):
     # em todas as voltas, incluindo com historico E com erro anterior
     for c in llm.chamadas:
         assert c["utilizador"].rstrip().endswith('{"ok": "..."}')
+
+
+# ===========================================================================
+#  LEITURA DE CONTEXTO
+#
+#  Contra velas construidas a mao, onde a resposta certa se sabe de antemao.
+#  Uma estatistica testada contra dados aleatorios so prova que nao rebenta.
+# ===========================================================================
+def vela(t, o, h, l, c):
+    return (t, float(o), float(h), float(l), float(c))
+
+
+def barras_ctrader(velas_ohlc, t0=0):
+    """As mesmas velas na forma que a API do cTrader devolve."""
+    saida = []
+    for i, (o, h, l, c) in enumerate(velas_ohlc):
+        low = int(round(l * 1e5))
+        saida.append({"utcTimestampInMinutes": t0 + i, "low": low,
+                      "deltaOpen": int(round(o * 1e5)) - low,
+                      "deltaHigh": int(round(h * 1e5)) - low,
+                      "deltaClose": int(round(c * 1e5)) - low})
+    return saida
+
+
+class ModuloFalso:
+    """O minimo que o /contexto precisa de um run_backtest.py."""
+
+    def __init__(self, barras, digits=2, **extra):
+        self._barras = barras
+        self._digits = digits
+        self._state = {"symbol_digits": digits}
+        self.SYMBOL_NAME = "ETHUSD"
+        self.MARKET_SPECS = {"ETHUSD": {"spread": 8.0}}
+        self.descargas = 0
+        for k, v in extra.items():
+            setattr(self, k, v)
+
+    def _bar_ts_min(self, b):
+        return int(b.get("utcTimestampInMinutes") or 0)
+
+    def _load_bars_cache(self, simbolo, tf="M1"):
+        return list(self._barras), self._digits
+
+    def _bars_cache_path(self, simbolo, tf="M1"):
+        return f"/nao/existe/bars_{simbolo}_M1.pkl"
+
+
+# -- estatistica ------------------------------------------------------------
+def test_atr_de_wilder_bate_a_conta_a_mao():
+    """14 barras com TR=10 e uma com TR=24: (10*13 + 24)/14 = 11."""
+    velas = [vela(i, 100, 105, 95, 100) for i in range(15)]
+    velas.append(vela(15, 100, 124, 100, 120))
+    assert runner.atr(velas, 14) == pytest.approx(11.0)
+
+
+def test_atr_sem_historia_devolve_none():
+    assert runner.atr([vela(i, 100, 101, 99, 100) for i in range(5)], 14) is None
+
+
+def test_extremos_e_posicao_por_horizonte():
+    velas = [vela(0, 100, 110, 90, 105), vela(1, 105, 120, 100, 118)]
+    h = runner._horizonte("teste", velas, preco=115.0, atr_ref=10.0, atr_tf="1h")
+    assert (h["maxima"], h["minima"]) == (120.0, 90.0)
+    assert h["amplitude_pts"] == pytest.approx(30.0)
+    assert h["amplitude_atr"] == pytest.approx(3.0)
+    assert h["posicao_pct"] == pytest.approx(100 * (115 - 90) / 30)
+
+
+def test_um_horizonte_vazio_nao_rebenta():
+    h = runner._horizonte("vazio", [], preco=100.0, atr_ref=1.0, atr_tf="1h")
+    assert h["maxima"] is None and h["posicao_pct"] is None
+
+
+def test_a_maior_perna_nao_e_a_amplitude():
+    """Sobe 40, corrige 35, sobe 38: amplitude 43, maior perna 40.
+
+    Se estes dois numeros fossem iguais, a metrica nao estaria a medir nada —
+    foi exatamente o erro da primeira versao.
+    """
+    subida = [vela(i, 100 + i * 4, 100 + i * 4, 100 + i * 4, 100 + i * 4) for i in range(11)]
+    descida = [vela(11 + i, 140 - i * 3.5, 140 - i * 3.5, 140 - i * 3.5, 140 - i * 3.5)
+               for i in range(11)]
+    volta = [vela(22 + i, 105 + i * 3.8, 105 + i * 3.8, 105 + i * 3.8, 105 + i * 3.8)
+             for i in range(11)]
+    velas = subida + descida + volta
+    alta, baixa = runner.extremos(velas)
+    assert alta - baixa == pytest.approx(43.0)
+    assert runner.maior_movimento(velas, limiar=10.0) == pytest.approx(40.0)
+
+
+def test_sem_limiar_a_maior_perna_cai_para_a_amplitude():
+    velas = [vela(0, 100, 130, 100, 120), vela(1, 120, 120, 90, 95)]
+    assert runner.maior_movimento(velas, limiar=0) == pytest.approx(40.0)
+
+
+def test_percentil_da_amplitude_separa_o_dia_extremo_do_normal():
+    amostra = [10.0] * 89 + [11.0]
+    extremo, n = runner.percentil(50.0, amostra, minimo=30)
+    normal, _ = runner.percentil(10.0, amostra, minimo=30)
+    assert n == 90 and extremo == pytest.approx(100.0)
+    assert normal < 10
+
+
+def test_percentil_recusa_se_a_amostra_for_curta_mas_diz_o_n():
+    pct, n = runner.percentil(5.0, [1.0] * 12, minimo=30)
+    assert pct is None and n == 12
+
+
+def test_velas_seguidas_conta_do_fim_e_o_doji_corta():
+    subir = [vela(i, 100, 101, 99, 101) for i in range(3)]
+    assert runner.seguidas(subir) == 3
+    assert runner.seguidas(subir + [vela(3, 100, 101, 99, 100)]) == 0
+    descer = [vela(i, 100, 101, 99, 99) for i in range(2)]
+    assert runner.seguidas(subir + descer) == -2
+
+
+def test_frequencia_da_serie_sem_amostra_devolve_none_e_o_n():
+    freq, n = runner.frequencia_de_serie([vela(i, 100, 101, 99, 101) for i in range(10)], 3)
+    assert freq is None and n == 8
+
+
+# -- o formato do candle ----------------------------------------------------
+OHLC_EXEMPLO = [(100.0, 110.0, 95.0, 105.0), (105.0, 112.0, 103.0, 108.0)]
+
+
+def test_as_tres_formas_de_candle_dao_o_mesmo():
+    """cTrader, OHLC direto e uma funcao do modulo tem de concordar.
+
+    Se discordassem, o mesmo mercado dava leituras diferentes conforme o
+    ficheiro do utilizador — e nao haveria maneira de saber qual estava certa.
+    """
+    ct = ModuloFalso(barras_ctrader(OHLC_EXEMPLO))
+    f_ct, desc_ct = runner.achar_ohlc(ct, ct._barras)
+
+    directas = [{"utcTimestampInMinutes": i, "open": o, "high": h, "low": l, "close": c}
+                for i, (o, h, l, c) in enumerate(OHLC_EXEMPLO)]
+    f_dir, desc_dir = runner.achar_ohlc(ModuloFalso(directas), directas)
+
+    proprias = [{"utcTimestampInMinutes": i, "v": [o, h, l, c]}
+                for i, (o, h, l, c) in enumerate(OHLC_EXEMPLO)]
+    mod = ModuloFalso(proprias)
+    mod._bar_ohlc = lambda b: tuple(b["v"])
+    f_mod, desc_mod = runner.achar_ohlc(mod, proprias)
+
+    for i, esperado in enumerate(OHLC_EXEMPLO):
+        assert f_ct(ct._barras[i]) == pytest.approx(esperado)
+        assert f_dir(directas[i]) == pytest.approx(esperado)
+        assert f_mod(proprias[i]) == pytest.approx(esperado)
+    assert "cTrader" in desc_ct and "direto" in desc_dir and "_bar_ohlc" in desc_mod
+
+
+def test_a_funcao_do_teu_ficheiro_ganha_as_outras():
+    """Se o teu ficheiro sabe ler o candle, e ele que manda — nao o meu palpite."""
+    barras = barras_ctrader(OHLC_EXEMPLO)
+    mod = ModuloFalso(barras)
+    mod._bar_ohlc = lambda b: (1.0, 2.0, 3.0, 4.0)
+    f, desc = runner.achar_ohlc(mod, barras)
+    assert f(barras[0]) == (1.0, 2.0, 3.0, 4.0)
+    assert "_bar_ohlc" in desc
+
+
+def test_um_candle_ja_convertido_nao_e_dividido_outra_vez():
+    """low=3412.5 e um preco, nao 341.250.000 pontos. A escala tem de ver isso."""
+    barras = [{"utcTimestampInMinutes": 0, "low": 3400.0, "deltaOpen": 5.0,
+               "deltaHigh": 12.5, "deltaClose": 8.0}]
+    f, desc = runner.achar_ohlc(ModuloFalso(barras), barras)
+    assert f(barras[0]) == pytest.approx((3405.0, 3412.5, 3400.0, 3408.0))
+    assert "escala 1" in desc
+
+
+def test_um_formato_desconhecido_falha_a_dizer_as_chaves():
+    barras = [{"utcTimestampInMinutes": 0, "preco_medio": 100, "tick": 3}]
+    with pytest.raises(runner.ErroRunner) as e:
+        runner.achar_ohlc(ModuloFalso(barras), barras)
+    texto = str(e.value)
+    assert "preco_medio" in texto and "tick" in texto
+    assert "utcTimestampInMinutes" in texto
+
+
+# -- de onde vem o candle ---------------------------------------------------
+def barras_longas(n=6000, base=3400.0):
+    """Velas suficientes para haver ATR, faixas e historia."""
+    ohlc = []
+    for i in range(n):
+        p = base + (i % 50) * 0.1
+        ohlc.append((p, p + 0.5, p - 0.5, p + 0.2))
+    return barras_ctrader(ohlc, t0=0)
+
+
+def test_desligado_a_descarga_nunca_e_chamada():
+    """O CONTEXTO_AO_VIVO desligado tem de significar zero toques na rede."""
+    mod = ModuloFalso(barras_longas())
+    chamadas = []
+    mod.fetch_bars = lambda symbol, hours=48: chamadas.append(symbol)
+    d = runner.contexto(mod, "ETHUSD", ao_vivo=False)
+    assert chamadas == []
+    assert d["fonte"] == "cache"
+    assert "desligado" in d["motivo_da_fonte"]
+
+
+def test_ligado_a_descarga_e_chamada_e_a_fonte_diz_ctrader():
+    mod = ModuloFalso(barras_longas())
+    chamadas = []
+
+    def fetch_bars(symbol, hours=48):
+        chamadas.append((symbol, hours))
+        return mod._barras[-60:]
+
+    mod.fetch_bars = fetch_bars
+    d = runner.contexto(mod, "ETHUSD", ao_vivo=True)
+    assert chamadas and chamadas[0][0] == "ETHUSD"
+    assert d["fonte"] == "cTrader" and d["motivo_da_fonte"] == ""
+
+
+@pytest.mark.parametrize("falha,pedaco", [
+    (lambda symbol, hours=48: (_ for _ in ()).throw(ConnectionError("recusou")), "recusou"),
+    (lambda symbol, hours=48: [], "nao devolveu candle"),
+])
+def test_uma_descarga_que_falha_cai_para_o_cache_com_a_razao(falha, pedaco):
+    """Falhar nao pode matar o comando: os numeros do cache continuam uteis."""
+    mod = ModuloFalso(barras_longas())
+    mod.fetch_bars = falha
+    d = runner.contexto(mod, "ETHUSD", ao_vivo=True)
+    assert d["fonte"] == "cache" and pedaco in d["motivo_da_fonte"]
+
+
+def test_uma_descarga_pendurada_nao_prende_o_comando():
+    import time as _t
+    mod = ModuloFalso(barras_longas())
+    mod.fetch_bars = lambda symbol, hours=48: _t.sleep(30)
+    inicio = _t.monotonic()
+    d = runner.contexto(mod, "ETHUSD", ao_vivo=True, timeout=1)
+    assert _t.monotonic() - inicio < 10
+    assert d["fonte"] == "cache" and "sem responder" in d["motivo_da_fonte"]
+
+
+def test_sem_funcao_de_descarga_a_razao_nomeia_as_candidatas():
+    mod = ModuloFalso(barras_longas())
+    mod._get_bars_do_broker = lambda s: []      # nome fora da lista, mas com cara
+    d = runner.contexto(mod, "ETHUSD", ao_vivo=True)
+    assert d["fonte"] == "cache"
+    assert "_get_bars_do_broker" in d["motivo_da_fonte"]
+
+
+def test_a_descarga_indicada_a_mao_e_respeitada(monkeypatch):
+    monkeypatch.setattr(runner, "FUNCAO_DESCARGA", "_o_meu_download")
+    mod = ModuloFalso(barras_longas())
+    mod._o_meu_download = lambda symbol, hours=48: mod._barras[-60:]
+    nome, _ = runner.achar_descarga(mod)
+    assert nome == "_o_meu_download"
+
+
+def test_uma_descarga_com_argumentos_que_nao_percebo_diz_quais():
+    mod = ModuloFalso(barras_longas())
+    mod.fetch_bars = lambda conta, cofre: []
+    d = runner.contexto(mod, "ETHUSD", ao_vivo=True)
+    assert "conta" in d["motivo_da_fonte"] and "cofre" in d["motivo_da_fonte"]
+
+
+def test_os_frescos_juntam_se_a_historia_do_cache():
+    """Os frescos dao o agora, o cache da os 90 dias. Nenhum chega sozinho."""
+    velhas = barras_longas(3000)
+    novas = barras_ctrader([(9.0, 9.5, 8.5, 9.2)] * 3, t0=3000)
+    juntas = runner._juntar(velhas, novas, lambda b: int(b["utcTimestampInMinutes"]))
+    assert len(juntas) == 3003
+    assert [b["utcTimestampInMinutes"] for b in juntas] == sorted(
+        b["utcTimestampInMinutes"] for b in juntas)
+
+
+# -- a faixa da Asia --------------------------------------------------------
+def test_a_faixa_da_asia_usa_as_horas_do_teu_ficheiro():
+    mod = ModuloFalso([], ASIA_INICIO=22, ASIA_FIM=7)
+    ini, fim, origem = runner.horas_da_asia(mod)
+    assert (ini, fim) == (22, 7) and "do teu ficheiro" in origem
+
+
+def test_sem_constantes_tuas_a_faixa_diz_que_horas_usou():
+    ini, fim, origem = runner.horas_da_asia(ModuloFalso([]))
+    assert (ini, fim) == runner.ASIA_OMISSAO
+    assert "omissao" in origem
+
+
+def test_a_faixa_que_atravessa_a_meia_noite_e_a_que_ja_comecou():
+    """22h-07h as 03:00 e a de ontem a noite, nao a de hoje a noite."""
+    agora = 5 * 1440 + 3 * 60          # dia 5, 03:00
+    a, b = runner.janela_asia(agora, 22, 7)
+    assert a == 4 * 1440 + 22 * 60 and b == 5 * 1440 + 7 * 60
+    assert a <= agora < b
+
+
+def test_a_faixa_normal_e_a_de_hoje_depois_de_ela_fechar():
+    agora = 5 * 1440 + 20 * 60         # dia 5, 20:00
+    a, b = runner.janela_asia(agora, 0, 7)
+    assert (a, b) == (5 * 1440, 5 * 1440 + 7 * 60)
+
+
+def test_uma_varrida_da_asia_e_reconhecida_como_tal():
+    """Sair da faixa e voltar e manipulacao; sair e ficar fora e outra coisa."""
+    dentro = [vela(i, 100, 101, 99, 100) for i in range(5)]
+    saiu_e_voltou = [vela(5, 100, 105, 99, 100)]
+    saiu_e_ficou = [vela(5, 100, 105, 99, 104)]
+    assert runner._rompeu(saiu_e_voltou, 101.0, 99.0) == ("acima", True)
+    assert runner._rompeu(saiu_e_ficou, 101.0, 99.0) == ("acima", False)
+    assert runner._rompeu(dentro, 101.0, 99.0) == ("nao", False)
+
+
+# -- a regua ----------------------------------------------------------------
+NIVEIS = [("max hoje", 3470.20), ("max 4h", 3455.00), ("max 15m", 3418.00),
+          ("min 15m", 3404.20), ("min Asia", 3388.40), ("min ontem", 3310.50)]
+FAIXAS = [("Asia", 3409.40, 3388.40), ("hoje", 3470.20, 3388.40),
+          ("ontem", 3402.00, 3310.50)]
+PRECO = 3412.50
+
+
+def test_a_regua_faz_as_contas_do_teu_exemplo():
+    r = runner.regua(NIVEIS, PRECO, 14.8, 215, 412, "compra", FAIXAS, spread=8.0)
+    assert r["R"] == pytest.approx(412 / 215)
+    assert r["equilibrio_pct"] == pytest.approx(100 * 215 / 627, abs=0.05)
+    assert r["equilibrio_com_spread_pct"] == pytest.approx(100 * 223 / 627, abs=0.05)
+    assert r["take_preco"] == pytest.approx(PRECO + 412)
+    assert r["stop_preco"] == pytest.approx(PRECO - 215)
+
+
+def test_a_escada_sai_ordenada_com_o_take_e_o_stop_no_sitio():
+    r = runner.regua(NIVEIS, PRECO, 14.8, 215, 412, "compra", FAIXAS)
+    precos = [d["preco"] for d in r["degraus"]]
+    assert precos == sorted(precos, reverse=True)
+    assert r["degraus"][0]["marca"] == "TAKE"
+    assert r["degraus"][-1]["marca"] == "STOP"
+
+
+def test_as_distancias_batem_em_pontos_em_atr_e_em_R():
+    r = runner.regua(NIVEIS, PRECO, 14.8, 215, 412, "compra", FAIXAS)
+    por_nome = {d["etiqueta"]: d for d in r["degraus"]}
+    alto = por_nome["max hoje"]
+    assert alto["pontos"] == pytest.approx(3470.20 - PRECO)
+    assert alto["atr"] == pytest.approx((3470.20 - PRECO) / 14.8)
+    assert alto["R"] == pytest.approx((3470.20 - PRECO) / 215)
+    baixo = por_nome["min ontem"]
+    assert baixo["pontos"] < 0 and baixo["R"] < 0
+    assert baixo["atr"] > 0            # o ATR e distancia, nao direcao
+    assert por_nome["STOP"]["R"] == pytest.approx(-1.0)
+
+
+def test_um_take_para_la_de_um_nivel_avisa_por_quantos_pontos():
+    r = runner.regua(NIVEIS, PRECO, 14.8, 215, 412, "compra", FAIXAS)
+    alem = r["take_alem_de"]
+    assert alem["nivel"] == "max hoje"
+    assert alem["pontos"] == pytest.approx(412 - (3470.20 - PRECO))
+
+
+def test_um_take_aquem_de_todos_os_niveis_nao_avisa_nada():
+    r = runner.regua(NIVEIS, PRECO, 14.8, 20, 3, "compra", FAIXAS)
+    assert r["take_alem_de"] is None
+
+
+def test_um_stop_dentro_da_faixa_da_asia_e_apontado():
+    r = runner.regua(NIVEIS, PRECO, 14.8, 10, 40, "compra", FAIXAS)
+    faixas = [x["faixa"] for x in r["stop_dentro_de"]]
+    assert "Asia" in faixas                      # 3402,50 cai dentro de 3388-3409
+
+
+def test_um_stop_fora_de_todas_as_faixas_nao_e_apontado():
+    r = runner.regua(NIVEIS, PRECO, 14.8, 215, 412, "compra", FAIXAS)
+    assert r["stop_dentro_de"] == []
+
+
+def test_do_lado_da_venda_o_take_e_o_stop_trocam_de_lado():
+    r = runner.regua(NIVEIS, PRECO, 14.8, 215, 412, "venda", FAIXAS)
+    assert r["lado"] == "venda"
+    assert r["take_preco"] == pytest.approx(PRECO - 412)
+    assert r["stop_preco"] == pytest.approx(PRECO + 215)
+    por_nome = {d["etiqueta"]: d for d in r["degraus"]}
+    assert por_nome["TAKE"]["R"] == pytest.approx(412 / 215)   # favoravel = positivo
+    assert por_nome["STOP"]["R"] == pytest.approx(-1.0)
+    assert por_nome["min ontem"]["R"] > 0        # cair e a favor de quem vende
+
+
+def test_sem_stop_nem_take_a_regua_sai_na_mesma():
+    r = runner.regua(NIVEIS, PRECO, 14.8, None, None, "compra", FAIXAS)
+    assert len(r["degraus"]) == len(NIVEIS)
+    assert all(d["marca"] is None for d in r["degraus"])
+    assert r["take_alem_de"] is None and r["stop_dentro_de"] == []
+    assert r["R"] is None
+
+
+# -- o modo, de ponta a ponta -----------------------------------------------
+def instantaneo(pasta: Path) -> dict:
+    """Ficheiros teus e o que lhes aconteceu. O __pycache__ nao conta: e o
+    Python a guardar o import compilado, coisa que o teu proprio bot ja faz —
+    nao e uma alteracao ao teu codigo nem aos teus dados."""
+    return {p: (p.stat().st_mtime_ns, p.stat().st_size)
+            for p in sorted(pasta.rglob("*"))
+            if p.is_file() and "__pycache__" not in p.parts}
+
+
+def test_o_contexto_nao_altera_nada_teu(alvo, tmp_path_factory):
+    """Uma leitura nao pode mexer no projeto. Nem no cache."""
+    fora = tmp_path_factory.mktemp("saida")
+    antes = instantaneo(alvo)
+    r = invocar(alvo, "--contexto", "--out", str(fora / "ctx.json"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert instantaneo(alvo) == antes
+
+
+def test_o_contexto_nao_religa_a_aprendizagem(alvo, tmp_path):
+    """O duplo rebenta se o Telegram falar; o FORCAR_DESLIGADO continua a valer."""
+    saida = tmp_path / "ctx.json"
+    r = invocar(alvo, "--contexto", "--out", str(saida))
+    assert r.returncode == 0, r.stdout + r.stderr
+    mod = runner.carregar_alvo(alvo / "run_backtest.py")
+    assert set(runner.PROIBIDOS) <= set(runner.FORCAR_DESLIGADO)
+    assert mod.BOT_ARRANCOU is False
+
+
+def test_o_contexto_escreve_o_json_com_o_que_o_placar_precisa(alvo, tmp_path):
+    saida = tmp_path / "ctx.json"
+    assert invocar(alvo, "--contexto", "--out", str(saida),
+                   "--stop", "215", "--take", "412").returncode == 0
+    d = json.loads(saida.read_text(encoding="utf-8"))
+    for chave in ("preco", "ts_min", "atr", "historico_1h", "regua",
+                  "horizontes", "fonte", "idade_min", "notavel"):
+        assert chave in d, chave
+    assert d["regua"]["R"] == pytest.approx(412 / 215)
+    assert d["historico_1h"] and len(d["historico_1h"][0]) == 2
+
+
+def test_o_verificar_diz_as_duas_incognitas(alvo):
+    """O formato do candle e a funcao de descarga, ditos antes de darem erro."""
+    r = invocar(alvo, "--verificar")
+    assert r.returncode == 0, r.stderr
+    assert "candle    :" in r.stdout
+    assert "descarga  :" in r.stdout
+    assert "faixa Asia:" in r.stdout
+
+
+def test_um_cache_velho_e_dito_como_velho():
+    """Ler dados velhos sabendo que sao velhos e util. A pensar que sao de
+    agora e o unico resultado mesmo mau."""
+    import time as _t
+    agora = int(_t.time()) // 60
+    velhas = barras_ctrader([(100.0, 100.5, 99.5, 100.2)] * 6000,
+                            t0=agora - 3 * 24 * 60 - 6000)
+    d = runner.contexto(ModuloFalso(velhas), "ETHUSD", ao_vivo=False)
+    assert d["idade_min"] > 3 * 24 * 60 - 60
+
+
+# ===========================================================================
+#  O GUARDA DOS NUMEROS, A TABELA E O PLACAR  (lado do orquestrador)
+# ===========================================================================
+def contexto_de_exemplo(tmp_path: Path, stop=215, take=412) -> dict:
+    (tmp_path / "run_backtest.py").write_text(DUPLO, encoding="utf-8")
+    escrever_cache(tmp_path, dias=200, passo_min=60)
+    saida = tmp_path / "ctx.json"
+    r = invocar(tmp_path, "--contexto", "--out", str(saida),
+                "--stop", str(stop), "--take", str(take))
+    assert r.returncode == 0, r.stdout + r.stderr
+    return json.loads(saida.read_text(encoding="utf-8"))
+
+
+def test_um_numero_inventado_e_apanhado_e_nomeado():
+    orq = carregar_orquestrador()
+    permitidos = orq.numeros_dos_dados({"preco": 3412.5, "atr": 14.8, "max": 3470.2})
+    assert orq.numero_inventado("resistencia forte em 3.500", permitidos) == "3.500"
+    assert orq.numero_inventado("alvo 4.000,00", permitidos) == "4.000,00"
+
+
+def test_o_mesmo_numero_a_portuguesa_e_aceite():
+    """3.412,50 e 3412.5 sao o mesmo numero. Rejeitar isto seria o guarda a
+    apanhar aritmetica correta em vez de invencao."""
+    orq = carregar_orquestrador()
+    permitidos = orq.numeros_dos_dados({"preco": 3412.5, "r": 1.916279, "eq": 34.29027})
+    assert orq.numero_inventado("o preco esta em 3.412,50", permitidos) is None
+    assert orq.numero_inventado("R de 1,92 e equilibrio de 34,3%", permitidos) is None
+
+
+def test_contagens_pequenas_passam_mas_percentagens_nao():
+    """"3 velas" e uma contagem; "subiu 12%" e uma afirmacao sobre os dados."""
+    orq = carregar_orquestrador()
+    permitidos = orq.numeros_dos_dados({"preco": 3412.5, "freq": 8.0})
+    assert orq.numero_inventado("3 velas seguidas a subir", permitidos) is None
+    assert orq.numero_inventado("acontece em 8% dos casos", permitidos) is None
+    assert orq.numero_inventado("subiu 12%", permitidos) == "12"
+
+
+def test_a_tabela_e_a_regua_cabem_numa_mensagem(tmp_path):
+    orq = carregar_orquestrador()
+    texto = orq.formatar_contexto(contexto_de_exemplo(tmp_path))
+    assert len(texto) < 3000                      # o Telegram corta aos 4096
+    assert "REGUA DE PONTOS" in texto
+    assert "TAKE" in texto and "STOP" in texto
+    assert "1,92" in texto                        # R a portuguesa, nao 1.92
+    assert "1.92" not in texto
+
+
+def test_a_tabela_diz_sempre_de_onde_vieram_os_dados(tmp_path):
+    orq = carregar_orquestrador()
+    dados = contexto_de_exemplo(tmp_path)
+    texto = orq.formatar_contexto(dados)
+    assert dados["fonte"] in texto
+    assert "candle de ha" in texto
+
+
+class ModeloInventor:
+    """Responde sempre com um numero que nao esta nos dados."""
+
+    def __init__(self, respostas):
+        self.respostas = list(respostas)
+        self.pedidos = 0
+
+    def conversar(self, sistema, prompt, modelo=None, json_mode=True):
+        self.pedidos += 1
+        return self.respostas[min(self.pedidos - 1, len(self.respostas) - 1)]
+
+
+LEITURA_MA = json.dumps({"leitura": "o preco vai a 9.999,99", "hipotese": "sobe",
+                         "invalidacao": "perde o suporte", "direcao": "subir",
+                         "confianca": "alta"})
+LEITURA_BOA = json.dumps({"leitura": "mercado apertado", "hipotese": "continua",
+                          "invalidacao": "perde a minima da Asia",
+                          "direcao": "lateral", "confianca": "baixa"})
+
+
+def test_o_modelo_corrige_se_depois_de_lhe_dizerem_o_numero(tmp_path):
+    """O ciclo so funciona porque o erro nomeia o numero: sem isso, o modelo
+    nao tem por onde se corrigir."""
+    orq = carregar_orquestrador()
+    dados = contexto_de_exemplo(tmp_path)
+    llm = ModeloInventor([LEITURA_MA, LEITURA_BOA])
+    agentes = orq.Agentes(llm, None)
+    leitura = agentes.ler_mercado(dados)
+    assert llm.pedidos == 2
+    assert leitura["direcao"] == "lateral"
+
+
+def test_um_modelo_que_inventa_sempre_nao_rebenta_a_tabela(tmp_path):
+    orq = carregar_orquestrador()
+    dados = contexto_de_exemplo(tmp_path)
+    agentes = orq.Agentes(ModeloInventor([LEITURA_MA]), None)
+    with pytest.raises(orq.ErroAgente) as e:
+        agentes.ler_mercado(dados)
+    assert "9.999,99" in str(e.value)
+    # e a tabela continua a sair inteira, que e o que decide
+    assert "REGUA DE PONTOS" in orq.formatar_contexto(dados)
+
+
+def test_uma_direcao_fora_das_tres_e_recusada():
+    orq = carregar_orquestrador()
+    with pytest.raises(ValueError) as e:
+        orq._validar_leitura({"leitura": "a", "hipotese": "b", "invalidacao": "c",
+                              "direcao": "talvez", "confianca": "alta"}, set())
+    assert "talvez" in str(e.value)
+
+
+def estado_limpo(tmp_path: Path):
+    orq = carregar_orquestrador()
+    return orq, orq.Estado(tmp_path / "orq.sqlite")
+
+
+def guardar(estado, direcao: str, preco: float, ts_min: int,
+            limiar: float = 10.0, confianca: str = "media") -> str:
+    return estado.nova_leitura(
+        "ETHUSD", preco, ts_min, "cache", limiar,
+        {"leitura": "x", "hipotese": "y", "invalidacao": "z",
+         "direcao": direcao, "confianca": confianca})
+
+
+def test_o_placar_vazio_nao_da_percentagem_nenhuma(tmp_path):
+    orq, estado = estado_limpo(tmp_path)
+    assert "%" not in orq._fmt_placar(estado.placar())
+
+
+def test_o_placar_com_tres_leituras_diz_que_nao_chega(tmp_path):
+    """Uma percentagem sobre tres leituras nao e um resultado: e uma maneira
+    de ganhar confianca sem ter ganho nada."""
+    orq, estado = estado_limpo(tmp_path)
+    for i in range(3):
+        lid = guardar(estado, "subir", 100.0, i * 60)
+        estado.marcar_leitura(lid, "acertou" if i else "falhou", 110.0, 4.0)
+    texto = orq._fmt_placar(estado.placar())
+    assert "2 acertaram" in texto and "1 falharam" in texto
+    assert "%" not in texto
+    assert "faltam" in texto
+
+
+def test_o_placar_com_amostra_suficiente_da_a_taxa(tmp_path):
+    orq, estado = estado_limpo(tmp_path)
+    for i in range(orq.MINIMO_LEITURAS_PARA_PLACAR):
+        lid = guardar(estado, "subir", 100.0, i * 60)
+        estado.marcar_leitura(lid, "acertou" if i % 2 == 0 else "falhou", 110.0, 4.0)
+    texto = orq._fmt_placar(estado.placar())
+    assert "50%" in texto
+
+
+def test_uma_leitura_e_conferida_contra_o_preco_que_houve_mesmo(tmp_path):
+    """Por codigo, contra os fechos reais — nao perguntando ao modelo se acha
+    que acertou."""
+    orq, estado = estado_limpo(tmp_path)
+    o = orq.Orquestrador(estado, None, aviso=type("A", (), {"enviar": lambda *a: None})())
+    t0 = 10_000
+    subiu = guardar(estado, "subir", 100.0, t0)
+    desceu = guardar(estado, "descer", 100.0, t0)
+    parado = guardar(estado, "lateral", 100.0, t0)
+    depois = t0 + orq.HORAS_PARA_AVALIAR * 60
+    dados = {"historico_1h": [[t0, 100.0], [depois, 130.0]]}
+
+    assert o.avaliar_leituras(dados) == 3
+    por_id = {r["id"]: r for r in estado.c.execute("SELECT * FROM leituras")}
+    assert por_id[subiu]["resultado"] == "acertou"
+    assert por_id[desceu]["resultado"] == "falhou"
+    assert por_id[parado]["resultado"] == "falhou"
+    assert por_id[subiu]["preco_depois"] == pytest.approx(130.0)
+    assert por_id[subiu]["horas_depois"] == pytest.approx(orq.HORAS_PARA_AVALIAR)
+
+
+def test_um_movimento_abaixo_do_limiar_fica_indeciso(tmp_path):
+    """Meio ATR nao e "subiu". Contar isso como acerto seria dar razao a
+    qualquer leitura que apontasse para algum lado."""
+    orq, estado = estado_limpo(tmp_path)
+    o = orq.Orquestrador(estado, None, aviso=type("A", (), {"enviar": lambda *a: None})())
+    t0 = 10_000
+    lid = guardar(estado, "subir", 100.0, t0, limiar=10.0)
+    parado = guardar(estado, "lateral", 100.0, t0, limiar=10.0)
+    dados = {"historico_1h": [[t0, 100.0], [t0 + orq.HORAS_PARA_AVALIAR * 60, 103.0]]}
+    o.avaliar_leituras(dados)
+    por_id = {r["id"]: r for r in estado.c.execute("SELECT * FROM leituras")}
+    assert por_id[lid]["resultado"] == "indeciso"
+    assert por_id[parado]["resultado"] == "acertou"
+
+
+def test_uma_leitura_recente_de_mais_fica_a_espera(tmp_path):
+    orq, estado = estado_limpo(tmp_path)
+    o = orq.Orquestrador(estado, None, aviso=type("A", (), {"enviar": lambda *a: None})())
+    t0 = 10_000
+    guardar(estado, "subir", 100.0, t0)
+    o.avaliar_leituras({"historico_1h": [[t0, 100.0], [t0 + 60, 130.0]]})
+    assert estado.placar()["por_decidir"] == 1
+
+
+def test_uma_leitura_fora_da_janela_do_historico_nao_fica_pendurada(tmp_path):
+    """Uma leitura eterna por decidir seria um acerto que nunca se cobra."""
+    orq, estado = estado_limpo(tmp_path)
+    o = orq.Orquestrador(estado, None, aviso=type("A", (), {"enviar": lambda *a: None})())
+    guardar(estado, "subir", 100.0, 1_000)
+    o.avaliar_leituras({"historico_1h": [[900_000, 100.0], [900_060, 101.0]]})
+    linha = list(estado.c.execute("SELECT resultado FROM leituras"))[0]
+    assert linha["resultado"] == "sem dados"
+    assert estado.placar()["por_decidir"] == 0
+
+
+def test_a_tabela_leituras_aparece_numa_base_que_ja_existia(tmp_path):
+    """Quem ja tem historico nao pode ter de recomecar por eu acrescentar uma
+    tabela."""
+    orq = carregar_orquestrador()
+    caminho = tmp_path / "antiga.sqlite"
+    primeiro = orq.Estado(caminho)
+    primeiro.c.execute("DROP TABLE leituras")
+    primeiro.c.close()
+    segundo = orq.Estado(caminho)
+    assert segundo.placar()["total"] == 0
