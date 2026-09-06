@@ -3,6 +3,7 @@
 """Agente de trading ao vivo. Um ficheiro, sem dependencias alem de requests.
 
     python3 agente.py             corre (vigia + bot)
+    python3 agente.py contas      que contas o teu token abre, e o id de cada uma
     python3 agente.py verificar   liga, autentica, diz o host, a conta e o saldo
     python3 agente.py contexto    escreve a fotografia do mercado agora, e sai
     python3 agente.py teste       autoteste: sem broker, sem Ollama, sem Telegram
@@ -55,13 +56,25 @@ A passagem a live nao e uma constante que se troca. Sao tres fechaduras:
 
 CREDENCIAIS
 -----------
-Nunca no ficheiro. Vai buscar ao ambiente:
+Nunca no ficheiro. Vai buscar ao ambiente. As tres primeiras estao no ecra da
+tua aplicacao em https://connect.spotware.com; a QUARTA NAO ESTA LA — e o
+ctidTraderAccountId, e so a API o sabe. Define as tres, corre
+`python agente.py contas`, e ele diz-te o id.
 
-    export CTRADER_CLIENT_ID=...          da tua aplicacao em connect.spotware.com
-    export CTRADER_CLIENT_SECRET=...
-    export CTRADER_ACCESS_TOKEN=...       do fluxo OAuth da tua aplicacao
-    export CTRADER_ACCOUNT_ID=...         ctidTraderAccountId da conta demo
-    export TELEGRAM_BOT_TOKEN=...         opcional: sem isto corre sem Telegram
+    CTRADER_CLIENT_ID        da tua aplicacao em connect.spotware.com
+    CTRADER_CLIENT_SECRET
+    CTRADER_ACCESS_TOKEN     do fluxo OAuth da tua aplicacao (expira em ~30 dias)
+    CTRADER_ACCOUNT_ID       ctidTraderAccountId — vem do `agente.py contas`
+    TELEGRAM_BOT_TOKEN       opcional: sem isto corre sem Telegram
+
+Em Windows, `export` NAO existe e nao da erro nenhum — so nao faz nada:
+
+    PowerShell   $env:CTRADER_CLIENT_ID = "..."
+    cmd.exe      set CTRADER_CLIENT_ID=...
+    bash/macOS   export CTRADER_CLIENT_ID=...
+
+E as variaveis so valem para a janela onde as escreveste. Fechaste o terminal,
+tens de as por outra vez.
 
 O ficheiro NAO fala protobuf. A Open API tambem serve JSON, na porta 5036, com
 um prefixo de comprimento de 4 bytes big-endian a frente de cada mensagem. Sao
@@ -115,7 +128,7 @@ PORTA_JSON = 5036          # JSON. A 5035 e protobuf, e nao e o que falamos.
 
 # O mercado. O nome tem de bater com o do teu broker — o `verificar` diz-te
 # quais e que existem se este nao bater.
-SIMBOLO = "ETHUSD"
+SIMBOLO = "EURUSD"
 
 # --- Telegram --------------------------------------------------------------
 # Gera/revoga em https://t.me/BotFather -> /mybots -> API Token.
@@ -906,26 +919,60 @@ class Ligacao:
                         "payloadType": tipo, "payload": carga})
 
 
-def credenciais() -> dict:
-    """As credenciais, do ambiente. Nunca do ficheiro, nunca do git."""
-    faltam, fora = [], {}
-    for chave, nome in (("CTRADER_CLIENT_ID", "cliente"),
-                        ("CTRADER_CLIENT_SECRET", "segredo"),
-                        ("CTRADER_ACCESS_TOKEN", "token"),
-                        ("CTRADER_ACCOUNT_ID", "conta")):
+def _como_definir(chaves) -> str:
+    """As tres sintaxes, porque `export` nao existe em Windows.
+
+    Mandar "faz export X=..." a quem esta no PowerShell e mandar a pessoa
+    procurar o problema no sitio errado: o comando nao da erro, so nao faz
+    nada, e a variavel continua a faltar na volta seguinte.
+    """
+    return ("\n  PowerShell:\n" +
+            "\n".join(f'    $env:{c} = "..."' for c in chaves) +
+            "\n  cmd.exe:\n" +
+            "\n".join(f"    set {c}=..." for c in chaves) +
+            "\n  bash / macOS / Linux:\n" +
+            "\n".join(f"    export {c}=..." for c in chaves))
+
+
+def credenciais(*, exigir_conta: bool = True) -> dict:
+    """As credenciais, do ambiente. Nunca do ficheiro, nunca do git.
+
+    O id da conta e opcional para o comando `contas` — e ele que existe para
+    to descobrir. Exigi-lo ai seria pedir-te a resposta da pergunta que vieste
+    fazer: o ctidTraderAccountId NAO aparece no ecra das credenciais do
+    Spotware, e o unico sitio onde ele vive e do outro lado desta ligacao.
+    """
+    precisas = [("CTRADER_CLIENT_ID", "cliente"),
+                ("CTRADER_CLIENT_SECRET", "segredo"),
+                ("CTRADER_ACCESS_TOKEN", "token")]
+    if exigir_conta:
+        precisas.append(("CTRADER_ACCOUNT_ID", "conta"))
+
+    faltam, fora = [], {"conta": (os.environ.get("CTRADER_ACCOUNT_ID") or "").strip()}
+    for chave, nome in precisas:
         valor = (os.environ.get(chave) or "").strip()
         if not valor:
             faltam.append(chave)
         fora[nome] = valor
     if faltam:
-        raise ErroBroker(
-            "faltam credenciais no ambiente: " + ", ".join(faltam) +
-            "\nApanha-as em https://connect.spotware.com (aplicacao + OAuth) e faz:\n" +
-            "\n".join(f"    export {c}=..." for c in faltam))
-    try:
-        fora["conta"] = int(fora["conta"])
-    except ValueError:
-        raise ErroBroker(f"CTRADER_ACCOUNT_ID tem de ser um numero, e e {fora['conta']!r}") from None
+        recado = ("faltam credenciais no ambiente: " + ", ".join(faltam) +
+                  "\n\nAs tres primeiras estao em https://connect.spotware.com, na tua "
+                  "aplicacao." + _como_definir(faltam))
+        if "CTRADER_ACCOUNT_ID" in faltam:
+            recado += ("\n\nO CTRADER_ACCOUNT_ID NAO esta nesse ecra: e o "
+                       "ctidTraderAccountId, e so a API o sabe. Com as outras tres "
+                       "ja definidas, corre\n    python agente.py contas\n"
+                       "e ele lista as contas que o teu token abre, com o id de cada uma.")
+        raise ErroBroker(recado)
+
+    if fora["conta"]:
+        try:
+            fora["conta"] = int(fora["conta"])
+        except ValueError:
+            raise ErroBroker(f"CTRADER_ACCOUNT_ID tem de ser um numero, e e "
+                             f"{fora['conta']!r}") from None
+    else:
+        fora["conta"] = 0
     return fora
 
 
@@ -957,9 +1004,9 @@ class CTrader:
     """A conversa com o broker, ja em portugues: barras, ordens, posicoes."""
 
     def __init__(self, simbolo: str = SIMBOLO, *, ligacao: Ligacao | None = None,
-                 creds: dict | None = None):
+                 creds: dict | None = None, exigir_conta: bool = True):
         exigir_conta_permitida()
-        self.creds = creds or credenciais()
+        self.creds = creds or credenciais(exigir_conta=exigir_conta)
         self.simbolo_nome = simbolo
         self.lig = ligacao or Ligacao(host_da_conta())
         self.lig.eventos = self._evento
@@ -970,30 +1017,63 @@ class CTrader:
         self._execucoes_lock = threading.Lock()
 
     # -- ligar --------------------------------------------------------------
-    def ligar(self) -> None:
+    def ligar(self, *, autenticar_conta: bool = True) -> None:
+        """Autentica a aplicacao e, salvo ordem em contrario, a conta.
+
+        O `contas` liga sem o segundo passo: e todo o ponto dele descobrir o id
+        que o segundo passo exigiria.
+        """
         self.lig.abrir()
         self.lig.pedir(PT.APP_AUTH_REQ, {"clientId": self.creds["cliente"],
                                          "clientSecret": self.creds["segredo"]})
+        if not autenticar_conta:
+            return
         self._exigir_conta_do_token()
         self.lig.pedir(PT.ACCOUNT_AUTH_REQ, {"ctidTraderAccountId": self.creds["conta"],
                                              "accessToken": self.creds["token"]})
 
-    def _exigir_conta_do_token(self) -> None:
-        """Fechadura numero tres: a conta e confirmada, nao assumida.
+    def contas_do_token(self) -> list[dict]:
+        """As contas que este access token abre, com o id de cada uma.
 
-        Um token de demo com um id de live (ou o contrario) e um erro de
-        arranque com os dois valores a frente — e nao uma ordem enviada para o
-        sitio errado, descoberta pelo extrato.
+        E o unico sitio onde o ctidTraderAccountId existe: nao esta no ecra das
+        credenciais do Spotware, so a API o sabe.
         """
         carga = self.lig.pedir(PT.ACCOUNTS_BY_TOKEN_REQ,
                                {"accessToken": self.creds["token"]})
-        contas = [int(c.get("ctidTraderAccountId") or 0)
-                  for c in (carga.get("ctidTraderAccount") or [])]
-        if contas and self.creds["conta"] not in contas:
+        return [{
+            "id": int(c.get("ctidTraderAccountId") or 0),
+            "live": bool(c.get("isLive")),
+            "login": c.get("traderLogin"),
+            "broker": c.get("brokerTitleShort") or "",
+        } for c in (carga.get("ctidTraderAccount") or [])]
+
+    def _exigir_conta_do_token(self) -> None:
+        """Fechadura numero tres: a conta e confirmada, nao assumida.
+
+        Duas verificacoes, e a segunda e a que interessa: alem de a conta ter de
+        estar entre as que o token abre, o `isLive` dela tem de bater com o
+        CONTA deste ficheiro. Um id de live no host de demo nao daria erro de
+        autenticacao — daria uma ordem enviada para o sitio errado, descoberta
+        pelo extrato.
+        """
+        contas = self.contas_do_token()
+        ids = [c["id"] for c in contas]
+        if contas and self.creds["conta"] not in ids:
             raise ErroBroker(
                 f"a conta {self.creds['conta']} nao esta entre as que este token "
-                f"autoriza ({', '.join(str(c) for c in contas)}).\n"
-                f"Ou o CTRADER_ACCOUNT_ID esta errado, ou o token e de outra conta.")
+                f"autoriza ({', '.join(str(i) for i in ids)}).\n"
+                f"Ou o CTRADER_ACCOUNT_ID esta errado, ou o token e de outra conta.\n"
+                f"Corre `python agente.py contas` para veres a lista com os detalhes.")
+        esta = next((c for c in contas if c["id"] == self.creds["conta"]), None)
+        if esta is not None:
+            devia = "live" if esta["live"] else "demo"
+            if devia != CONTA:
+                raise ErroBroker(
+                    f"a conta {self.creds['conta']} e uma conta {devia.upper()}, e este "
+                    f"ficheiro esta com CONTA = {CONTA!r}.\n"
+                    f"Nao vou autenticar uma conta {devia} contra o host de {CONTA}: "
+                    f"ou mudas o CONTA para {devia!r}, ou pos o "
+                    f"CTRADER_ACCOUNT_ID de uma conta {CONTA}.")
 
     def garantir_ligado(self) -> None:
         """Religa e volta a autenticar. Uma ligacao morta nao se remenda."""
@@ -3035,8 +3115,10 @@ def _para_trendbar(v: tuple) -> dict:
 class BrokerFalso(threading.Thread):
     """Um cTrader de mentira. Mesmo enquadramento, mesmos payloadType."""
 
-    def __init__(self, velas=None, *, conta: int = 111, saldo: float = 10_000.0):
+    def __init__(self, velas=None, *, conta: int = 111, saldo: float = 10_000.0,
+                 live: bool = False):
         super().__init__(name="broker-falso", daemon=True)
+        self.live = live
         self.velas = velas if velas is not None else velas_falsas(45 * 1440)
         self.conta, self.saldo = conta, saldo
         self.posicoes: list[dict] = []
@@ -3096,8 +3178,9 @@ class BrokerFalso(threading.Thread):
             self.autenticado["app"] = True
             return self._enviar(PT.APP_AUTH_RES, {}, cid)
         if tipo == PT.ACCOUNTS_BY_TOKEN_REQ:
-            return self._enviar(PT.ACCOUNTS_BY_TOKEN_RES,
-                                {"ctidTraderAccount": [{"ctidTraderAccountId": self.conta}]}, cid)
+            return self._enviar(PT.ACCOUNTS_BY_TOKEN_RES, {"ctidTraderAccount": [
+                {"ctidTraderAccountId": self.conta, "isLive": self.live,
+                 "traderLogin": 900_000 + self.conta, "brokerTitleShort": "Falso"}]}, cid)
         if tipo == PT.ACCOUNT_AUTH_REQ:
             if not self.autenticado["app"]:
                 return self._enviar(PT.ERROR_RES,
@@ -3107,11 +3190,11 @@ class BrokerFalso(threading.Thread):
             return self._enviar(PT.ACCOUNT_AUTH_RES, {"ctidTraderAccountId": self.conta}, cid)
         if tipo == PT.SYMBOLS_LIST_REQ:
             return self._enviar(PT.SYMBOLS_LIST_RES, {"symbol": [
-                {"symbolId": 42, "symbolName": "ETHUSD", "digits": 2},
-                {"symbolId": 43, "symbolName": "BTCUSD", "digits": 2}]}, cid)
+                {"symbolId": 42, "symbolName": "EURUSD", "digits": 5},
+                {"symbolId": 43, "symbolName": "GBPUSD", "digits": 5}]}, cid)
         if tipo == PT.SYMBOL_BY_ID_REQ:
             return self._enviar(PT.SYMBOL_BY_ID_RES, {"symbol": [
-                {"symbolId": 42, "digits": 2, "pipPosition": 2, "lotSize": 10_000_000,
+                {"symbolId": 42, "digits": 5, "pipPosition": 4, "lotSize": 10_000_000,
                  "minVolume": 1_000, "maxVolume": 100_000_000, "stepVolume": 1_000}]}, cid)
         if tipo == PT.TRADER_REQ:
             return self._enviar(PT.TRADER_RES, {"trader": {
@@ -3161,7 +3244,7 @@ def broker_de_teste(falso: BrokerFalso) -> CTrader:
     """Um CTrader a falar com o BrokerFalso: sem TLS, sem rede, sem conta."""
     lig = Ligacao("127.0.0.1", falso.porta, tls=False, timeout=10)
     creds = {"cliente": "id", "segredo": "segredo", "token": "tok", "conta": falso.conta}
-    broker = CTrader("ETHUSD", ligacao=lig, creds=creds)
+    broker = CTrader("EURUSD", ligacao=lig, creds=creds)
     broker.ligar()
     broker.resolver_simbolo()
     return broker
@@ -3331,6 +3414,7 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
         verificar(falso.autenticado["app"] and falso.autenticado["conta"],
                   "a autenticacao faz os dois passos: aplicacao e depois conta")
         verificar(broker.simbolo_id == 42, "o nome do simbolo resolveu-se para um symbolId")
+        verificar(broker.detalhes["nome"] == "EURUSD", "e o simbolo e mesmo o que se pediu")
         verificar(broker.detalhes["stepVolume"] == 1_000,
                   "o stepVolume vem do broker, e nao de um palpite meu")
         verificar(abs(broker.conta()["saldo"] - 10_000.0) < 1e-6,
@@ -3373,7 +3457,8 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
     try:
         broker2 = broker_de_teste(falso2)
         dados, m1_teste = None, broker2.m1(2)
-        dados = fotografia(m1_teste, agora_utc_min(), detalhes=broker2.detalhes)
+        dados = fotografia(m1_teste, agora_utc_min(), simbolo="EURUSD",
+                           detalhes=broker2.detalhes)
         verificar([e["nome"] for e in dados["escalas"]] == ["M15", "H1", "H4", "D1"],
                   "a fotografia traz as quatro escalas")
         verificar(dados["escalas"][0]["atr"] is not None, "o M15 tem ATR")
@@ -3563,7 +3648,7 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
     falso3.start()
     try:
         lig = Ligacao("127.0.0.1", falso3.porta, tls=False, timeout=10)
-        errado = CTrader("ETHUSD", ligacao=lig,
+        errado = CTrader("EURUSD", ligacao=lig,
                          creds={"cliente": "id", "segredo": "s", "token": "t", "conta": 999})
         try:
             errado.ligar()
@@ -3574,6 +3659,67 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
         errado.fechar()
     finally:
         falso3.parar()
+
+    # Descobrir o id: e para isto que o `contas` existe. Liga sem autenticar a
+    # conta — que e precisamente o passo que exigiria o id que falta.
+    # (Servidor proprio: o BrokerFalso aceita um cliente so, e o de cima ja
+    # gastou o dele. E limitacao do falso, nao do cliente.)
+    falso3b = BrokerFalso(velas=velas_falsas(2000), conta=111)
+    falso3b.start()
+    try:
+        lig2 = Ligacao("127.0.0.1", falso3b.porta, tls=False, timeout=10)
+        descobre = CTrader("EURUSD", ligacao=lig2, exigir_conta=False,
+                           creds={"cliente": "id", "segredo": "s", "token": "t", "conta": 0})
+        descobre.ligar(autenticar_conta=False)
+        lista = descobre.contas_do_token()
+        verificar([c["id"] for c in lista] == [111],
+                  "o `contas` descobre o id sem precisar do id")
+        verificar(lista[0]["live"] is False and lista[0]["broker"] == "Falso",
+                  "e diz se e demo ou live, e de que broker")
+        descobre.fechar()
+    finally:
+        falso3b.parar()
+
+    # Uma conta LIVE contra o host de demo nao da erro de autenticacao — daria
+    # uma ordem no sitio errado. Por isso o isLive e conferido contra o CONTA.
+    falso4 = BrokerFalso(velas=velas_falsas(2000), conta=222, live=True)
+    falso4.start()
+    try:
+        lig3 = Ligacao("127.0.0.1", falso4.porta, tls=False, timeout=10)
+        trocado = CTrader("EURUSD", ligacao=lig3,
+                          creds={"cliente": "id", "segredo": "s", "token": "t", "conta": 222})
+        try:
+            trocado.ligar()
+            verificar(False, "uma conta live no host de demo tem de parar o arranque")
+        except ErroBroker as e:
+            verificar("LIVE" in str(e) and "demo" in str(e),
+                      "o erro do live-contra-demo diz o que a conta e e o que o ficheiro espera")
+        trocado.fechar()
+    finally:
+        falso4.parar()
+
+    guardadas = {c: os.environ.pop(c, None) for c in
+                 ("CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET",
+                  "CTRADER_ACCESS_TOKEN", "CTRADER_ACCOUNT_ID")}
+    try:
+        os.environ.update({"CTRADER_CLIENT_ID": "a", "CTRADER_CLIENT_SECRET": "b",
+                           "CTRADER_ACCESS_TOKEN": "c"})
+        try:
+            credenciais()
+            verificar(False, "sem o id da conta, o arranque normal tem de parar")
+        except ErroBroker as e:
+            verificar("agente.py contas" in str(e),
+                      "e o erro do id em falta manda-te ao comando que o descobre")
+            verificar("$env:" in str(e) and "set " in str(e) and "export " in str(e),
+                      "e da as tres sintaxes, porque `export` nao existe em Windows")
+        sem_conta = credenciais(exigir_conta=False)
+        verificar(sem_conta["conta"] == 0,
+                  "o `contas` corre sem o id da conta — e o que ele vem descobrir")
+    finally:
+        for chave, valor in guardadas.items():
+            os.environ.pop(chave, None)
+            if valor is not None:
+                os.environ[chave] = valor
 
     print("\n=== 12. O Estado nao atravessa threads ===")
     with Estado(tmp / "threads.db") as e0:
@@ -3639,6 +3785,45 @@ def montar() -> tuple[CTrader, object]:
         except ValueError as e:
             print(f"aviso: {e}\nSigo sem Telegram.", file=sys.stderr)
     return broker, aviso
+
+
+def cmd_contas() -> int:
+    """Lista as contas que o teu access token abre, com o id de cada uma.
+
+    Existe porque o ctidTraderAccountId nao esta no ecra das credenciais do
+    Spotware — e nao ha maneira de o adivinhar. So precisa das tres credenciais
+    que esse ecra te da.
+    """
+    print(f"{carimbo()} host: {host_da_conta()}:{PORTA_JSON} (JSON)")
+    broker = CTrader(SIMBOLO, exigir_conta=False)
+    try:
+        broker.ligar(autenticar_conta=False)
+        contas = broker.contas_do_token()
+    finally:
+        broker.fechar()
+
+    if not contas:
+        print("\nEste token nao abre conta nenhuma. Refaz o fluxo OAuth e confirma "
+              "que autorizaste o acesso as contas de trading.")
+        return 2
+
+    print(f"\n{len(contas)} conta(s):\n")
+    for c in contas:
+        marca = "LIVE" if c["live"] else "demo"
+        casa = f" · {c['broker']}" if c["broker"] else ""
+        login = f" · login {c['login']}" if c["login"] else ""
+        print(f"  {c['id']:<12} {marca:<5}{casa}{login}")
+
+    querida = [c for c in contas if c["live"] == (CONTA == "live")]
+    print(f"\nEste ficheiro esta com CONTA = {CONTA!r}, por isso quer uma das "
+          f"{'LIVE' if CONTA == 'live' else 'demo'}.")
+    if not querida:
+        print(f"E nao ha nenhuma. Ou mudas o CONTA, ou crias uma conta "
+              f"{'live' if CONTA == 'live' else 'demo'} no teu broker.")
+        return 2
+    print(_como_definir(["CTRADER_ACCOUNT_ID"]).replace('"..."', f'"{querida[0]["id"]}"')
+          .replace("=...", f"={querida[0]['id']}"))
+    return 0
 
 
 def cmd_verificar() -> int:
@@ -3732,7 +3917,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Agente de trading ao vivo: o modelo decide, o codigo mede e executa.")
     ap.add_argument("comando", nargs="?", default="correr",
-                    choices=["correr", "verificar", "contexto", "teste"])
+                    choices=["correr", "contas", "verificar", "contexto", "teste"])
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
 
@@ -3744,6 +3929,8 @@ def main(argv=None) -> int:
     if a.comando == "teste":
         return autoteste()
     try:
+        if a.comando == "contas":
+            return cmd_contas()
         if a.comando == "verificar":
             return cmd_verificar()
         if a.comando == "contexto":
