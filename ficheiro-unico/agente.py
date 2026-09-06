@@ -89,6 +89,8 @@ trinta linhas de socket, e poupa o protobuf, o Twisted e o SDK.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import logging
 import math
@@ -817,10 +819,30 @@ class Ligacao:
 
     # -- ligar e desligar ---------------------------------------------------
     def abrir(self) -> None:
-        cru = socket.create_connection((self.host, self.porta), timeout=self.timeout)
-        if self.tls:
-            ctx = ssl.create_default_context()
-            cru = ctx.wrap_socket(cru, server_hostname=self.host)
+        # Rede, DNS e TLS falham com excecoes da biblioteca padrao, e uma delas
+        # a subir crua ate ao topo da-te um traceback em vez de uma frase — e o
+        # `main` nem sequer a apanha, porque so apanha ErroBroker. Uma falha de
+        # ligacao e um erro do broker como qualquer outro, e diz-se assim.
+        try:
+            cru = socket.create_connection((self.host, self.porta), timeout=self.timeout)
+            if self.tls:
+                ctx = ssl.create_default_context()
+                cru = ctx.wrap_socket(cru, server_hostname=self.host)
+        except socket.gaierror as e:
+            raise ErroBroker(
+                f"nao consegui resolver o nome {self.host}: {e}\n"
+                f"Ha rede nesta maquina? Ha algum proxy ou DNS pelo meio?") from e
+        except (TimeoutError, socket.timeout) as e:
+            raise ErroBroker(
+                f"{self.host}:{self.porta} nao respondeu em {self.timeout}s.\n"
+                f"A porta {self.porta} costuma ser a primeira coisa que uma firewall "
+                f"corporativa ou uma VPN bloqueiam — nao e uma porta de web.") from e
+        except ssl.SSLError as e:
+            raise ErroBroker(
+                f"o TLS com {self.host} falhou: {e}\n"
+                f"Costuma ser um antivirus ou um proxy a inspecionar a ligacao.") from e
+        except OSError as e:
+            raise ErroBroker(f"nao consegui ligar a {self.host}:{self.porta}: {e}") from e
         cru.settimeout(None)          # o leitor bloqueia; o timeout e por pedido
         self.sock, self.morreu = cru, ""
         self._parar.clear()
@@ -3765,7 +3787,82 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
             if valor is not None:
                 os.environ[chave] = valor
 
-    print("\n=== 12. O Estado nao atravessa threads ===")
+    print("\n=== 12. O erro chega a quem o tem de ler ===")
+
+    def capturar(f, *args, **kw):
+        saida = io.StringIO()
+        with contextlib.redirect_stdout(saida):
+            codigo = f(*args, **kw)
+        return codigo, saida.getvalue()
+
+    codigo, texto = capturar(falhar, "uma razao qualquer")
+    verificar(codigo == 2, "falhar devolve 2")
+    verificar("NAO ARRANQUEI" in texto and "uma razao qualquer" in texto,
+              "e escreve a razao emoldurada — em STDOUT, que e onde se le")
+
+    guardadas2 = {c: os.environ.pop(c, None) for c in
+                  ("CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET",
+                   "CTRADER_ACCESS_TOKEN", "CTRADER_ACCOUNT_ID")}
+    antes2 = (CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET,
+              CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID)
+    try:
+        CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN = "a", "b", "c"
+        CTRADER_ACCOUNT_ID = 0
+        verificar(so_falta_a_conta(),
+                  "com as tres postas e o id a zero, so falta a conta")
+        CTRADER_ACCOUNT_ID = 555
+        verificar(not so_falta_a_conta(), "com o id ja posto, nao falta nada")
+        CTRADER_ACCOUNT_ID = 0
+        CTRADER_ACCESS_TOKEN = ""
+        verificar(not so_falta_a_conta(),
+                  "e com outra credencial em falta tambem nao: ai falta mais do que a conta")
+    finally:
+        (CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET,
+         CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID) = antes2
+        for chave, valor in guardadas2.items():
+            os.environ.pop(chave, None)
+            if valor is not None:
+                os.environ[chave] = valor
+
+    falso5 = BrokerFalso(velas=velas_falsas(2000), conta=333)
+    falso5.start()
+    try:
+        antes3 = (CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN)
+        try:
+            CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN = "a", "b", "c"
+            lista = buscar_contas(Ligacao("127.0.0.1", falso5.porta, tls=False, timeout=10))
+            codigo, texto = capturar(escrever_contas, lista)
+            verificar(codigo == 0, "com uma conta demo a servir, o caminho fecha bem")
+            verificar("CTRADER_ACCOUNT_ID = 333" in texto,
+                      "e escreve a linha pronta a copiar, com o numero la dentro")
+            verificar("demo" in texto and "Falso" in texto,
+                      "com o tipo da conta e o broker a vista")
+        finally:
+            (CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET,
+             CTRADER_ACCESS_TOKEN) = antes3
+    finally:
+        falso5.parar()
+
+    codigo, texto = capturar(escrever_contas, [])
+    verificar(codigo == 2 and "OAuth" in texto,
+              "um token que nao abre conta nenhuma diz o que refazer")
+
+    # Uma ligacao que nao existe tem de dar uma FRASE, nao um traceback: se
+    # subisse crua, o `main` nem sequer a apanhava — so apanha ErroBroker.
+    morto = socket.socket()
+    morto.bind(("127.0.0.1", 0))
+    porta_morta = morto.getsockname()[1]
+    morto.close()
+    try:
+        Ligacao("127.0.0.1", porta_morta, tls=False, timeout=3).abrir()
+        verificar(False, "ligar a uma porta fechada tem de levantar")
+    except ErroBroker as e:
+        verificar("nao consegui ligar" in str(e) or "nao respondeu" in str(e),
+                  "uma falha de rede sai como ErroBroker, com uma frase")
+    except Exception as e:
+        verificar(False, f"a falha de rede subiu crua: {type(e).__name__}")
+
+    print("\n=== 13. O Estado nao atravessa threads ===")
     with Estado(tmp / "threads.db") as e0:
         recado = {}
 
@@ -3784,7 +3881,7 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
         e0.exigir_mesma_thread("o teste")
         verificar(True, "na propria thread nao se queixa de nada")
 
-    print("\n=== 13. O estado sobrevive a um restart ===")
+    print("\n=== 14. O estado sobrevive a um restart ===")
     caminho = tmp / "restart.db"
     with Estado(caminho) as e1:
         e1.gravar_maquina("armado", armado={"nivel": "max H1", "gatilho": 123.0,
@@ -3831,21 +3928,26 @@ def montar() -> tuple[CTrader, object]:
     return broker, aviso
 
 
-def cmd_contas() -> int:
-    """Lista as contas que o teu access token abre, com o id de cada uma.
+def buscar_contas(ligacao: Ligacao | None = None) -> list[dict]:
+    """Pergunta ao broker que contas o access token abre. Sem autenticar conta.
 
-    Existe porque o ctidTraderAccountId nao esta no ecra das credenciais do
-    Spotware — e nao ha maneira de o adivinhar. So precisa das tres credenciais
-    que esse ecra te da.
+    E o passo da conta que exigiria o id que se veio descobrir, por isso fica
+    de fora. So precisa das tres credenciais do ecra do Spotware.
     """
-    print(f"{carimbo()} host: {host_da_conta()}:{PORTA_JSON} (JSON)")
-    broker = CTrader(SIMBOLO, exigir_conta=False)
+    broker = CTrader(SIMBOLO, exigir_conta=False, ligacao=ligacao)
     try:
         broker.ligar(autenticar_conta=False)
-        contas = broker.contas_do_token()
+        return broker.contas_do_token()
     finally:
         broker.fechar()
 
+
+def escrever_contas(contas: list[dict]) -> int:
+    """A lista, e a linha para copiar. Um caminho so, usado em dois sitios.
+
+    Duas versoes da mesma frase divergem, e a que diverge e sempre a que a
+    pessoa esta a ler.
+    """
     if not contas:
         print("\nEste token nao abre conta nenhuma. Refaz o fluxo OAuth e confirma "
               "que autorizaste o acesso as contas de trading.")
@@ -3868,6 +3970,30 @@ def cmd_contas() -> int:
     print(f"\nPoe isto no topo do ficheiro, na seccao CONFIGURACAO:\n\n"
           f"    CTRADER_ACCOUNT_ID = {querida[0]['id']}")
     return 0
+
+
+def cmd_contas() -> int:
+    """Lista as contas que o teu access token abre, com o id de cada uma.
+
+    Existe porque o ctidTraderAccountId nao esta no ecra das credenciais do
+    Spotware — e nao ha maneira de o adivinhar.
+    """
+    print(f"{carimbo()} host: {host_da_conta()}:{PORTA_JSON} (JSON)")
+    return escrever_contas(buscar_contas())
+
+
+def so_falta_a_conta() -> bool:
+    """As tres credenciais postas e o id da conta por por.
+
+    E o unico caso em que o programa SABE a resposta a pergunta que o esta a
+    bloquear. Reconhece-lo aqui e o que permite ir busca-la em vez de mandar a
+    pessoa correr outro comando.
+    """
+    try:
+        credenciais(exigir_conta=False)
+    except ErroBroker:
+        return False
+    return not _valor(CTRADER_ACCOUNT_ID or "", "CTRADER_ACCOUNT_ID")
 
 
 def cmd_verificar() -> int:
@@ -3957,6 +4083,42 @@ def correr() -> int:
     return 0
 
 
+def falhar(texto: str) -> int:
+    """A explicacao, emoldurada, em STDOUT, e com flush antes de sair.
+
+    Em stderr isto perde-se: num depurador e uma corrente separada, ordenada
+    por acaso, e as vezes atras do modal do SystemExit. A mensagem estava
+    escrita e certa das duas vezes que ninguem a leu — o que faltava era chegar
+    aos olhos de quem precisava dela.
+    """
+    risco = "=" * 68
+    print(f"\n{risco}\n  NAO ARRANQUEI\n{risco}\n{texto}\n{risco}")
+    sys.stdout.flush()
+    return 2
+
+
+def atalho_da_conta() -> int:
+    """Falta o id da conta, e eu sei como o descobrir. Entao vou descobri-lo.
+
+    Mandar alguem correr um comando quando se podia ter corrido o comando e
+    fazer da mensagem de erro um trabalho de casa.
+    """
+    print(f"{carimbo()} host: {host_da_conta()}:{PORTA_JSON} (JSON)")
+    risco = "=" * 68
+    print(f"\n{risco}\n  NAO ARRANQUEI: falta o CTRADER_ACCOUNT_ID\n{risco}")
+    print("As outras tres credenciais estao la, por isso fui perguntar ao broker\n"
+          "qual e o numero que te falta.")
+    try:
+        contas = buscar_contas()
+    except ErroBroker as e:
+        return falhar(f"falta o CTRADER_ACCOUNT_ID no topo do ficheiro, e nao "
+                      f"consegui ir busca-lo:\n\n  {e}")
+    codigo = escrever_contas(contas)
+    print(f"\n{risco}")
+    sys.stdout.flush()
+    return codigo or 2
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Agente de trading ao vivo: o modelo decide, o codigo mede e executa.")
@@ -3975,19 +4137,26 @@ def main(argv=None) -> int:
     try:
         if a.comando == "contas":
             return cmd_contas()
+        # Antes de qualquer coisa que precise do id da conta: se ele e a UNICA
+        # coisa que falta, nao ha razao para parar a pedir uma coisa que se
+        # pode ir buscar.
+        if so_falta_a_conta():
+            return atalho_da_conta()
         if a.comando == "verificar":
             return cmd_verificar()
         if a.comando == "contexto":
             return cmd_contexto()
         return correr()
     except ErroBroker as e:
-        print(f"\n{e}", file=sys.stderr)
-        return 2
+        return falhar(str(e))
 
 
 if __name__ == "__main__":
     _codigo = main()
-    # Só sai com codigo se houver mesmo um erro: assim o depurador nao mostra
-    # um SystemExit(0) como se fosse uma excecao.
-    if _codigo:
+    # O codigo de saida so serve para automacao. Debaixo de um depurador nao ha
+    # automacao nenhuma — ha uma pessoa a olhar, e o SystemExit tapa-lhe a
+    # mensagem com um modal. `sys.gettrace()` diz se o debugpy ou o pdb estao
+    # agarrados ao processo; se estiverem, sai-se em silencio e a explicacao
+    # que acabou de ser impressa fica a ser a ultima coisa na consola.
+    if _codigo and sys.gettrace() is None:
         sys.exit(_codigo)
