@@ -56,25 +56,31 @@ A passagem a live nao e uma constante que se troca. Sao tres fechaduras:
 
 CREDENCIAIS
 -----------
-Nunca no ficheiro. Vai buscar ao ambiente. As tres primeiras estao no ecra da
-tua aplicacao em https://connect.spotware.com; a QUARTA NAO ESTA LA — e o
-ctidTraderAccountId, e so a API o sabe. Define as tres, corre
-`python agente.py contas`, e ele diz-te o id.
+No topo deste ficheiro, na seccao CONFIGURACAO. Abres, preenches, corres.
 
     CTRADER_CLIENT_ID        da tua aplicacao em connect.spotware.com
     CTRADER_CLIENT_SECRET
     CTRADER_ACCESS_TOKEN     do fluxo OAuth da tua aplicacao (expira em ~30 dias)
-    CTRADER_ACCOUNT_ID       ctidTraderAccountId — vem do `agente.py contas`
-    TELEGRAM_BOT_TOKEN       opcional: sem isto corre sem Telegram
+    CTRADER_ACCOUNT_ID       NAO esta naquele ecra — ve abaixo
+    TELEGRAM_TOKEN           opcional: sem isto corre sem Telegram
 
-Em Windows, `export` NAO existe e nao da erro nenhum — so nao faz nada:
+O ctidTraderAccountId nao aparece no ecra das credenciais e nao ha maneira de o
+adivinhar: so a API o sabe. Preenche as tres de cima, corre
 
-    PowerShell   $env:CTRADER_CLIENT_ID = "..."
-    cmd.exe      set CTRADER_CLIENT_ID=...
-    bash/macOS   export CTRADER_CLIENT_ID=...
+    python agente.py contas
 
-E as variaveis so valem para a janela onde as escreveste. Fechaste o terminal,
-tens de as por outra vez.
+e ele lista as contas que o teu token abre — id, demo ou live, broker — e
+escreve-te a linha para copiares.
+
+UMA COISA, E E A UNICA: este ficheiro esta debaixo de git. Se puseres aqui os
+valores e fizeres commit, eles ficam no historico do repositorio mesmo depois
+de os apagares do ficheiro. A copia versionada tem os campos vazios; a que tem
+os teus valores e a tua. Se um dia isto for parar a um repositorio, muda o
+segredo antes de fazeres mais nada.
+
+(Se preferires nao ter o segredo dentro de um ficheiro, cada uma destas
+constantes cai para a variavel de ambiente com o mesmo nome quando fica vazia.
+Nao precisas de saber isto para nada; fica dito para quem quiser.)
 
 O ficheiro NAO fala protobuf. A Open API tambem serve JSON, na porta 5036, com
 um prefixo de comprimento de 4 bytes big-endian a frente de cada mensagem. Sao
@@ -125,6 +131,22 @@ CONTA = "demo"
 
 HOSTS = {"demo": "demo.ctraderapi.com", "live": "live.ctraderapi.com"}
 PORTA_JSON = 5036          # JSON. A 5035 e protobuf, e nao e o que falamos.
+
+# --- Credenciais do cTrader ------------------------------------------------
+# As tres primeiras estao em https://connect.spotware.com, na tua aplicacao.
+#
+# A QUARTA NAO ESTA LA. O ctidTraderAccountId so a API o sabe: preenche as tres
+# de cima, corre `python agente.py contas`, e ele diz-te o numero.
+#
+# AVISO, e e o unico: este ficheiro esta debaixo de git. Se puseres aqui os
+# valores e fizeres commit, eles vao para o historico do repositorio e ficam la
+# mesmo depois de os apagares. A copia versionada fica com estes campos VAZIOS;
+# a que tem os teus valores e a tua, na tua maquina. Se um dia isto for parar a
+# um repositorio, muda o segredo antes de qualquer outra coisa.
+CTRADER_CLIENT_ID = ""
+CTRADER_CLIENT_SECRET = ""
+CTRADER_ACCESS_TOKEN = ""      # expira em ~30 dias
+CTRADER_ACCOUNT_ID = 0         # o numero que o `contas` te der
 
 # O mercado. O nome tem de bater com o do teu broker — o `verificar` diz-te
 # quais e que existem se este nao bater.
@@ -919,60 +941,57 @@ class Ligacao:
                         "payloadType": tipo, "payload": carga})
 
 
-def _como_definir(chaves) -> str:
-    """As tres sintaxes, porque `export` nao existe em Windows.
+def _valor(constante, chave: str) -> str:
+    """A constante do topo do ficheiro; o ambiente so se ela estiver vazia.
 
-    Mandar "faz export X=..." a quem esta no PowerShell e mandar a pessoa
-    procurar o problema no sitio errado: o comando nao da erro, so nao faz
-    nada, e a variavel continua a faltar na volta seguinte.
+    A constante manda, porque e onde tu a poes. O ambiente fica atras dela para
+    quem preferir nao ter o segredo dentro de um ficheiro — nao tens de saber
+    que existe, e nunca te obriga a nada.
     """
-    return ("\n  PowerShell:\n" +
-            "\n".join(f'    $env:{c} = "..."' for c in chaves) +
-            "\n  cmd.exe:\n" +
-            "\n".join(f"    set {c}=..." for c in chaves) +
-            "\n  bash / macOS / Linux:\n" +
-            "\n".join(f"    export {c}=..." for c in chaves))
+    escrito = str(constante or "").strip()
+    return escrito or (os.environ.get(chave) or "").strip()
 
 
 def credenciais(*, exigir_conta: bool = True) -> dict:
-    """As credenciais, do ambiente. Nunca do ficheiro, nunca do git.
+    """As credenciais, da CONFIGURACAO no topo deste ficheiro.
 
     O id da conta e opcional para o comando `contas` — e ele que existe para
     to descobrir. Exigi-lo ai seria pedir-te a resposta da pergunta que vieste
     fazer: o ctidTraderAccountId NAO aparece no ecra das credenciais do
     Spotware, e o unico sitio onde ele vive e do outro lado desta ligacao.
     """
-    precisas = [("CTRADER_CLIENT_ID", "cliente"),
-                ("CTRADER_CLIENT_SECRET", "segredo"),
-                ("CTRADER_ACCESS_TOKEN", "token")]
-    if exigir_conta:
-        precisas.append(("CTRADER_ACCOUNT_ID", "conta"))
+    fora = {
+        "cliente": _valor(CTRADER_CLIENT_ID, "CTRADER_CLIENT_ID"),
+        "segredo": _valor(CTRADER_CLIENT_SECRET, "CTRADER_CLIENT_SECRET"),
+        "token": _valor(CTRADER_ACCESS_TOKEN, "CTRADER_ACCESS_TOKEN"),
+        "conta": _valor(CTRADER_ACCOUNT_ID or "", "CTRADER_ACCOUNT_ID"),
+    }
+    faltam = [c for c, n in (("CTRADER_CLIENT_ID", "cliente"),
+                             ("CTRADER_CLIENT_SECRET", "segredo"),
+                             ("CTRADER_ACCESS_TOKEN", "token"))
+              if not fora[n]]
+    if exigir_conta and not fora["conta"]:
+        faltam.append("CTRADER_ACCOUNT_ID")
 
-    faltam, fora = [], {"conta": (os.environ.get("CTRADER_ACCOUNT_ID") or "").strip()}
-    for chave, nome in precisas:
-        valor = (os.environ.get(chave) or "").strip()
-        if not valor:
-            faltam.append(chave)
-        fora[nome] = valor
     if faltam:
-        recado = ("faltam credenciais no ambiente: " + ", ".join(faltam) +
-                  "\n\nAs tres primeiras estao em https://connect.spotware.com, na tua "
-                  "aplicacao." + _como_definir(faltam))
+        recado = ("falta preencher no topo deste ficheiro, na seccao "
+                  "CONFIGURACAO: " + ", ".join(faltam) + "\n\n" +
+                  "\n".join(f'    {c} = "..."' for c in faltam if c != "CTRADER_ACCOUNT_ID") +
+                  ("\n    CTRADER_ACCOUNT_ID = 0" if "CTRADER_ACCOUNT_ID" in faltam else ""))
+        if [c for c in faltam if c != "CTRADER_ACCOUNT_ID"]:
+            recado += "\n\nAs tres primeiras estao em https://connect.spotware.com, na tua aplicacao."
         if "CTRADER_ACCOUNT_ID" in faltam:
             recado += ("\n\nO CTRADER_ACCOUNT_ID NAO esta nesse ecra: e o "
                        "ctidTraderAccountId, e so a API o sabe. Com as outras tres "
-                       "ja definidas, corre\n    python agente.py contas\n"
-                       "e ele lista as contas que o teu token abre, com o id de cada uma.")
+                       "ja preenchidas, corre\n    python agente.py contas\n"
+                       "e ele diz-te o numero para pores aqui.")
         raise ErroBroker(recado)
 
-    if fora["conta"]:
-        try:
-            fora["conta"] = int(fora["conta"])
-        except ValueError:
-            raise ErroBroker(f"CTRADER_ACCOUNT_ID tem de ser um numero, e e "
-                             f"{fora['conta']!r}") from None
-    else:
-        fora["conta"] = 0
+    try:
+        fora["conta"] = int(fora["conta"]) if fora["conta"] else 0
+    except ValueError:
+        raise ErroBroker(f"CTRADER_ACCOUNT_ID tem de ser um numero, e e "
+                         f"{fora['conta']!r}") from None
     return fora
 
 
@@ -3698,24 +3717,49 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
     finally:
         falso4.parar()
 
+    global CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID
+    antes_consts = (CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET,
+                    CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID)
     guardadas = {c: os.environ.pop(c, None) for c in
                  ("CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET",
                   "CTRADER_ACCESS_TOKEN", "CTRADER_ACCOUNT_ID")}
     try:
-        os.environ.update({"CTRADER_CLIENT_ID": "a", "CTRADER_CLIENT_SECRET": "b",
-                           "CTRADER_ACCESS_TOKEN": "c"})
+        CTRADER_CLIENT_ID = CTRADER_CLIENT_SECRET = CTRADER_ACCESS_TOKEN = ""
+        CTRADER_ACCOUNT_ID = 0
+        try:
+            credenciais()
+            verificar(False, "sem credenciais nenhumas, o arranque tem de parar")
+        except ErroBroker as e:
+            verificar("CONFIGURACAO" in str(e),
+                      "o erro manda-te ao topo do ficheiro, que e onde se preenche")
+            verificar("connect.spotware.com" in str(e),
+                      "e diz onde se apanham as tres primeiras")
+
+        CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN = "a", "b", "c"
         try:
             credenciais()
             verificar(False, "sem o id da conta, o arranque normal tem de parar")
         except ErroBroker as e:
             verificar("agente.py contas" in str(e),
                       "e o erro do id em falta manda-te ao comando que o descobre")
-            verificar("$env:" in str(e) and "set " in str(e) and "export " in str(e),
-                      "e da as tres sintaxes, porque `export` nao existe em Windows")
         sem_conta = credenciais(exigir_conta=False)
-        verificar(sem_conta["conta"] == 0,
+        verificar(sem_conta["conta"] == 0 and sem_conta["cliente"] == "a",
                   "o `contas` corre sem o id da conta — e o que ele vem descobrir")
+
+        CTRADER_ACCOUNT_ID = 777
+        verificar(credenciais()["conta"] == 777,
+                  "o id da conta le-se da constante, e vem como numero")
+
+        # A constante manda; o ambiente so entra quando ela esta vazia.
+        os.environ["CTRADER_CLIENT_ID"] = "do-ambiente"
+        verificar(credenciais()["cliente"] == "a",
+                  "a constante do ficheiro ganha ao ambiente")
+        CTRADER_CLIENT_ID = ""
+        verificar(credenciais()["cliente"] == "do-ambiente",
+                  "e o ambiente so entra quando a constante fica vazia")
     finally:
+        (CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET,
+         CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID) = antes_consts
         for chave, valor in guardadas.items():
             os.environ.pop(chave, None)
             if valor is not None:
@@ -3821,8 +3865,8 @@ def cmd_contas() -> int:
         print(f"E nao ha nenhuma. Ou mudas o CONTA, ou crias uma conta "
               f"{'live' if CONTA == 'live' else 'demo'} no teu broker.")
         return 2
-    print(_como_definir(["CTRADER_ACCOUNT_ID"]).replace('"..."', f'"{querida[0]["id"]}"')
-          .replace("=...", f"={querida[0]['id']}"))
+    print(f"\nPoe isto no topo do ficheiro, na seccao CONFIGURACAO:\n\n"
+          f"    CTRADER_ACCOUNT_ID = {querida[0]['id']}")
     return 0
 
 
