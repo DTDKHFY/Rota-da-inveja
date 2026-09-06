@@ -4,6 +4,7 @@
 
     python3 agente.py             corre (vigia + bot)
     python3 agente.py contas      que contas o teu token abre, e o id de cada uma
+    python3 agente.py diagnostico que enquadramento o teu broker aceita
     python3 agente.py verificar   liga, autentica, diz o host, a conta e o saldo
     python3 agente.py contexto    escreve a fotografia do mercado agora, e sai
     python3 agente.py teste       autoteste: sem broker, sem Ollama, sem Telegram
@@ -89,7 +90,9 @@ trinta linhas de socket, e poupa o protobuf, o Twisted e o SDK.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
+import hashlib
 import io
 import json
 import logging
@@ -133,6 +136,22 @@ CONTA = "demo"
 
 HOSTS = {"demo": "demo.ctraderapi.com", "live": "live.ctraderapi.com"}
 PORTA_JSON = 5036          # JSON. A 5035 e protobuf, e nao e o que falamos.
+
+# Como e que uma mensagem se delimita dentro da ligacao. A porta 5036 aceita
+# as duas coisas, e a escolha nao e de gosto:
+#
+#   "websocket"  cada mensagem e um quadro de texto do RFC 6455. O enquadramento
+#                esta especificado ao bit, por isso ou esta certo ou nao liga —
+#                nao ha uma versao que quase funciona. E a omissao por isso.
+#   "tcp"        prefixo de 4 bytes com o comprimento, a moda do Int32String-
+#                Receiver do Twisted. Mais simples, mas o sentido dos bytes
+#                nao esta escrito em lado nenhum que eu consiga ler.
+#
+# Se um deles nao ligar, `python agente.py diagnostico` experimenta os tres
+# (websocket, tcp big-endian, tcp little-endian) e diz qual e que o TEU broker
+# aceita — em vez de ficarmos os dois a adivinhar.
+TRANSPORTE = "websocket"
+ORDEM_BYTES = ">I"         # so para TRANSPORTE = "tcp". ">I" grande, "<I" pequeno.
 
 # --- Credenciais do cTrader ------------------------------------------------
 # As tres primeiras estao em https://connect.spotware.com, na tua aplicacao.
@@ -758,6 +777,64 @@ SEGUNDOS_HEARTBEAT = 10       # a ligacao cai sozinha sem isto
 TIMEOUT_PEDIDO = 30
 
 
+# ---------------------------------------------------------------------------
+#  WebSocket (RFC 6455), o minimo que serve
+#
+#  Escrito a mao porque uma biblioteca de WebSocket seria a primeira
+#  dependencia deste ficheiro alem do requests — e porque a parte de que
+#  precisamos sao noventa linhas com uma especificacao publica ao bit. E
+#  exatamente por estar especificada ao bit que se escolheu isto: ou o
+#  enquadramento esta certo, ou nao liga. Nao ha uma versao que quase funciona.
+# ---------------------------------------------------------------------------
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"   # o do RFC, nao e um segredo
+WS_TEXTO, WS_BINARIO, WS_FECHO, WS_PING, WS_PONG = 0x1, 0x2, 0x8, 0x9, 0xA
+
+
+def ws_mascarar(dados: bytes, chave: bytes) -> bytes:
+    """XOR com a chave, a repetir. O RFC obriga o CLIENTE a mascarar."""
+    return bytes(b ^ chave[i % 4] for i, b in enumerate(dados))
+
+
+def ws_quadro(carga: bytes, opcode: int = WS_TEXTO, *, mascarar: bool) -> bytes:
+    """Um quadro completo, FIN a 1: nao fragmentamos o que escrevemos."""
+    cabeca = bytes([0x80 | opcode])
+    n = len(carga)
+    marca = 0x80 if mascarar else 0x00
+    if n < 126:
+        cabeca += bytes([marca | n])
+    elif n < 65536:
+        cabeca += bytes([marca | 126]) + struct.pack(">H", n)
+    else:
+        cabeca += bytes([marca | 127]) + struct.pack(">Q", n)
+    if not mascarar:
+        return cabeca + carga
+    chave = os.urandom(4)
+    return cabeca + chave + ws_mascarar(carga, chave)
+
+
+def ws_ler_quadro(ler_exato) -> tuple[int, bytes]:
+    """Le UM quadro. `ler_exato(n)` tem de devolver exatamente n bytes."""
+    b0, b1 = ler_exato(2)
+    opcode = b0 & 0x0F
+    mascarado = bool(b1 & 0x80)
+    n = b1 & 0x7F
+    if n == 126:
+        (n,) = struct.unpack(">H", ler_exato(2))
+    elif n == 127:
+        (n,) = struct.unpack(">Q", ler_exato(8))
+    chave = ler_exato(4) if mascarado else b""
+    carga = ler_exato(n) if n else b""
+    if mascarado:
+        carga = ws_mascarar(carga, chave)
+    return opcode, carga
+
+
+def ws_aceite(chave: str) -> str:
+    """A resposta ao Sec-WebSocket-Key, que prova que do outro lado ha um WS."""
+    return base64.b64encode(
+        hashlib.sha1((chave + WS_GUID).encode("ascii")).digest()).decode("ascii")
+
+
 def _ler_exato(sock, n: int) -> bytes:
     """Le exatamente n bytes, ou levanta. `recv` devolve o que quiser."""
     partes, faltam = [], n
@@ -806,8 +883,14 @@ class Ligacao:
     """
 
     def __init__(self, host: str, porta: int = PORTA_JSON, *, tls: bool = True,
-                 timeout: int = TIMEOUT_PEDIDO):
+                 timeout: int = TIMEOUT_PEDIDO, transporte: str = "",
+                 ordem: str = ""):
         self.host, self.porta, self.tls, self.timeout = host, porta, tls, timeout
+        self.transporte = (transporte or TRANSPORTE).lower()
+        self.ordem = ordem or ORDEM_BYTES
+        if self.transporte not in ("websocket", "tcp"):
+            raise ErroBroker(f"TRANSPORTE e {self.transporte!r}; so conheco "
+                             f'"websocket" e "tcp".')
         self.sock = None
         self._envio = threading.Lock()
         self._pendentes: dict[str, dict] = {}
@@ -843,13 +926,95 @@ class Ligacao:
                 f"Costuma ser um antivirus ou um proxy a inspecionar a ligacao.") from e
         except OSError as e:
             raise ErroBroker(f"nao consegui ligar a {self.host}:{self.porta}: {e}") from e
-        cru.settimeout(None)          # o leitor bloqueia; o timeout e por pedido
+        cru.settimeout(self.timeout)  # o aperto de mao nao pode ficar pendurado
         self.sock, self.morreu = cru, ""
+        if self.transporte == "websocket":
+            self._aperto_de_mao()
+        cru.settimeout(None)          # o leitor bloqueia; o timeout e por pedido
         self._parar.clear()
         self._leitor = threading.Thread(target=self._ler_sempre, name="ct-leitor", daemon=True)
         self._leitor.start()
         self._pulso = threading.Thread(target=self._bater_sempre, name="ct-pulso", daemon=True)
         self._pulso.start()
+
+    def _aperto_de_mao(self) -> None:
+        """O GET/101 do RFC 6455, e a prova de que do outro lado ha um WebSocket.
+
+        A chave de resposta e conferida: um proxy ou um portal de rede que
+        devolva um 200 com uma pagina bonita nao passa daqui a fingir que e o
+        broker.
+        """
+        chave = base64.b64encode(os.urandom(16)).decode("ascii")
+        pedido = (
+            f"GET / HTTP/1.1\r\n"
+            f"Host: {self.host}:{self.porta}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {chave}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n")
+        self.sock.sendall(pedido.encode("ascii"))
+
+        # Byte a byte ate ao \r\n\r\n: ler de mais aqui comia o principio do
+        # primeiro quadro, e o primeiro quadro e a resposta a autenticacao.
+        cabecalho = b""
+        while not cabecalho.endswith(b"\r\n\r\n"):
+            pedaco = self.sock.recv(1)
+            if not pedaco:
+                raise ErroBroker("o broker fechou a ligacao durante o aperto de mao "
+                                 "do WebSocket")
+            cabecalho += pedaco
+            if len(cabecalho) > 16_384:
+                raise ErroBroker("o cabecalho de resposta nunca mais acabava")
+
+        texto = cabecalho.decode("latin-1")
+        primeira = texto.split("\r\n", 1)[0]
+        if "101" not in primeira:
+            raise ErroBroker(
+                f"o broker recusou o WebSocket: {primeira!r}\n"
+                f"Se isto for um 200 com HTML, ha um proxy ou um portal de rede pelo "
+                f"meio. Se for outra coisa, experimenta TRANSPORTE = \"tcp\".")
+        esperado = ws_aceite(chave)
+        if esperado.lower() not in texto.lower():
+            raise ErroBroker(
+                "o Sec-WebSocket-Accept que veio nao bate com a chave que mandei: "
+                "do outro lado esta alguma coisa, mas nao e um WebSocket.")
+
+    # -- o enquadramento, que e a unica coisa que muda entre transportes ----
+    def _enviar_quadro(self, carga: bytes) -> None:
+        with self._envio:
+            sock = self.sock
+            if sock is None:
+                raise ErroBroker("nao estou ligado ao broker")
+            if self.transporte == "websocket":
+                sock.sendall(ws_quadro(carga, WS_TEXTO, mascarar=True))
+            else:
+                sock.sendall(struct.pack(self.ordem, len(carga)) + carga)
+
+    def _ler_quadro(self) -> bytes | None:
+        """A carga da proxima mensagem, ou None se o quadro nao era uma.
+
+        Devolver None em vez de saltar por dentro mantem o ciclo do leitor com
+        uma unica saida: um ping continua a ser uma volta do ciclo, e nao uma
+        recursao escondida.
+        """
+        if self.transporte != "websocket":
+            (tamanho,) = struct.unpack(self.ordem, _ler_exato(self.sock, 4))
+            return _ler_exato(self.sock, tamanho)
+
+        opcode, carga = ws_ler_quadro(lambda n: _ler_exato(self.sock, n))
+        if opcode in (WS_TEXTO, WS_BINARIO):
+            return carga
+        if opcode == WS_PING:
+            self._enviar_bruto(ws_quadro(carga, WS_PONG, mascarar=True))
+            return None
+        if opcode == WS_FECHO:
+            raise ErroBroker("o broker mandou fechar o WebSocket")
+        return None                   # pong, ou um opcode que nao me diz nada
+
+    def _enviar_bruto(self, dados: bytes) -> None:
+        with self._envio:
+            if self.sock is not None:
+                self.sock.sendall(dados)
 
     def fechar(self) -> None:
         self._parar.set()
@@ -871,18 +1036,14 @@ class Ligacao:
 
     # -- escrever e ler -----------------------------------------------------
     def _escrever(self, mensagem: dict) -> None:
-        carga = json.dumps(mensagem).encode("utf-8")
-        with self._envio:
-            sock = self.sock
-            if sock is None:
-                raise ErroBroker("nao estou ligado ao broker")
-            sock.sendall(struct.pack(">I", len(carga)) + carga)
+        self._enviar_quadro(json.dumps(mensagem).encode("utf-8"))
 
     def _ler_sempre(self) -> None:
         while not self._parar.is_set():
             try:
-                (tamanho,) = struct.unpack(">I", _ler_exato(self.sock, 4))
-                bruto = _ler_exato(self.sock, tamanho)
+                bruto = self._ler_quadro()
+                if bruto is None:     # ping, pong: nao e mensagem nenhuma
+                    continue
                 mensagem = json.loads(bruto.decode("utf-8", "replace"))
             except Exception as e:                    # noqa: BLE001 — ver abaixo
                 # Qualquer coisa que rebente aqui mata a ligacao, e a ligacao
@@ -3157,9 +3318,12 @@ class BrokerFalso(threading.Thread):
     """Um cTrader de mentira. Mesmo enquadramento, mesmos payloadType."""
 
     def __init__(self, velas=None, *, conta: int = 111, saldo: float = 10_000.0,
-                 live: bool = False):
+                 live: bool = False, ordem: str = ">I"):
         super().__init__(name="broker-falso", daemon=True)
         self.live = live
+        # O transporte nao se configura: deteta-se, como o real faz. Assim o
+        # mesmo falso serve os dois caminhos e os testes cobrem os dois.
+        self.ordem, self.transporte = ordem, "?"
         self.velas = velas if velas is not None else velas_falsas(45 * 1440)
         self.conta, self.saldo = conta, saldo
         self.posicoes: list[dict] = []
@@ -3188,12 +3352,44 @@ class BrokerFalso(threading.Thread):
     def run(self) -> None:
         try:
             self._cliente, _ = self.servidor.accept()
+            primeiros = _ler_exato(self._cliente, 4)
         except OSError:
             return
+        except ErroBroker:
+            return
+
+        pendente = b""
+        if primeiros == b"GET ":
+            self.transporte = "websocket"
+            try:
+                self._aperto_de_mao()
+            except Exception:
+                return
+        else:
+            self.transporte = "tcp"
+            pendente = primeiros
+
         while not self._parar.is_set():
             try:
-                (tamanho,) = struct.unpack(">I", _ler_exato(self._cliente, 4))
-                pedido = json.loads(_ler_exato(self._cliente, tamanho).decode("utf-8"))
+                if self.transporte == "websocket":
+                    opcode, carga = ws_ler_quadro(lambda n: _ler_exato(self._cliente, n))
+                    if opcode == WS_FECHO:
+                        return
+                    if opcode not in (WS_TEXTO, WS_BINARIO):
+                        continue
+                else:
+                    if pendente:
+                        cabeca, pendente = pendente, b""
+                    else:
+                        cabeca = _ler_exato(self._cliente, 4)
+                    (tamanho,) = struct.unpack(self.ordem, cabeca)
+                    # Um comprimento absurdo quer dizer que o outro lado esta a
+                    # falar outra lingua. Fecha-se, que e o que um servidor a
+                    # serio faz — e e o que faz o `diagnostico` poder decidir.
+                    if tamanho > 1_000_000:
+                        return
+                    carga = _ler_exato(self._cliente, tamanho)
+                pedido = json.loads(carga.decode("utf-8"))
             except Exception:
                 return
             try:
@@ -3201,12 +3397,31 @@ class BrokerFalso(threading.Thread):
             except Exception:
                 log.exception("o broker falso rebentou")
 
+    def _aperto_de_mao(self) -> None:
+        cabecalho = b"GET "
+        while not cabecalho.endswith(b"\r\n\r\n"):
+            pedaco = self._cliente.recv(1)
+            if not pedaco:
+                raise ErroBroker("aperto de mao a meio")
+            cabecalho += pedaco
+        chave = ""
+        for linha in cabecalho.decode("latin-1").split("\r\n"):
+            if linha.lower().startswith("sec-websocket-key:"):
+                chave = linha.split(":", 1)[1].strip()
+        self._cliente.sendall(
+            ("HTTP/1.1 101 Switching Protocols\r\n"
+             "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+             f"Sec-WebSocket-Accept: {ws_aceite(chave)}\r\n\r\n").encode("ascii"))
+
     def _enviar(self, tipo: int, carga: dict, cid: str = "") -> None:
         mensagem = {"payloadType": tipo, "payload": carga}
         if cid:
             mensagem["clientMsgId"] = cid
         bruto = json.dumps(mensagem).encode("utf-8")
-        self._cliente.sendall(struct.pack(">I", len(bruto)) + bruto)
+        if self.transporte == "websocket":
+            self._cliente.sendall(ws_quadro(bruto, WS_TEXTO, mascarar=False))
+        else:
+            self._cliente.sendall(struct.pack(self.ordem, len(bruto)) + bruto)
 
     def _tratar(self, pedido: dict) -> None:
         tipo = int(pedido.get("payloadType") or 0)
@@ -3286,6 +3501,7 @@ def broker_de_teste(falso: BrokerFalso) -> CTrader:
     lig = Ligacao("127.0.0.1", falso.porta, tls=False, timeout=10)
     creds = {"cliente": "id", "segredo": "segredo", "token": "tok", "conta": falso.conta}
     broker = CTrader("EURUSD", ligacao=lig, creds=creds)
+
     broker.ligar()
     broker.resolver_simbolo()
     return broker
@@ -3486,10 +3702,76 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
         time.sleep(0.4)
         verificar(not broker.posicoes(), "depois de fechar, o reconcile ja nao ve nada")
         verificar(broker.execucoes_recentes(0), "os eventos sem clientMsgId foram apanhados")
+        verificar(falso.transporte == TRANSPORTE,
+                  f"e tudo isto correu pelo transporte de omissao ({TRANSPORTE})")
     finally:
         if broker:
             broker.fechar()
         falso.parar()
+
+    # -- o codec do WebSocket, contra o RFC --------------------------------
+    verificar(ws_mascarar(ws_mascarar(b"abc", b"\x01\x02\x03\x04"),
+                          b"\x01\x02\x03\x04") == b"abc",
+              "mascarar duas vezes com a mesma chave devolve o original")
+    verificar(ws_aceite("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+              "o Sec-WebSocket-Accept bate com o exemplo do RFC 6455")
+    for n in (0, 1, 125, 126, 127, 65_535, 65_536):
+        carga = b"x" * n
+        quadro = ws_quadro(carga, WS_TEXTO, mascarar=True)
+        fluxo = {"i": 0}
+
+        def puxar(quantos, _q=quadro, _f=fluxo):
+            # O `ws_ler_quadro` pede os DOIS primeiros bytes a cabeca: comecar
+            # a servir a partir do byte 1 era eu a comer o opcode antes de ele
+            # o ler, e depois a culpar o codec.
+            pedaco = _q[_f["i"]:_f["i"] + quantos]
+            _f["i"] += quantos
+            return pedaco
+
+        opcode, lida = ws_ler_quadro(puxar)
+        if lida != carga or opcode != WS_TEXTO:
+            verificar(False, f"um quadro de {n} bytes sobrevive a ida e volta")
+            break
+    else:
+        verificar(True, "os quadros sobrevivem a ida e volta nos limites de 125/126/65535/65536")
+
+    # -- os tres enquadramentos, e a prova de que o errado NAO passa --------
+    def provar_contra(falso_, transporte, ordem):
+        antes = (CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN)
+        try:
+            globals().update(CTRADER_CLIENT_ID="a", CTRADER_CLIENT_SECRET="b",
+                             CTRADER_ACCESS_TOKEN="c")
+            return provar_transporte(transporte, ordem, host="127.0.0.1",
+                                     porta=falso_.porta, tls=False)
+        finally:
+            globals().update(CTRADER_CLIENT_ID=antes[0], CTRADER_CLIENT_SECRET=antes[1],
+                             CTRADER_ACCESS_TOKEN=antes[2])
+
+    for nome, transporte, ordem in (("websocket", "websocket", ">I"),
+                                    ("tcp big-endian", "tcp", ">I")):
+        f = BrokerFalso(velas=velas_falsas(200), ordem=">I")
+        f.start()
+        try:
+            ok, razao = provar_contra(f, transporte, ordem)
+            verificar(ok, f"o enquadramento certo passa: {nome}")
+        finally:
+            f.parar()
+
+    f = BrokerFalso(velas=velas_falsas(200), ordem=">I")
+    f.start()
+    try:
+        ok, razao = provar_contra(f, "tcp", "<I")
+        verificar(not ok, "e o enquadramento errado NAO passa — senao o "
+                          "diagnostico nao decidia nada")
+    finally:
+        f.parar()
+
+    try:
+        Ligacao("127.0.0.1", 1, transporte="carta-pombo")
+        verificar(False, "um transporte que nao existe tem de rebentar")
+    except ErroBroker as e:
+        verificar("websocket" in str(e) and "tcp" in str(e),
+                  "e o erro diz quais e que existem")
 
     print("\n=== 9. Os quatro momentos ===")
     falso2 = BrokerFalso()
@@ -3996,6 +4278,76 @@ def so_falta_a_conta() -> bool:
     return not _valor(CTRADER_ACCOUNT_ID or "", "CTRADER_ACCOUNT_ID")
 
 
+HIPOTESES = (
+    ("websocket",                  "websocket", ">I"),
+    ("tcp, 4 bytes big-endian",    "tcp",       ">I"),
+    ("tcp, 4 bytes little-endian", "tcp",       "<I"),
+)
+
+
+def provar_transporte(transporte: str, ordem: str, *, host: str = "",
+                      porta: int = 0, tls: bool = True) -> tuple[bool, str]:
+    """Liga e tenta autenticar a APLICACAO. Devolve (o broker percebeu?, razao).
+
+    O teste nao e "autenticou": e "percebeu o que eu disse". Um ProtoOAErrorRes
+    de credenciais erradas prova que o enquadramento esta CERTO — o broker leu a
+    mensagem, percebeu-a, e discordou dela. Uma ligacao fechada em silencio e
+    que quer dizer que ele nao percebeu.
+    """
+    lig = Ligacao(host or host_da_conta(), porta or PORTA_JSON, tls=tls,
+                  timeout=15, transporte=transporte, ordem=ordem)
+    try:
+        broker = CTrader(SIMBOLO, ligacao=lig, exigir_conta=False)
+        broker.ligar(autenticar_conta=False)
+        return True, "autenticou a aplicacao"
+    except ErroBroker as e:
+        if getattr(e, "codigo", ""):
+            return True, f"o broker percebeu e respondeu: {e}"
+        return False, str(e)
+    except Exception as e:                              # noqa: BLE001
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        lig.fechar()
+
+
+def cmd_diagnostico() -> int:
+    """Experimenta os transportes todos e diz qual e que o TEU broker aceita.
+
+    Existe porque a documentacao do enquadramento da porta 5036 nao esta ao meu
+    alcance, e adivinhar custa-te uma volta de cada vez. Medir custa uma.
+    """
+    credenciais(exigir_conta=False)          # rebenta cedo se faltar alguma
+    print(f"{carimbo()} host: {host_da_conta()}:{PORTA_JSON}\n")
+    print("Vou experimentar os tres enquadramentos. O que interessa nao e se "
+          "autentica —\ne se o broker PERCEBE o que lhe digo.\n")
+
+    bons = []
+    for nome, transporte, ordem in HIPOTESES:
+        print(f"  {nome:<28} ", end="", flush=True)
+        ok, razao = provar_transporte(transporte, ordem)
+        # Numa linha: a razao traz mudancas de linha, e uma tabela partida ao
+        # meio deixa de se ler como tabela, que e a unica coisa que ela faz.
+        print(("SIM  · " if ok else "nao  · ") + " ".join(razao.split())[:100])
+        if ok:
+            bons.append((nome, transporte, ordem))
+
+    if not bons:
+        print("\nNenhum funcionou. Se todos falharam a LIGAR, o problema esta antes "
+              "do\nenquadramento: firewall, VPN ou proxy a cortar a porta "
+              f"{PORTA_JSON}.")
+        return 2
+
+    nome, transporte, ordem = bons[0]
+    print("\nUsa este. No topo do ficheiro, na seccao CONFIGURACAO:\n")
+    print(f'    TRANSPORTE = "{transporte}"')
+    if transporte == "tcp":
+        print(f'    ORDEM_BYTES = "{ordem}"')
+    if (transporte, ordem) == (TRANSPORTE, ORDEM_BYTES):
+        print("\n(E ja e o que la esta. Se assim mesmo nao arranca, o problema "
+              "nao e o transporte.)")
+    return 0
+
+
 def cmd_verificar() -> int:
     """O passo que nao se salta. E aqui que se apanha a conta trocada."""
     print(f"{carimbo()} host: {host_da_conta()}:{PORTA_JSON} (JSON)")
@@ -4123,7 +4475,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Agente de trading ao vivo: o modelo decide, o codigo mede e executa.")
     ap.add_argument("comando", nargs="?", default="correr",
-                    choices=["correr", "contas", "verificar", "contexto", "teste"])
+                    choices=["correr", "contas", "verificar", "contexto",
+                             "diagnostico", "teste"])
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
 
@@ -4135,6 +4488,8 @@ def main(argv=None) -> int:
     if a.comando == "teste":
         return autoteste()
     try:
+        if a.comando == "diagnostico":
+            return cmd_diagnostico()
         if a.comando == "contas":
             return cmd_contas()
         # Antes de qualquer coisa que precise do id da conta: se ele e a UNICA
