@@ -3,6 +3,7 @@
 """Agente de trading ao vivo. Um ficheiro, sem dependencias alem de requests.
 
     python3 agente.py             corre (vigia + bot)
+    python3 agente.py autorizar   faz o OAuth e da-te o access token
     python3 agente.py contas      que contas o teu token abre, e o id de cada uma
     python3 agente.py diagnostico que enquadramento o teu broker aceita
     python3 agente.py verificar   liga, autentica, diz o host, a conta e o saldo
@@ -61,17 +62,21 @@ No topo deste ficheiro, na seccao CONFIGURACAO. Abres, preenches, corres.
 
     CTRADER_CLIENT_ID        da tua aplicacao em connect.spotware.com
     CTRADER_CLIENT_SECRET
-    CTRADER_ACCESS_TOKEN     do fluxo OAuth da tua aplicacao (expira em ~30 dias)
-    CTRADER_ACCOUNT_ID       NAO esta naquele ecra — ve abaixo
+    CTRADER_ACCESS_TOKEN     NAO esta naquele ecra — ve abaixo
+    CTRADER_REFRESH_TOKEN    idem
+    CTRADER_ACCOUNT_ID       idem
     TELEGRAM_TOKEN           opcional: sem isto corre sem Telegram
 
-O ctidTraderAccountId nao aparece no ecra das credenciais e nao ha maneira de o
-adivinhar: so a API o sabe. Preenche as tres de cima, corre
+So o clientId e o clientSecret e que se copiam. As outras tres nao existem em
+ecra nenhum — nascem de tu autorizares a aplicacao na tua conta, e so tu podes
+fazer isso. Com as duas primeiras preenchidas:
 
-    python agente.py contas
+    python agente.py autorizar    abre o browser, autorizas, e ele guarda o par
+    python agente.py contas       diz-te o ctidTraderAccountId
 
-e ele lista as contas que o teu token abre — id, demo ou live, broker — e
-escreve-te a linha para copiares.
+O access token dura ~30 dias; o refresh nao expira. Quando o de acesso morrer, o
+agente renova-o sozinho com o refresh e guarda o par novo na base — nao voltas
+a passar pelo `autorizar`.
 
 UMA COISA, E E A UNICA: este ficheiro esta debaixo de git. Se puseres aqui os
 valores e fizeres commit, eles ficam no historico do repositorio mesmo depois
@@ -110,6 +115,8 @@ import threading
 import time
 import urllib.parse
 import uuid
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 from html import unescape as desescapar_html
 from pathlib import Path
@@ -166,8 +173,20 @@ ORDEM_BYTES = ">I"         # so para TRANSPORTE = "tcp". ">I" grande, "<I" peque
 # um repositorio, muda o segredo antes de qualquer outra coisa.
 CTRADER_CLIENT_ID = ""
 CTRADER_CLIENT_SECRET = ""
-CTRADER_ACCESS_TOKEN = ""      # expira em ~30 dias
+CTRADER_ACCESS_TOKEN = ""      # expira em ~30 dias — vem do `agente.py autorizar`
+CTRADER_REFRESH_TOKEN = ""     # nao expira, e de uso unico — vem do mesmo sitio
 CTRADER_ACCOUNT_ID = 0         # o numero que o `contas` te der
+
+# Onde o cTrader te devolve depois de autorizares. TEM DE ESTAR REGISTADO na
+# tua aplicacao em connect.spotware.com, tal e qual, barra final incluida — se
+# nao estiver, ele recusa antes de chegar aqui e a culpa nao e do codigo.
+OAUTH_REDIRECT = "http://localhost:5000/"
+
+# "trading" da acesso a operar; "accounts" so a ler os dados das contas.
+OAUTH_SCOPE = "trading"
+
+OAUTH_AUTORIZAR = "https://connect.spotware.com/apps/auth"
+OAUTH_TOKEN = "https://openapi.ctrader.com/apps/token"
 
 # O mercado. O nome tem de bater com o do teu broker — o `verificar` diz-te
 # quais e que existem se este nao bater.
@@ -835,6 +854,28 @@ def ws_aceite(chave: str) -> str:
         hashlib.sha1((chave + WS_GUID).encode("ascii")).digest()).decode("ascii")
 
 
+def pista_do_broker(codigo: str) -> str:
+    """O que fazer com o codigo que o broker devolveu.
+
+    Estes dois sao os que toda a gente apanha a primeira vez. Deixar sair so o
+    codigo e deixar a pessoa a procurar no sitio errado.
+    """
+    return {
+        "CH_CLIENT_AUTH_FAILURE": (
+            "O clientId ou o clientSecret nao batem com nenhuma aplicacao. "
+            "Confere-os em https://connect.spotware.com, na tua aplicacao — e "
+            "repara que se fizeste reset ao segredo, o antigo deixou de servir."),
+        "CH_ACCESS_TOKEN_INVALID": (
+            "O access token e invalido ou ja expirou (duram ~30 dias). "
+            "Corre `python agente.py autorizar` para fazer um novo."),
+        "CH_ACCESS_TOKEN_EXPIRED": (
+            "O access token expirou. Corre `python agente.py autorizar`."),
+        "ACCOUNT_NOT_AUTHORIZED": (
+            "Este token nao abre esta conta. Corre `python agente.py contas` "
+            "para veres quais e que ele abre."),
+    }.get((codigo or "").upper(), "")
+
+
 def _ler_exato(sock, n: int) -> bytes:
     """Le exatamente n bytes, ou levanta. `recv` devolve o que quiser."""
     partes, faltam = [], n
@@ -1076,9 +1117,11 @@ class Ligacao:
             espera = self._pendentes.pop(cid, None)
         if espera is not None:
             if tipo == PT.ERROR_RES:
+                codigo = str(carga.get("errorCode") or "")
+                recado = f"{codigo or 'erro'}: {carga.get('description', '')}".strip(": ")
+                pista = pista_do_broker(codigo)
                 espera["erro"] = ErroBroker(
-                    f"{carga.get('errorCode', 'erro')}: {carga.get('description', '')}".strip(": "),
-                    codigo=str(carga.get("errorCode") or ""))
+                    recado + (f"\n\n{pista}" if pista else ""), codigo=codigo)
             else:
                 espera["tipo"], espera["carga"] = tipo, carga
             espera["evento"].set()
@@ -1135,6 +1178,47 @@ def _valor(constante, chave: str) -> str:
     return escrito or (os.environ.get(chave) or "").strip()
 
 
+# ---------------------------------------------------------------------------
+#  O par de tokens: as constantes sao a semente, a base e quem manda depois
+#
+#  Um refresh escreve o par novo na base, e nao no teu codigo. Escrever no
+#  ficheiro de alguem sem lhe perguntar e outra coisa, e uma que nao faco — e a
+#  base ja esta no .gitignore (`*.db`), por isso o par tambem fica fora do git.
+# ---------------------------------------------------------------------------
+def _bd_tokens() -> sqlite3.Connection:
+    BD.parent.mkdir(parents=True, exist_ok=True)
+    bd = sqlite3.connect(str(BD), timeout=30, isolation_level=None)
+    bd.execute("CREATE TABLE IF NOT EXISTS tokens ("
+               "id INTEGER PRIMARY KEY CHECK (id = 1), "
+               "acesso TEXT, refresh TEXT, mudou REAL)")
+    return bd
+
+
+def ler_par() -> tuple[str, str]:
+    """O par guardado, ou ("", "") se nunca houve nenhum."""
+    try:
+        bd = _bd_tokens()
+    except sqlite3.Error:
+        return "", ""
+    try:
+        r = bd.execute("SELECT acesso, refresh FROM tokens WHERE id = 1").fetchone()
+        return (r[0] or "", r[1] or "") if r else ("", "")
+    except sqlite3.Error:
+        return "", ""
+    finally:
+        bd.close()
+
+
+def guardar_par(acesso: str, refresh: str) -> None:
+    bd = _bd_tokens()
+    try:
+        bd.execute("INSERT INTO tokens (id, acesso, refresh, mudou) VALUES (1,?,?,?) "
+                   "ON CONFLICT(id) DO UPDATE SET acesso=?, refresh=?, mudou=?",
+                   (acesso, refresh, time.time(), acesso, refresh, time.time()))
+    finally:
+        bd.close()
+
+
 def credenciais(*, exigir_conta: bool = True) -> dict:
     """As credenciais, da CONFIGURACAO no topo deste ficheiro.
 
@@ -1143,10 +1227,16 @@ def credenciais(*, exigir_conta: bool = True) -> dict:
     fazer: o ctidTraderAccountId NAO aparece no ecra das credenciais do
     Spotware, e o unico sitio onde ele vive e do outro lado desta ligacao.
     """
+    # A base ganha as constantes NO PAR DE TOKENS, e so nesse: se houve um
+    # refresh, o token do ficheiro ja esta velho e usa-lo seria voltar a falhar
+    # com o valor que acabou de ser substituido.
+    guardado, guardado_refresh = ler_par()
     fora = {
         "cliente": _valor(CTRADER_CLIENT_ID, "CTRADER_CLIENT_ID"),
         "segredo": _valor(CTRADER_CLIENT_SECRET, "CTRADER_CLIENT_SECRET"),
-        "token": _valor(CTRADER_ACCESS_TOKEN, "CTRADER_ACCESS_TOKEN"),
+        "token": guardado or _valor(CTRADER_ACCESS_TOKEN, "CTRADER_ACCESS_TOKEN"),
+        "refresh": guardado_refresh or _valor(CTRADER_REFRESH_TOKEN,
+                                              "CTRADER_REFRESH_TOKEN"),
         "conta": _valor(CTRADER_ACCOUNT_ID or "", "CTRADER_ACCOUNT_ID"),
     }
     faltam = [c for c, n in (("CTRADER_CLIENT_ID", "cliente"),
@@ -1157,18 +1247,28 @@ def credenciais(*, exigir_conta: bool = True) -> dict:
         faltam.append("CTRADER_ACCOUNT_ID")
 
     if faltam:
-        recado = ("falta preencher no topo deste ficheiro, na seccao "
-                  "CONFIGURACAO: " + ", ".join(faltam) + "\n\n" +
-                  "\n".join(f'    {c} = "..."' for c in faltam if c != "CTRADER_ACCOUNT_ID") +
-                  ("\n    CTRADER_ACCOUNT_ID = 0" if "CTRADER_ACCOUNT_ID" in faltam else ""))
-        if [c for c in faltam if c != "CTRADER_ACCOUNT_ID"]:
-            recado += "\n\nAs tres primeiras estao em https://connect.spotware.com, na tua aplicacao."
-        if "CTRADER_ACCOUNT_ID" in faltam:
-            recado += ("\n\nO CTRADER_ACCOUNT_ID NAO esta nesse ecra: e o "
-                       "ctidTraderAccountId, e so a API o sabe. Com as outras tres "
-                       "ja preenchidas, corre\n    python agente.py contas\n"
-                       "e ele diz-te o numero para pores aqui.")
-        raise ErroBroker(recado)
+        # As tres que faltam nao se resolvem todas da mesma maneira, e dizer
+        # "vai ao connect.spotware.com" para as tres manda a pessoa procurar
+        # duas delas num sitio onde elas nao estao.
+        linhas = ["falta preencher no topo deste ficheiro, na seccao CONFIGURACAO:", ""]
+        for c in faltam:
+            linhas.append(f"    {c} = 0" if c == "CTRADER_ACCOUNT_ID"
+                          else f'    {c} = "..."')
+        copiaveis = [c for c in faltam
+                     if c in ("CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET")]
+        if copiaveis:
+            linhas += ["", "O " + " e o ".join(copiaveis) + " copiam-se de "
+                       "https://connect.spotware.com,", "na tua aplicacao."]
+        if "CTRADER_ACCESS_TOKEN" in faltam:
+            linhas += ["", "O CTRADER_ACCESS_TOKEN NAO se copia de ecra nenhum: nasce de "
+                       "tu autorizares", "a aplicacao na tua conta, e so tu podes fazer "
+                       "isso. Com as duas de cima", "preenchidas, corre",
+                       "    python agente.py autorizar"]
+        elif "CTRADER_ACCOUNT_ID" in faltam:
+            linhas += ["", "O CTRADER_ACCOUNT_ID e o ctidTraderAccountId, e so a API o "
+                       "sabe. Corre", "    python agente.py contas",
+                       "e ele diz-te o numero para pores aqui."]
+        raise ErroBroker("\n".join(linhas))
 
     try:
         fora["conta"] = int(fora["conta"]) if fora["conta"] else 0
@@ -1176,6 +1276,143 @@ def credenciais(*, exigir_conta: bool = True) -> dict:
         raise ErroBroker(f"CTRADER_ACCOUNT_ID tem de ser um numero, e e "
                          f"{fora['conta']!r}") from None
     return fora
+
+
+# ---------------------------------------------------------------------------
+#  OAuth: o passo que so o dono da conta pode dar
+#
+#  O access token nao e um valor que se copie de um ecra — e o que sobra de tu
+#  entrares na tua conta e autorizares a aplicacao. Ninguem o pode fazer por ti,
+#  e por isso o melhor que o codigo pode fazer e nao te deixar sozinho a meio.
+# ---------------------------------------------------------------------------
+def endereco_de_autorizacao(cliente: str) -> str:
+    campos = {"client_id": cliente, "redirect_uri": OAUTH_REDIRECT,
+              "scope": OAUTH_SCOPE, "product": "web"}
+    return f"{OAUTH_AUTORIZAR}?{urllib.parse.urlencode(campos)}"
+
+
+def _par_da_resposta(corpo: dict) -> tuple[str, str]:
+    """O cTrader ja escreveu isto de duas maneiras. Aceito as duas."""
+    acesso = corpo.get("accessToken") or corpo.get("access_token") or ""
+    refresh = corpo.get("refreshToken") or corpo.get("refresh_token") or ""
+    return str(acesso), str(refresh)
+
+
+def _pedir_token(campos: dict) -> tuple[str, str]:
+    try:
+        r = requests.get(OAUTH_TOKEN, params=campos, timeout=WEB_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        raise ErroBroker(f"nao consegui falar com {OAUTH_TOKEN}: {e}") from e
+    try:
+        corpo = r.json()
+    except ValueError:
+        raise ErroBroker(f"{OAUTH_TOKEN} devolveu {r.status_code} e nao era JSON: "
+                         f"{(r.text or '')[:200]}") from None
+    if corpo.get("errorCode"):
+        raise ErroBroker(f"{corpo['errorCode']}: {corpo.get('description', '')}".strip(": "),
+                         codigo=str(corpo["errorCode"]))
+    acesso, refresh = _par_da_resposta(corpo)
+    if not acesso:
+        raise ErroBroker(f"a resposta do token nao trazia accessToken nenhum: "
+                         f"{json.dumps(corpo)[:200]}")
+    return acesso, refresh
+
+
+def trocar_codigo(codigo: str, cliente: str, segredo: str) -> tuple[str, str]:
+    return _pedir_token({"grant_type": "authorization_code", "code": codigo,
+                         "redirect_uri": OAUTH_REDIRECT, "client_id": cliente,
+                         "client_secret": segredo})
+
+
+def renovar_token(refresh: str, cliente: str, segredo: str) -> tuple[str, str]:
+    """Um refresh token e de uso unico: cada renovacao devolve outro."""
+    return _pedir_token({"grant_type": "refresh_token", "refresh_token": refresh,
+                         "client_id": cliente, "client_secret": segredo})
+
+
+def apanhar_codigo(timeout: float = 300.0) -> str:
+    """Levanta um servidor no redirect e espera pelo `?code=`.
+
+    O codigo de autorizacao vive UM MINUTO. Por isso quem o apanha devolve-o
+    logo, e a troca acontece a seguir — nao depois de tu ires ler a consola.
+    """
+    partes = urllib.parse.urlparse(OAUTH_REDIRECT)
+    porta = partes.port or 80
+    apanhado: dict[str, str] = {}
+
+    class Ouvinte(BaseHTTPRequestHandler):
+        def do_GET(self):                                  # noqa: N802 (e do http.server)
+            pedido = urllib.parse.urlparse(self.path)
+            campos = urllib.parse.parse_qs(pedido.query)
+            apanhado["codigo"] = (campos.get("code") or [""])[0]
+            apanhado["erro"] = (campos.get("error") or [""])[0]
+            corpo = ("<h2>Podes fechar esta janela.</h2>"
+                     "<p>Volta ao terminal — o resto acontece la.</p>"
+                     if apanhado["codigo"] else
+                     f"<h2>O cTrader recusou.</h2><p>{apanhado['erro']}</p>")
+            bruto = corpo.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(bruto)))
+            self.end_headers()
+            self.wfile.write(bruto)
+
+        def log_message(self, *a):                         # noqa: N802
+            pass                                            # o servidor cala-se
+
+    try:
+        servidor = HTTPServer(("127.0.0.1", porta), Ouvinte)
+    except OSError as e:
+        raise ErroBroker(
+            f"nao consegui abrir o {OAUTH_REDIRECT}: {e}\n"
+            f"Ou ha outra coisa na porta {porta}, ou o OAUTH_REDIRECT aponta para "
+            f"um sitio que nao e desta maquina.") from e
+
+    limite = time.time() + timeout
+    servidor.timeout = 1.0
+    try:
+        while not apanhado and time.time() < limite:
+            servidor.handle_request()
+    finally:
+        servidor.server_close()
+
+    if not apanhado:
+        raise ErroBroker(f"passaram {timeout:.0f}s e nao voltaste. Corre outra vez "
+                         f"quando tiveres o browser a mao.")
+    if apanhado.get("erro"):
+        raise ErroBroker(f"o cTrader recusou a autorizacao: {apanhado['erro']}")
+    return apanhado["codigo"]
+
+
+def cmd_autorizar() -> int:
+    creds = credenciais(exigir_conta=False)
+    endereco = endereco_de_autorizacao(creds["cliente"])
+    partes = urllib.parse.urlparse(OAUTH_REDIRECT)
+
+    print(f"{carimbo()} Vou pedir-te para autorizares esta aplicacao na tua conta.\n")
+    print(f"O {OAUTH_REDIRECT} TEM DE ESTAR REGISTADO na tua aplicacao em")
+    print("connect.spotware.com, tal e qual, barra final incluida. Se nao estiver,")
+    print("o cTrader recusa antes de chegar aqui.\n")
+    print("Abre isto (vou tentar abrir-to no browser):\n")
+    print(f"  {endereco}\n")
+    try:
+        webbrowser.open(endereco)
+    except Exception:                                       # noqa: BLE001
+        pass                                                # sem browser, copia-se a mao
+    print(f"A espera em {partes.hostname}:{partes.port or 80} ...")
+
+    codigo = apanhar_codigo()
+    print("Apanhei o codigo. A troca-lo, que ele so vive um minuto...")
+    acesso, refresh = trocar_codigo(codigo, creds["cliente"], creds["segredo"])
+    guardar_par(acesso, refresh)
+
+    print("\nPronto. Guardei o par na base, por isso ja podes correr o agente\n"
+          "sem colar nada. Se quiseres deixa-los tambem no ficheiro:\n")
+    print(f'    CTRADER_ACCESS_TOKEN = "{acesso}"')
+    print(f'    CTRADER_REFRESH_TOKEN = "{refresh}"')
+    print("\nO access token dura ~30 dias. O refresh nao expira, e quando o de")
+    print("acesso morrer eu renovo-o sozinho — nao voltas a passar por aqui.")
+    return 0
 
 
 def host_da_conta() -> str:
@@ -1217,8 +1454,39 @@ class CTrader:
         self.escala = 1.0
         self.execucoes: list[dict] = []
         self._execucoes_lock = threading.Lock()
+        self._renovado = False
 
     # -- ligar --------------------------------------------------------------
+    def pedir(self, tipo: int, carga: dict, **kw) -> dict:
+        """Todos os pedidos passam por aqui, para a renovacao ter um so sitio.
+
+        Um access token morto responde CH_ACCESS_TOKEN_INVALID. Se houver
+        refresh token, renova-se UMA vez e repete-se — e uma so, senao um token
+        que o broker recusa por outra razao punha isto a renovar para sempre.
+        """
+        try:
+            return self.lig.pedir(tipo, carga, **kw)
+        except ErroBroker as e:
+            if not self._renovar(e):
+                raise
+            if "accessToken" in carga:
+                carga = dict(carga, accessToken=self.creds["token"])
+            return self.lig.pedir(tipo, carga, **kw)
+
+    def _renovar(self, erro: ErroBroker) -> bool:
+        """Renova se o erro for de token e houver com que. Uma vez por ligacao."""
+        if "ACCESS_TOKEN" not in (getattr(erro, "codigo", "") or "").upper():
+            return False
+        if self._renovado or not self.creds.get("refresh"):
+            return False
+        self._renovado = True
+        log.info("o access token expirou; a renovar com o refresh token")
+        acesso, refresh = renovar_token(self.creds["refresh"], self.creds["cliente"],
+                                        self.creds["segredo"])
+        self.creds["token"], self.creds["refresh"] = acesso, refresh or self.creds["refresh"]
+        guardar_par(self.creds["token"], self.creds["refresh"])
+        return True
+
     def ligar(self, *, autenticar_conta: bool = True) -> None:
         """Autentica a aplicacao e, salvo ordem em contrario, a conta.
 
@@ -1226,12 +1494,12 @@ class CTrader:
         que o segundo passo exigiria.
         """
         self.lig.abrir()
-        self.lig.pedir(PT.APP_AUTH_REQ, {"clientId": self.creds["cliente"],
+        self.pedir(PT.APP_AUTH_REQ, {"clientId": self.creds["cliente"],
                                          "clientSecret": self.creds["segredo"]})
         if not autenticar_conta:
             return
         self._exigir_conta_do_token()
-        self.lig.pedir(PT.ACCOUNT_AUTH_REQ, {"ctidTraderAccountId": self.creds["conta"],
+        self.pedir(PT.ACCOUNT_AUTH_REQ, {"ctidTraderAccountId": self.creds["conta"],
                                              "accessToken": self.creds["token"]})
 
     def contas_do_token(self) -> list[dict]:
@@ -1240,7 +1508,7 @@ class CTrader:
         E o unico sitio onde o ctidTraderAccountId existe: nao esta no ecra das
         credenciais do Spotware, so a API o sabe.
         """
-        carga = self.lig.pedir(PT.ACCOUNTS_BY_TOKEN_REQ,
+        carga = self.pedir(PT.ACCOUNTS_BY_TOKEN_REQ,
                                {"accessToken": self.creds["token"]})
         return [{
             "id": int(c.get("ctidTraderAccountId") or 0),
@@ -1318,7 +1586,7 @@ class CTrader:
         que nao e o que se julgava, ANTES de existir uma ordem — e nao pela
         rejeicao dela.
         """
-        carga = self.lig.pedir(PT.SYMBOLS_LIST_REQ,
+        carga = self.pedir(PT.SYMBOLS_LIST_REQ,
                                {"ctidTraderAccountId": self.creds["conta"],
                                 "includeArchivedSymbols": False})
         todos = carga.get("symbol") or []
@@ -1334,7 +1602,7 @@ class CTrader:
                    else f"A conta tem {len(todos)} simbolos."))
         self.simbolo_id = int(achado["symbolId"])
 
-        detalhe = self.lig.pedir(PT.SYMBOL_BY_ID_REQ,
+        detalhe = self.pedir(PT.SYMBOL_BY_ID_REQ,
                                  {"ctidTraderAccountId": self.creds["conta"],
                                   "symbolId": [self.simbolo_id]})
         cheio = (detalhe.get("symbol") or [{}])[0]
@@ -1352,7 +1620,7 @@ class CTrader:
 
     def conta(self) -> dict:
         """Saldo e moeda. Serve para dimensionar, e para veres onde estas."""
-        carga = self.lig.pedir(PT.TRADER_REQ, {"ctidTraderAccountId": self.creds["conta"]})
+        carga = self.pedir(PT.TRADER_REQ, {"ctidTraderAccountId": self.creds["conta"]})
         t = carga.get("trader") or {}
         casas = int(t.get("moneyDigits") or 2)
         return {
@@ -1363,7 +1631,7 @@ class CTrader:
         }
 
     def _pedir_m1(self, inicio_ms: int, fim_ms: int) -> list[tuple]:
-        carga = self.lig.pedir(PT.GET_TRENDBARS_REQ, {
+        carga = self.pedir(PT.GET_TRENDBARS_REQ, {
             "ctidTraderAccountId": self.creds["conta"],
             "symbolId": self.simbolo_id,
             "period": PERIODO_M1,
@@ -1415,7 +1683,7 @@ class CTrader:
         stop que bateu enquanto isto estava a dormir sao todos maneiras de a
         memoria ficar a mentir. Quem sabe e quem as tem.
         """
-        carga = self.lig.pedir(PT.RECONCILE_REQ,
+        carga = self.pedir(PT.RECONCILE_REQ,
                                {"ctidTraderAccountId": self.creds["conta"],
                                 "returnProtectionOrders": True})
         fora = []
@@ -3318,9 +3586,11 @@ class BrokerFalso(threading.Thread):
     """Um cTrader de mentira. Mesmo enquadramento, mesmos payloadType."""
 
     def __init__(self, velas=None, *, conta: int = 111, saldo: float = 10_000.0,
-                 live: bool = False, ordem: str = ">I"):
+                 live: bool = False, ordem: str = ">I", recusas_token: int = 0):
         super().__init__(name="broker-falso", daemon=True)
         self.live = live
+        self.recusas_token = recusas_token
+        self.tokens_vistos: list[str] = []
         # O transporte nao se configura: deteta-se, como o real faz. Assim o
         # mesmo falso serve os dois caminhos e os testes cobrem os dois.
         self.ordem, self.transporte = ordem, "?"
@@ -3434,6 +3704,12 @@ class BrokerFalso(threading.Thread):
             self.autenticado["app"] = True
             return self._enviar(PT.APP_AUTH_RES, {}, cid)
         if tipo == PT.ACCOUNTS_BY_TOKEN_REQ:
+            self.tokens_vistos.append(str(carga.get("accessToken") or ""))
+            if self.recusas_token > 0:
+                self.recusas_token -= 1
+                return self._enviar(PT.ERROR_RES,
+                                    {"errorCode": "CH_ACCESS_TOKEN_INVALID",
+                                     "description": "Invalid access token"}, cid)
             return self._enviar(PT.ACCOUNTS_BY_TOKEN_RES, {"ctidTraderAccount": [
                 {"ctidTraderAccountId": self.conta, "isLive": self.live,
                  "traderLogin": 900_000 + self.conta, "brokerTitleShort": "Falso"}]}, cid)
@@ -4039,7 +4315,17 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
             verificar("connect.spotware.com" in str(e),
                       "e diz onde se apanham as tres primeiras")
 
-        CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN = "a", "b", "c"
+        CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET = "a", "b"
+        try:
+            credenciais()
+            verificar(False, "sem o access token, o arranque normal tem de parar")
+        except ErroBroker as e:
+            verificar("agente.py autorizar" in str(e),
+                      "e o erro do token em falta manda-te ao `autorizar`")
+            verificar("NAO se copia de ecra nenhum" in str(e),
+                      "a dizer porque e que nao adianta ir procura-lo")
+
+        CTRADER_ACCESS_TOKEN = "c"
         try:
             credenciais()
             verificar(False, "sem o id da conta, o arranque normal tem de parar")
@@ -4144,7 +4430,148 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
     except Exception as e:
         verificar(False, f"a falha de rede subiu crua: {type(e).__name__}")
 
-    print("\n=== 13. O Estado nao atravessa threads ===")
+    print("\n=== 13. OAuth: o token que so o dono pode gerar ===")
+    endereco = endereco_de_autorizacao("2094_abc def")
+    verificar(endereco.startswith(OAUTH_AUTORIZAR),
+              "o endereco de autorizacao aponta ao connect.spotware.com")
+    verificar("client_id=2094_abc+def" in endereco or "client_id=2094_abc%20def" in endereco,
+              "e escapa o client_id em vez de o colar em cru")
+    verificar(f"scope={OAUTH_SCOPE}" in endereco, "com o scope pedido")
+    verificar(urllib.parse.quote(OAUTH_REDIRECT, safe="") in endereco,
+              "e com o redirect escapado, barras incluidas")
+
+    verificar(_par_da_resposta({"accessToken": "a", "refreshToken": "r"}) == ("a", "r"),
+              "o par le-se do formato em camelCase")
+    verificar(_par_da_resposta({"access_token": "a", "refresh_token": "r"}) == ("a", "r"),
+              "e tambem do formato com underscores — ja vieram os dois")
+
+    # O servidor do redirect, contra um GET a serio.
+    apanhado = {}
+
+    def apanhar_numa_thread():
+        try:
+            apanhado["codigo"] = apanhar_codigo(timeout=15)
+        except ErroBroker as e:
+            apanhado["erro"] = str(e)
+
+    porta_redirect = urllib.parse.urlparse(OAUTH_REDIRECT).port or 80
+    t = threading.Thread(target=apanhar_numa_thread, daemon=True)
+    t.start()
+    time.sleep(0.5)
+    try:
+        r = requests.get(f"http://127.0.0.1:{porta_redirect}/?code=abc123", timeout=10)
+        verificar("fechar esta janela" in r.text,
+                  "o redirect responde uma pagina que manda voltar ao terminal")
+    except requests.exceptions.RequestException as e:
+        verificar(False, f"o servidor do redirect nao atendeu: {e}")
+    t.join(20)
+    verificar(apanhado.get("codigo") == "abc123",
+              "e o codigo de autorizacao e apanhado do ?code=")
+
+    # A troca do codigo, contra um endpoint de mentira.
+    trocas = []
+
+    class TokenFalso(BaseHTTPRequestHandler):
+        def do_GET(self):                                  # noqa: N802
+            campos = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            trocas.append({k: v[0] for k, v in campos.items()})
+            corpo = json.dumps({"accessToken": "acesso-novo",
+                                "refreshToken": "refresh-novo"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(corpo)))
+            self.end_headers()
+            self.wfile.write(corpo)
+
+        def log_message(self, *a):                         # noqa: N802
+            pass
+
+    servidor_token = HTTPServer(("127.0.0.1", 0), TokenFalso)
+    porta_token = servidor_token.server_port
+    threading.Thread(target=servidor_token.serve_forever, daemon=True).start()
+    global OAUTH_TOKEN, BD
+    antes_token, antes_bd = OAUTH_TOKEN, BD
+    try:
+        OAUTH_TOKEN = f"http://127.0.0.1:{porta_token}/"
+        BD = tmp / "tokens.db"
+        acesso, refresh = trocar_codigo("cod", "cli", "seg")
+        verificar((acesso, refresh) == ("acesso-novo", "refresh-novo"),
+                  "a troca do codigo devolve o par")
+        verificar(trocas[-1]["grant_type"] == "authorization_code",
+                  "e vai como authorization_code")
+        renovar_token("r", "cli", "seg")
+        verificar(trocas[-1]["grant_type"] == "refresh_token",
+                  "a renovacao vai como refresh_token")
+
+        guardar_par("guardado", "guardado-r")
+        verificar(ler_par() == ("guardado", "guardado-r"),
+                  "o par guarda-se e le-se da base, e nao do teu codigo")
+
+        # A renovacao automatica: o broker recusa o token uma vez, e so uma.
+        falso6 = BrokerFalso(velas=velas_falsas(200), conta=444, recusas_token=1)
+        falso6.start()
+        try:
+            lig = Ligacao("127.0.0.1", falso6.porta, tls=False, timeout=10)
+            broker6 = CTrader("EURUSD", ligacao=lig, creds={
+                "cliente": "cli", "segredo": "seg", "token": "velho",
+                "refresh": "refresh-velho", "conta": 444})
+            broker6.ligar()
+            verificar(True, "um token recusado renova-se e a ligacao segue")
+            verificar(falso6.tokens_vistos == ["velho", "acesso-novo"],
+                      "a segunda tentativa leva o token NOVO, e nao o que falhou")
+            verificar(ler_par()[0] == "acesso-novo",
+                      "e o par novo fica guardado na base")
+            broker6.fechar()
+        finally:
+            falso6.parar()
+
+        # Sem refresh token nao ha renovacao nenhuma: o erro sobe.
+        falso7 = BrokerFalso(velas=velas_falsas(200), conta=444, recusas_token=1)
+        falso7.start()
+        try:
+            lig = Ligacao("127.0.0.1", falso7.porta, tls=False, timeout=10)
+            broker7 = CTrader("EURUSD", ligacao=lig, creds={
+                "cliente": "cli", "segredo": "seg", "token": "velho",
+                "refresh": "", "conta": 444})
+            try:
+                broker7.ligar()
+                verificar(False, "sem refresh token, o erro do token tem de subir")
+            except ErroBroker as e:
+                verificar("autorizar" in str(e),
+                          "e a mensagem manda-te ao `autorizar`, que e o unico caminho")
+            broker7.fechar()
+        finally:
+            falso7.parar()
+
+        # Duas recusas seguidas nao podem virar um ciclo de renovacoes.
+        falso8 = BrokerFalso(velas=velas_falsas(200), conta=444, recusas_token=5)
+        falso8.start()
+        try:
+            lig = Ligacao("127.0.0.1", falso8.porta, tls=False, timeout=10)
+            broker8 = CTrader("EURUSD", ligacao=lig, creds={
+                "cliente": "cli", "segredo": "seg", "token": "velho",
+                "refresh": "r", "conta": 444})
+            try:
+                broker8.ligar()
+                verificar(False, "um token que falha sempre tem de acabar por levantar")
+            except ErroBroker:
+                verificar(len(falso8.tokens_vistos) == 2,
+                          "e renova-se UMA vez, nao para sempre")
+            broker8.fechar()
+        finally:
+            falso8.parar()
+    finally:
+        OAUTH_TOKEN, BD = antes_token, antes_bd
+        servidor_token.shutdown()
+
+    verificar("autorizar" in pista_do_broker("CH_ACCESS_TOKEN_INVALID"),
+              "o codigo do token invalido traz a saida escrita")
+    verificar("connect.spotware.com" in pista_do_broker("CH_CLIENT_AUTH_FAILURE"),
+              "e o do clientId errado diz onde se conferem")
+    verificar(pista_do_broker("QUALQUER_OUTRO") == "",
+              "um codigo que eu nao conheco nao inventa conselho nenhum")
+
+    print("\n=== 14. O Estado nao atravessa threads ===")
     with Estado(tmp / "threads.db") as e0:
         recado = {}
 
@@ -4163,7 +4590,7 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
         e0.exigir_mesma_thread("o teste")
         verificar(True, "na propria thread nao se queixa de nada")
 
-    print("\n=== 14. O estado sobrevive a um restart ===")
+    print("\n=== 15. O estado sobrevive a um restart ===")
     caminho = tmp / "restart.db"
     with Estado(caminho) as e1:
         e1.gravar_maquina("armado", armado={"nivel": "max H1", "gatilho": 123.0,
@@ -4475,8 +4902,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Agente de trading ao vivo: o modelo decide, o codigo mede e executa.")
     ap.add_argument("comando", nargs="?", default="correr",
-                    choices=["correr", "contas", "verificar", "contexto",
-                             "diagnostico", "teste"])
+                    choices=["correr", "autorizar", "contas", "verificar",
+                             "contexto", "diagnostico", "teste"])
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
 
@@ -4488,6 +4915,8 @@ def main(argv=None) -> int:
     if a.comando == "teste":
         return autoteste()
     try:
+        if a.comando == "autorizar":
+            return cmd_autorizar()
         if a.comando == "diagnostico":
             return cmd_diagnostico()
         if a.comando == "contas":
