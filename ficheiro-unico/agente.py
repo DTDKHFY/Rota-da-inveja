@@ -301,6 +301,12 @@ STOP_SO_A_FAVOR = True
 BASE = Path(__file__).resolve().parent
 BD = BASE / "agente.db"
 
+# Onde o `autorizar` e a renovacao escrevem o par de tokens: este mesmo
+# ficheiro. E uma constante, e nao `__file__` colado no meio do codigo, porque
+# o autoteste tem de a desviar para uma copia — um teste que altera o ficheiro
+# que esta a testar ja nao esta a testar coisa nenhuma. (Aconteceu.)
+FICHEIRO_CONFIG = Path(__file__).resolve()
+
 # ===========================================================================
 #  fim da configuracao
 # ===========================================================================
@@ -1172,16 +1178,72 @@ CHAVES_CTRADER = ("CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET",
                   "CTRADER_ACCOUNT_ID")
 
 
-def _valor(constante) -> str:
-    """So a constante do topo do ficheiro. O ambiente NAO entra aqui.
+# Espacos que nao se veem. O .strip() normal nao apanha estes, o olho tambem
+# nao, e um valor colado de uma pagina web traz-los sem ninguem dar por isso —
+# depois o broker recusa a credencial e todas as verificacoes visuais dizem que
+# ela esta correta.
+INVISIVEIS = "\u00a0\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008" \
+             "\u2009\u200a\u200b\u200c\u200d\u2028\u2029\u202f\u205f\u3000\ufeff"
 
-    Ja entrou, e foi um erro meu: o mesmo ficheiro dava erros diferentes em
-    janelas diferentes de PowerShell, porque em cada uma tinha ficado um
-    $env:CTRADER_* de uma tentativa anterior a ganhar ao que estava escrito.
-    Nada no ecra dizia de onde vinha o valor, por isso pareciam as credenciais
-    a mudar sozinhas. Uma fonte so, e a fonte e este ficheiro.
+
+def limpar_credencial(bruto) -> str:
+    """Tira espacos de qualquer especie das pontas E DO MEIO.
+
+    Do meio tambem: um zero-width no meio de um token nao e um valor com lixo a
+    volta, e um valor partido — e nenhum `.strip()` o desfaz.
     """
-    return str(constante or "").strip()
+    texto = str(bruto or "")
+    for ch in INVISIVEIS:
+        texto = texto.replace(ch, "")
+    return "".join(texto.split())
+
+
+_PERMITIDOS_CREDENCIAL = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.~+/=")
+
+
+def avisar_estranhos(nome: str, bruto) -> str:
+    """Aponta o dedo ao caractere estranho, com a posicao e o codigo.
+
+    "a credencial esta errada" nao ajuda ninguem que ja a conferiu tres vezes.
+    "posicao 12, U+00A0" acaba com a duvida numa linha.
+    """
+    texto = str(bruto or "")
+    for i, ch in enumerate(texto):
+        if ch in _PERMITIDOS_CREDENCIAL:
+            continue
+        nomes = {"\u00a0": "espaco nao-quebravel", "\u200b": "zero-width space",
+                 "\ufeff": "byte-order mark", " ": "espaco", "\t": "tab",
+                 "\n": "mudanca de linha", "\r": "retorno"}
+        como = nomes.get(ch, "caractere invisivel ou fora do alfabeto")
+        return (f"{nome} tem um caractere estranho na posicao {i}: "
+                f"U+{ord(ch):04X} ({como}).\n"
+                f"Isto vem de copiar de uma pagina web. Reescreve o valor a mao, "
+                f"caractere a caractere, ou cola-o primeiro no Bloco de Notas.")
+    return ""
+
+
+def avisos_das_credenciais() -> str:
+    """Todos os avisos de caracteres estranhos, de uma vez."""
+    fora = []
+    for nome, valor in (("CTRADER_CLIENT_ID", CTRADER_CLIENT_ID),
+                        ("CTRADER_CLIENT_SECRET", CTRADER_CLIENT_SECRET),
+                        ("CTRADER_ACCESS_TOKEN", CTRADER_ACCESS_TOKEN),
+                        ("CTRADER_REFRESH_TOKEN", CTRADER_REFRESH_TOKEN)):
+        aviso = avisar_estranhos(nome, valor)
+        if aviso:
+            fora.append(aviso)
+    return "\n\n".join(fora)
+
+
+def _valor(constante) -> str:
+    """So a constante do topo do ficheiro. Nem ambiente, nem base, nem nada.
+
+    Ja entrou o ambiente, e depois uma base ao lado, e as duas vezes o mesmo
+    defeito: um valor a mandar sem estar escrito aqui, e nada no ecra a dizer de
+    onde vinha. Uma fonte so, e a fonte e este ficheiro.
+    """
+    return limpar_credencial(constante)
 
 
 def ambiente_a_estorvar() -> list[str]:
@@ -1225,64 +1287,54 @@ def resumo_credenciais() -> str:
     origem numa linha. Era isto que faltava em todas as vezes que o mesmo
     ficheiro deu erros diferentes.
     """
-    guardado, guardado_refresh = ler_par()
     linhas = []
-    for chave, constante, da_base in (
-            ("CTRADER_CLIENT_ID", CTRADER_CLIENT_ID, ""),
-            ("CTRADER_CLIENT_SECRET", CTRADER_CLIENT_SECRET, ""),
-            ("CTRADER_ACCESS_TOKEN", CTRADER_ACCESS_TOKEN, guardado),
-            ("CTRADER_REFRESH_TOKEN", CTRADER_REFRESH_TOKEN, guardado_refresh),
-            ("CTRADER_ACCOUNT_ID", str(CTRADER_ACCOUNT_ID or ""), "")):
-        if da_base:
-            origem, valor = "base", da_base
-        elif _valor(constante):
-            origem, valor = "ficheiro", _valor(constante)
-        else:
-            origem, valor = "-", ""
+    for chave, constante in (
+            ("CTRADER_CLIENT_ID", CTRADER_CLIENT_ID),
+            ("CTRADER_CLIENT_SECRET", CTRADER_CLIENT_SECRET),
+            ("CTRADER_ACCESS_TOKEN", CTRADER_ACCESS_TOKEN),
+            ("CTRADER_REFRESH_TOKEN", CTRADER_REFRESH_TOKEN),
+            ("CTRADER_ACCOUNT_ID", str(CTRADER_ACCOUNT_ID or ""))):
+        valor = _valor(constante)
+        origem = "ficheiro" if valor else "-"
         mostra = valor if (chave == "CTRADER_ACCOUNT_ID" and valor) else _digital(valor)
         linhas.append(f"  {chave:<22} {origem:<9} {mostra}")
     return "\n".join(linhas)
 
 
 # ---------------------------------------------------------------------------
-#  O par de tokens: as constantes sao a semente, a base e quem manda depois
+#  O par de tokens vive NESTE ficheiro, e em mais lado nenhum
 #
-#  Um refresh escreve o par novo na base, e nao no teu codigo. Escrever no
-#  ficheiro de alguem sem lhe perguntar e outra coisa, e uma que nao faco — e a
-#  base ja esta no .gitignore (`*.db`), por isso o par tambem fica fora do git.
+#  Ja esteve numa base ao lado, e essa base ganhava as constantes. Era a mesma
+#  falha das variaveis de ambiente com outra roupa: um valor a mandar sem estar
+#  escrito aqui. Se o par novo nao pode ir para fora, vai para onde o antigo
+#  esta — as duas linhas de constante deste ficheiro.
 # ---------------------------------------------------------------------------
-def _bd_tokens() -> sqlite3.Connection:
-    BD.parent.mkdir(parents=True, exist_ok=True)
-    bd = sqlite3.connect(str(BD), timeout=30, isolation_level=None)
-    bd.execute("CREATE TABLE IF NOT EXISTS tokens ("
-               "id INTEGER PRIMARY KEY CHECK (id = 1), "
-               "acesso TEXT, refresh TEXT, mudou REAL)")
-    return bd
+def gravar_constante(nome: str, valor: str, caminho: Path | None = None) -> int:
+    """Reescreve a linha `NOME = "..."` deste ficheiro. So essa linha.
 
-
-def ler_par() -> tuple[str, str]:
-    """O par guardado, ou ("", "") se nunca houve nenhum."""
-    try:
-        bd = _bd_tokens()
-    except sqlite3.Error:
-        return "", ""
-    try:
-        r = bd.execute("SELECT acesso, refresh FROM tokens WHERE id = 1").fetchone()
-        return (r[0] or "", r[1] or "") if r else ("", "")
-    except sqlite3.Error:
-        return "", ""
-    finally:
-        bd.close()
-
-
-def guardar_par(acesso: str, refresh: str) -> None:
-    bd = _bd_tokens()
-    try:
-        bd.execute("INSERT INTO tokens (id, acesso, refresh, mudou) VALUES (1,?,?,?) "
-                   "ON CONFLICT(id) DO UPDATE SET acesso=?, refresh=?, mudou=?",
-                   (acesso, refresh, time.time(), acesso, refresh, time.time()))
-    finally:
-        bd.close()
+    Escrita para um temporario e substituicao atomica: uma falha a meio do
+    caminho nao pode deixar o ficheiro do agente truncado, que seria trocar um
+    token velho por nenhum programa.
+    """
+    alvo = Path(caminho or FICHEIRO_CONFIG).resolve()
+    linhas = alvo.read_text(encoding="utf-8").splitlines(keepends=True)
+    padrao = re.compile(rf'^({re.escape(nome)}\s*=\s*)(".*?"|\S+)(.*)$')
+    for i, linha in enumerate(linhas):
+        achado = padrao.match(linha)
+        if not achado:
+            continue
+        fim = achado.group(3).rstrip("\r\n")
+        quebra = linha[len(linha.rstrip("\r\n")):]
+        linhas[i] = f'{achado.group(1)}"{valor}"{fim}{quebra}'
+        novo_texto = "".join(linhas)
+        # Se o que eu escrevi nao compila, nao o ponho no lugar do que compilava.
+        compile(novo_texto, str(alvo), "exec")
+        temporario = alvo.with_suffix(alvo.suffix + ".novo")
+        temporario.write_text(novo_texto, encoding="utf-8")
+        os.replace(temporario, alvo)
+        return i + 1
+    raise ErroBroker(f"nao encontrei a linha `{nome} = ...` em {alvo.name}. "
+                     f"Escreve-a a mao.")
 
 
 def credenciais(*, exigir_conta: bool = True) -> dict:
@@ -1293,15 +1345,11 @@ def credenciais(*, exigir_conta: bool = True) -> dict:
     fazer: o ctidTraderAccountId NAO aparece no ecra das credenciais do
     Spotware, e o unico sitio onde ele vive e do outro lado desta ligacao.
     """
-    # A base ganha as constantes NO PAR DE TOKENS, e so nesse: se houve um
-    # refresh, o token do ficheiro ja esta velho e usa-lo seria voltar a falhar
-    # com o valor que acabou de ser substituido.
-    guardado, guardado_refresh = ler_par()
     fora = {
         "cliente": _valor(CTRADER_CLIENT_ID),
         "segredo": _valor(CTRADER_CLIENT_SECRET),
-        "token": guardado or _valor(CTRADER_ACCESS_TOKEN),
-        "refresh": guardado_refresh or _valor(CTRADER_REFRESH_TOKEN),
+        "token": _valor(CTRADER_ACCESS_TOKEN),
+        "refresh": _valor(CTRADER_REFRESH_TOKEN),
         "conta": _valor(CTRADER_ACCOUNT_ID or ""),
     }
     faltam = [c for c, n in (("CTRADER_CLIENT_ID", "cliente"),
@@ -1475,14 +1523,18 @@ def cmd_autorizar() -> int:
     codigo = apanhar_codigo()
     print("Apanhei o codigo. A troca-lo, que ele so vive um minuto...")
     acesso, refresh = trocar_codigo(codigo, creds["cliente"], creds["segredo"])
-    guardar_par(acesso, refresh)
-
-    print("\nPronto. Guardei o par na base, por isso ja podes correr o agente\n"
-          "sem colar nada. Se quiseres deixa-los tambem no ficheiro:\n")
-    print(f'    CTRADER_ACCESS_TOKEN = "{acesso}"')
-    print(f'    CTRADER_REFRESH_TOKEN = "{refresh}"')
+    try:
+        linha_a = gravar_constante("CTRADER_ACCESS_TOKEN", acesso)
+        linha_r = gravar_constante("CTRADER_REFRESH_TOKEN", refresh)
+        print(f"\nPronto. Escrevi os dois no proprio ficheiro, nas linhas "
+              f"{linha_a} e {linha_r}.")
+    except (OSError, ErroBroker) as e:
+        print(f"\nApanhei o par, mas nao o consegui escrever no ficheiro ({e}).")
+        print("Cola tu estas duas linhas na seccao CONFIGURACAO:\n")
+        print(f'    CTRADER_ACCESS_TOKEN = "{acesso}"')
+        print(f'    CTRADER_REFRESH_TOKEN = "{refresh}"')
     print("\nO access token dura ~30 dias. O refresh nao expira, e quando o de")
-    print("acesso morrer eu renovo-o sozinho — nao voltas a passar por aqui.")
+    print("acesso morrer eu renovo-o e reescrevo-o aqui — nao voltas a passar por aqui.")
     return 0
 
 
@@ -1555,7 +1607,17 @@ class CTrader:
         acesso, refresh = renovar_token(self.creds["refresh"], self.creds["cliente"],
                                         self.creds["segredo"])
         self.creds["token"], self.creds["refresh"] = acesso, refresh or self.creds["refresh"]
-        guardar_par(self.creds["token"], self.creds["refresh"])
+        try:
+            gravar_constante("CTRADER_ACCESS_TOKEN", self.creds["token"])
+            gravar_constante("CTRADER_REFRESH_TOKEN", self.creds["refresh"])
+            log.info("token novo escrito no proprio ficheiro")
+        except (OSError, ErroBroker) as e:
+            # O token renovado vale para esta corrida mesmo que nao se consiga
+            # escrever; o que nao pode e a corrida morrer por causa disso.
+            log.warning("renovei o token mas nao o consegui escrever: %s", e)
+            print(f"\nO token foi renovado. Guarda-o, que nao o consegui escrever:\n"
+                  f'    CTRADER_ACCESS_TOKEN = "{self.creds["token"]}"\n'
+                  f'    CTRADER_REFRESH_TOKEN = "{self.creds["refresh"]}"')
         return True
 
     def ligar(self, *, autenticar_conta: bool = True) -> None:
@@ -3866,6 +3928,12 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
     tmp = Path(os.environ.get("TMPDIR") or "/tmp") / f"agente_teste_{os.getpid()}"
     tmp.mkdir(parents=True, exist_ok=True)
 
+    # O autoteste escreve constantes, e ja escreveu por engano NESTE ficheiro.
+    # Isto guarda-o a cabeca e confere-o no fim: um teste que altera o ficheiro
+    # que esta a testar nao esta a testar coisa nenhuma.
+    _eu = Path(__file__).resolve()
+    _eu_antes = _eu.read_bytes()
+
     print("\n=== 1. A barra em formacao e descartada ===")
     # Baldes de 15m: 0-14, 15-29, 30-44. Com agora_min = 38, o balde dos 30
     # ainda esta a meio e o seu maximo e provisorio.
@@ -4440,10 +4508,34 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
                   "mas traz o principio e o comprimento, que e o que serve para reconhecer")
         verificar(_digital("") == "vazio", "e um valor vazio diz-se vazio")
 
-        # A origem: base ganha ao ficheiro no par de tokens, e o resumo di-lo.
+        # A origem so pode ser o ficheiro. Nunca uma base, nunca o ambiente.
         CTRADER_ACCESS_TOKEN = "do-ficheiro"
-        verificar("ficheiro" in resumo_credenciais().split("CTRADER_ACCESS_TOKEN")[1][:40],
-                  "com a base vazia, o token vem do ficheiro e o resumo diz ficheiro")
+        resumo = resumo_credenciais()
+        verificar("ficheiro" in resumo.split("CTRADER_ACCESS_TOKEN")[1][:40],
+                  "o token vem do ficheiro e o resumo diz ficheiro")
+        verificar("base" not in resumo,
+                  "e a palavra `base` nao aparece: nenhum valor vem de fora do ficheiro")
+
+        # Caracteres invisiveis: a hipotese que sobra quando o valor "esta certo"
+        # em todas as verificacoes visuais e o broker o recusa na mesma.
+        sujo = "2094_T6mx\u00a0GxP4"
+        verificar(limpar_credencial(sujo) == "2094_T6mxGxP4",
+                  "um espaco nao-quebravel no MEIO do valor e removido")
+        verificar(limpar_credencial("  a b\u200bc  ") == "abc",
+                  "e os zero-width e os espacos normais tambem")
+        aviso_sujo = avisar_estranhos("CTRADER_CLIENT_ID", sujo)
+        verificar("posicao 9" in aviso_sujo and "U+00A0" in aviso_sujo,
+                  "e o aviso aponta a posicao exata e o codigo do caractere")
+        verificar("pagina web" in aviso_sujo,
+                  "a dizer de onde e que ele costuma vir")
+        verificar(avisar_estranhos("X", "2094_abcDEF-123.~+/=") == "",
+                  "um valor limpo nao gera aviso nenhum")
+
+        CTRADER_CLIENT_ID = sujo
+        verificar(credenciais(exigir_conta=False)["cliente"] == "2094_T6mxGxP4",
+                  "e a credencial chega ao broker ja limpa, nao como foi colada")
+        CTRADER_CLIENT_ID = "a"
+        CTRADER_ACCESS_TOKEN = "c"
     finally:
         (CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET,
          CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID) = antes_consts
@@ -4586,7 +4678,7 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
     servidor_token = HTTPServer(("127.0.0.1", 0), TokenFalso)
     porta_token = servidor_token.server_port
     threading.Thread(target=servidor_token.serve_forever, daemon=True).start()
-    global OAUTH_TOKEN, BD
+    global OAUTH_TOKEN, BD, FICHEIRO_CONFIG
     antes_token, antes_bd = OAUTH_TOKEN, BD
     try:
         OAUTH_TOKEN = f"http://127.0.0.1:{porta_token}/"
@@ -4600,11 +4692,55 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
         verificar(trocas[-1]["grant_type"] == "refresh_token",
                   "a renovacao vai como refresh_token")
 
-        guardar_par("guardado", "guardado-r")
-        verificar(ler_par() == ("guardado", "guardado-r"),
-                  "o par guarda-se e le-se da base, e nao do teu codigo")
+        # A escrita da constante NO PROPRIO FICHEIRO: e ai que o par vive agora.
+        copia = tmp / "copia_para_escrever.py"
+        copia.write_text(
+            'CTRADER_ACCESS_TOKEN = ""      # um comentario que tem de sobreviver\n'
+            'CTRADER_REFRESH_TOKEN = ""\n'
+            'OUTRA_COISA = "nao mexer"\n', encoding="utf-8")
+        linha = gravar_constante("CTRADER_ACCESS_TOKEN", "abc-123", copia)
+        escrito = copia.read_text(encoding="utf-8")
+        verificar(linha == 1, "a constante e escrita na linha certa, e a linha e dita")
+        verificar('CTRADER_ACCESS_TOKEN = "abc-123"' in escrito,
+                  "o valor novo esta la")
+        verificar("# um comentario que tem de sobreviver" in escrito,
+                  "e o comentario da mesma linha nao se perde")
+        verificar('OUTRA_COISA = "nao mexer"' in escrito
+                  and 'CTRADER_REFRESH_TOKEN = ""' in escrito,
+                  "as outras linhas ficam intactas")
+        compile(escrito, "copia", "exec")
+        verificar(True, "e o ficheiro continua a compilar depois de escrito")
 
-        # A renovacao automatica: o broker recusa o token uma vez, e so uma.
+        try:
+            gravar_constante("NAO_EXISTE_ESTA", "x", copia)
+            verificar(False, "escrever numa constante que nao existe tem de rebentar")
+        except ErroBroker as e:
+            verificar("a mao" in str(e),
+                      "e o erro diz que a tens de escrever tu")
+
+        # Uma falha a meio nao pode truncar o ficheiro do agente.
+        antes_bytes = copia.read_bytes()
+        real_replace = os.replace
+        try:
+            os.replace = lambda *a, **k: (_ for _ in ()).throw(OSError("disco cheio"))
+            try:
+                gravar_constante("CTRADER_ACCESS_TOKEN", "nunca", copia)
+            except OSError:
+                pass
+        finally:
+            os.replace = real_replace
+        verificar(copia.read_bytes() == antes_bytes,
+                  "uma falha a meio da escrita deixa o ficheiro byte a byte igual")
+
+        # A renovacao automatica escreve no FICHEIRO_CONFIG. Desviado para uma
+        # copia: um teste que altera o ficheiro que testa nao testa nada, e da
+        # primeira vez que escrevi isto foi exatamente o que aconteceu.
+        antes_config = FICHEIRO_CONFIG
+        copia_config = tmp / "config_renovacao.py"
+        copia_config.write_text('CTRADER_ACCESS_TOKEN = ""\n'
+                                'CTRADER_REFRESH_TOKEN = ""\n', encoding="utf-8")
+        FICHEIRO_CONFIG = copia_config
+
         falso6 = BrokerFalso(velas=velas_falsas(200), conta=444, recusas_token=1)
         falso6.start()
         try:
@@ -4616,8 +4752,9 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
             verificar(True, "um token recusado renova-se e a ligacao segue")
             verificar(falso6.tokens_vistos == ["velho", "acesso-novo"],
                       "a segunda tentativa leva o token NOVO, e nao o que falhou")
-            verificar(ler_par()[0] == "acesso-novo",
-                      "e o par novo fica guardado na base")
+            verificar('CTRADER_ACCESS_TOKEN = "acesso-novo"'
+                      in copia_config.read_text(encoding="utf-8"),
+                      "e o token novo fica escrito no proprio ficheiro de configuracao")
             broker6.fechar()
         finally:
             falso6.parar()
@@ -4659,6 +4796,7 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
             falso8.parar()
     finally:
         OAUTH_TOKEN, BD = antes_token, antes_bd
+        FICHEIRO_CONFIG = antes_config
         servidor_token.shutdown()
 
     verificar("autorizar" in pista_do_broker("CH_ACCESS_TOKEN_INVALID"),
@@ -4698,6 +4836,9 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
         m = e2.maquina()
         verificar(m["momento"] == "armado" and abs(m["armado"]["gatilho"] - 123.0) < 1e-9,
                   "o nivel armado sobrevive a fechar e reabrir a base")
+
+    verificar(_eu.read_bytes() == _eu_antes,
+              "e o autoteste nao mexeu uma virgula no ficheiro que estava a testar")
 
     print()
     if falhas:
@@ -4877,6 +5018,9 @@ def cmd_verificar() -> int:
     print(f"{carimbo()} host: {host_da_conta()}:{PORTA_JSON} (JSON)")
     print("\nCredenciais (origem e impressao digital, nunca o valor):")
     print(resumo_credenciais())
+    estranhos = avisos_das_credenciais()
+    if estranhos:
+        print("\n" + estranhos)
     aviso = aviso_do_ambiente()
     if aviso:
         print("\n" + aviso)
@@ -4977,6 +5121,9 @@ def falhar(texto: str, *, com_credenciais: bool = False) -> int:
     partes = [texto]
     if com_credenciais:
         partes.append("\nO que estou a usar, e de onde vem:\n" + resumo_credenciais())
+        estranhos = avisos_das_credenciais()
+        if estranhos:
+            partes.append("\n" + estranhos)
     aviso = aviso_do_ambiente()
     if aviso:
         partes.append("\n" + aviso)
