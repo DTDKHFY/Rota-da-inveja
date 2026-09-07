@@ -1167,15 +1167,81 @@ class Ligacao:
                         "payloadType": tipo, "payload": carga})
 
 
-def _valor(constante, chave: str) -> str:
-    """A constante do topo do ficheiro; o ambiente so se ela estiver vazia.
+CHAVES_CTRADER = ("CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET",
+                  "CTRADER_ACCESS_TOKEN", "CTRADER_REFRESH_TOKEN",
+                  "CTRADER_ACCOUNT_ID")
 
-    A constante manda, porque e onde tu a poes. O ambiente fica atras dela para
-    quem preferir nao ter o segredo dentro de um ficheiro — nao tens de saber
-    que existe, e nunca te obriga a nada.
+
+def _valor(constante) -> str:
+    """So a constante do topo do ficheiro. O ambiente NAO entra aqui.
+
+    Ja entrou, e foi um erro meu: o mesmo ficheiro dava erros diferentes em
+    janelas diferentes de PowerShell, porque em cada uma tinha ficado um
+    $env:CTRADER_* de uma tentativa anterior a ganhar ao que estava escrito.
+    Nada no ecra dizia de onde vinha o valor, por isso pareciam as credenciais
+    a mudar sozinhas. Uma fonte so, e a fonte e este ficheiro.
     """
-    escrito = str(constante or "").strip()
-    return escrito or (os.environ.get(chave) or "").strip()
+    return str(constante or "").strip()
+
+
+def ambiente_a_estorvar() -> list[str]:
+    """As CTRADER_* que estao no ambiente e que eu estou a IGNORAR.
+
+    Ignorar em silencio era o defeito. Ignorar e DIZER que se esta a ignorar e
+    a correcao.
+    """
+    return [c for c in CHAVES_CTRADER if (os.environ.get(c) or "").strip()]
+
+
+def aviso_do_ambiente() -> str:
+    sobras = ambiente_a_estorvar()
+    if not sobras:
+        return ""
+    return ("Ha variaveis de ambiente CTRADER_* nesta janela, e eu estou a IGNORA-LAS:\n"
+            + "\n".join(f"    {c}" for c in sobras) +
+            "\n\nO que vale e o que esta escrito no ficheiro. Para as limpares:\n"
+            + "\n".join(f"    Remove-Item Env:\\{c}" for c in sobras)
+            + "\n(PowerShell — ou fecha e abre a janela.)")
+
+
+def _digital(valor: str) -> str:
+    """Os quatro do principio, os quatro do fim, e o comprimento. Nunca o valor.
+
+    Chega para veres que o token e o que puseste; nao chega para alguem o usar
+    a partir de um ecra ou de um registo.
+    """
+    v = str(valor or "")
+    if not v:
+        return "vazio"
+    if len(v) <= 10:
+        return f"{v[:2]}...{v[-2:]} ({len(v)})"
+    return f"{v[:4]}...{v[-4:]} ({len(v)})"
+
+
+def resumo_credenciais() -> str:
+    """De onde vem cada valor, e qual e. Sem mostrar nenhum por inteiro.
+
+    Um valor velho a ganhar a um novo deixa de se poder esconder: le-se a
+    origem numa linha. Era isto que faltava em todas as vezes que o mesmo
+    ficheiro deu erros diferentes.
+    """
+    guardado, guardado_refresh = ler_par()
+    linhas = []
+    for chave, constante, da_base in (
+            ("CTRADER_CLIENT_ID", CTRADER_CLIENT_ID, ""),
+            ("CTRADER_CLIENT_SECRET", CTRADER_CLIENT_SECRET, ""),
+            ("CTRADER_ACCESS_TOKEN", CTRADER_ACCESS_TOKEN, guardado),
+            ("CTRADER_REFRESH_TOKEN", CTRADER_REFRESH_TOKEN, guardado_refresh),
+            ("CTRADER_ACCOUNT_ID", str(CTRADER_ACCOUNT_ID or ""), "")):
+        if da_base:
+            origem, valor = "base", da_base
+        elif _valor(constante):
+            origem, valor = "ficheiro", _valor(constante)
+        else:
+            origem, valor = "-", ""
+        mostra = valor if (chave == "CTRADER_ACCOUNT_ID" and valor) else _digital(valor)
+        linhas.append(f"  {chave:<22} {origem:<9} {mostra}")
+    return "\n".join(linhas)
 
 
 # ---------------------------------------------------------------------------
@@ -1232,12 +1298,11 @@ def credenciais(*, exigir_conta: bool = True) -> dict:
     # com o valor que acabou de ser substituido.
     guardado, guardado_refresh = ler_par()
     fora = {
-        "cliente": _valor(CTRADER_CLIENT_ID, "CTRADER_CLIENT_ID"),
-        "segredo": _valor(CTRADER_CLIENT_SECRET, "CTRADER_CLIENT_SECRET"),
-        "token": guardado or _valor(CTRADER_ACCESS_TOKEN, "CTRADER_ACCESS_TOKEN"),
-        "refresh": guardado_refresh or _valor(CTRADER_REFRESH_TOKEN,
-                                              "CTRADER_REFRESH_TOKEN"),
-        "conta": _valor(CTRADER_ACCOUNT_ID or "", "CTRADER_ACCOUNT_ID"),
+        "cliente": _valor(CTRADER_CLIENT_ID),
+        "segredo": _valor(CTRADER_CLIENT_SECRET),
+        "token": guardado or _valor(CTRADER_ACCESS_TOKEN),
+        "refresh": guardado_refresh or _valor(CTRADER_REFRESH_TOKEN),
+        "conta": _valor(CTRADER_ACCOUNT_ID or ""),
     }
     faltam = [c for c, n in (("CTRADER_CLIENT_ID", "cliente"),
                              ("CTRADER_CLIENT_SECRET", "segredo"),
@@ -1390,6 +1455,12 @@ def cmd_autorizar() -> int:
     partes = urllib.parse.urlparse(OAUTH_REDIRECT)
 
     print(f"{carimbo()} Vou pedir-te para autorizares esta aplicacao na tua conta.\n")
+    print("Credenciais (origem e impressao digital, nunca o valor):")
+    print(resumo_credenciais())
+    aviso = aviso_do_ambiente()
+    if aviso:
+        print("\n" + aviso)
+    print()
     print(f"O {OAUTH_REDIRECT} TEM DE ESTAR REGISTADO na tua aplicacao em")
     print("connect.spotware.com, tal e qual, barra final incluida. Se nao estiver,")
     print("o cTrader recusa antes de chegar aqui.\n")
@@ -4340,13 +4411,39 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
         verificar(credenciais()["conta"] == 777,
                   "o id da conta le-se da constante, e vem como numero")
 
-        # A constante manda; o ambiente so entra quando ela esta vazia.
-        os.environ["CTRADER_CLIENT_ID"] = "do-ambiente"
-        verificar(credenciais()["cliente"] == "a",
-                  "a constante do ficheiro ganha ao ambiente")
+        # O AMBIENTE NAO ENTRA. Este e o teste que impede o defeito desta
+        # sessao de voltar: com a constante vazia e a variavel posta, o valor
+        # tem de FALTAR — e nao ser silenciosamente apanhado do ambiente.
         CTRADER_CLIENT_ID = ""
-        verificar(credenciais()["cliente"] == "do-ambiente",
-                  "e o ambiente so entra quando a constante fica vazia")
+        os.environ["CTRADER_CLIENT_ID"] = "do-ambiente"
+        try:
+            credenciais()
+            verificar(False, "uma credencial que so existe no ambiente tem de FALTAR")
+        except ErroBroker as e:
+            verificar("CTRADER_CLIENT_ID" in str(e),
+                      "o ambiente e ignorado: o valor conta como em falta")
+        verificar("CTRADER_CLIENT_ID" in ambiente_a_estorvar(),
+                  "e a variavel que la esta e denunciada")
+        verificar("IGNORA-LAS" in aviso_do_ambiente() and "Remove-Item" in aviso_do_ambiente(),
+                  "com o aviso a dizer que se ignora e como se limpa")
+        os.environ.pop("CTRADER_CLIENT_ID", None)
+        verificar(aviso_do_ambiente() == "",
+                  "e sem variaveis nenhumas nao ha aviso nenhum")
+        CTRADER_CLIENT_ID = "a"
+
+        # A impressao digital mostra o suficiente para reconheceres, e nao mais.
+        segredo = "1yFkY93qppqOjtyvKJ2puCx0F0GE9Ntgs6YgIU62QnUph"
+        digital = _digital(segredo)
+        verificar(segredo not in digital and len(digital) < 20,
+                  "a impressao digital nao traz o segredo inteiro")
+        verificar(digital.startswith("1yFk") and "(45)" in digital,
+                  "mas traz o principio e o comprimento, que e o que serve para reconhecer")
+        verificar(_digital("") == "vazio", "e um valor vazio diz-se vazio")
+
+        # A origem: base ganha ao ficheiro no par de tokens, e o resumo di-lo.
+        CTRADER_ACCESS_TOKEN = "do-ficheiro"
+        verificar("ficheiro" in resumo_credenciais().split("CTRADER_ACCESS_TOKEN")[1][:40],
+                  "com a base vazia, o token vem do ficheiro e o resumo diz ficheiro")
     finally:
         (CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET,
          CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID) = antes_consts
@@ -4702,7 +4799,7 @@ def so_falta_a_conta() -> bool:
         credenciais(exigir_conta=False)
     except ErroBroker:
         return False
-    return not _valor(CTRADER_ACCOUNT_ID or "", "CTRADER_ACCOUNT_ID")
+    return not _valor(CTRADER_ACCOUNT_ID or "")
 
 
 HIPOTESES = (
@@ -4778,6 +4875,12 @@ def cmd_diagnostico() -> int:
 def cmd_verificar() -> int:
     """O passo que nao se salta. E aqui que se apanha a conta trocada."""
     print(f"{carimbo()} host: {host_da_conta()}:{PORTA_JSON} (JSON)")
+    print("\nCredenciais (origem e impressao digital, nunca o valor):")
+    print(resumo_credenciais())
+    aviso = aviso_do_ambiente()
+    if aviso:
+        print("\n" + aviso)
+    print()
     broker = CTrader(SIMBOLO)
     try:
         broker.ligar()
@@ -4862,7 +4965,7 @@ def correr() -> int:
     return 0
 
 
-def falhar(texto: str) -> int:
+def falhar(texto: str, *, com_credenciais: bool = False) -> int:
     """A explicacao, emoldurada, em STDOUT, e com flush antes de sair.
 
     Em stderr isto perde-se: num depurador e uma corrente separada, ordenada
@@ -4871,7 +4974,13 @@ def falhar(texto: str) -> int:
     aos olhos de quem precisava dela.
     """
     risco = "=" * 68
-    print(f"\n{risco}\n  NAO ARRANQUEI\n{risco}\n{texto}\n{risco}")
+    partes = [texto]
+    if com_credenciais:
+        partes.append("\nO que estou a usar, e de onde vem:\n" + resumo_credenciais())
+    aviso = aviso_do_ambiente()
+    if aviso:
+        partes.append("\n" + aviso)
+    print(f"\n{risco}\n  NAO ARRANQUEI\n{risco}\n" + "\n".join(partes) + f"\n{risco}")
     sys.stdout.flush()
     return 2
 
@@ -4882,16 +4991,18 @@ def atalho_da_conta() -> int:
     Mandar alguem correr um comando quando se podia ter corrido o comando e
     fazer da mensagem de erro um trabalho de casa.
     """
-    print(f"{carimbo()} host: {host_da_conta()}:{PORTA_JSON} (JSON)")
-    risco = "=" * 68
-    print(f"\n{risco}\n  NAO ARRANQUEI: falta o CTRADER_ACCOUNT_ID\n{risco}")
-    print("As outras tres credenciais estao la, por isso fui perguntar ao broker\n"
-          "qual e o numero que te falta.")
+    print(f"{carimbo()} host: {host_da_conta()}:{PORTA_JSON}")
+    print("Falta-te o CTRADER_ACCOUNT_ID. As outras credenciais estao la, por isso\n"
+          "vou perguntar ao broker qual e o numero — aguenta um instante.")
     try:
         contas = buscar_contas()
     except ErroBroker as e:
+        # UMA moldura por falha. Duas seguidas para a mesma coisa e ruido, e o
+        # ruido e o que faz uma mensagem certa deixar de ser lida.
         return falhar(f"falta o CTRADER_ACCOUNT_ID no topo do ficheiro, e nao "
-                      f"consegui ir busca-lo:\n\n  {e}")
+                      f"consegui ir busca-lo:\n\n  {e}", com_credenciais=True)
+    risco = "=" * 68
+    print(f"\n{risco}\n  FALTA SO O CTRADER_ACCOUNT_ID\n{risco}")
     codigo = escrever_contas(contas)
     print(f"\n{risco}")
     sys.stdout.flush()
@@ -4932,7 +5043,7 @@ def main(argv=None) -> int:
             return cmd_contexto()
         return correr()
     except ErroBroker as e:
-        return falhar(str(e))
+        return falhar(str(e), com_credenciais=True)
 
 
 if __name__ == "__main__":
