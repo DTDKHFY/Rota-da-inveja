@@ -199,15 +199,31 @@ SIMBOLO = "EURUSD"
 TELEGRAM_TOKEN = ""
 CHAT_ID = 0                # so este chat recebe e da ordens
 
-# --- Modelo (ve os nomes exatos com: ollama list) --------------------------
+# --- Modelo ----------------------------------------------------------------
+# `ollama list` mostra o que ESTA MESMO instalado nesta maquina. Um nome que
+# nao esteja nessa lista falha; e os que acabam em `:cloud` falham na mesma sem
+# subscricao paga no Ollama, com um 402 que nao se resolve tentando outra vez.
+#
+# Este trabalho e ler uma tabela e devolver JSON estrito, com nomes de niveis
+# copiados tal e qual. Um modelo de codigo faz isso melhor do que um
+# conversador, e por isso um 7B chega — nao e preciso um modelo grande para
+# escolher entre dez etiquetas que ja lhe foram dadas.
+#
+# A subir: `ollama pull gemma4:26b` raciocina bastante melhor sobre estrutura
+# de mercado. Se o puseres aqui, acrescenta-o tambem ao JANELA_MODELO.
 OLLAMA_URL = "http://localhost:11434"
-MODELO = "minimax-m3:cloud"
+MODELO = "qwen2.5-coder:7b"
 TIMEOUT_MODELO = 300
 TENTATIVAS_JSON = 3
 
 # Janela de contexto, SO para modelos locais. Um modelo de nuvem decide o
 # contexto do lado dele, e impor-lhe um valor pode so atrasa-lo.
-JANELA_MODELO = {"qwen2.5-coder:7b": 32_768}
+#
+# Um modelo local que NAO esteja aqui recebe a janela por omissao do Ollama, que
+# e pequena — e a fotografia chega-lhe cortada pelo fim, sem erro nenhum. Ele
+# decide sobre metade dos dados e ninguem da por isso. Se mudares o MODELO para
+# outro local, poe-o aqui.
+JANELA_MODELO = {"qwen2.5-coder:7b": 32_768, "gemma4:26b": 32_768}
 
 # --- Ferramentas do agente -------------------------------------------------
 # Ele pesquisa noticias e le paginas quando quiser, com orcamento. O que leu
@@ -4202,7 +4218,22 @@ def autoteste() -> int:  # noqa: C901 — e uma lista de casos, nao um algoritmo
         verificar(dados["escalas"][0]["atr"] is not None, "o M15 tem ATR")
         verificar("VOLUME DE TICKS" in dados["lambda_definicao"],
                   "a ressalva do volume de ticks vai na saida, nao num comentario")
-        verificar(len(formatar(dados)) > 200, "a fotografia escreve-se em texto")
+        texto_foto = formatar(dados)
+        verificar(len(texto_foto) > 200, "a fotografia escreve-se em texto")
+
+        # A fotografia tem de caber na janela do modelo com folga. Se um dia
+        # crescer para alem disto, chega cortada pelo fim e ele decide sobre
+        # metade dos dados sem erro nenhum a dizer que faltou alguma coisa.
+        janela = JANELA_MODELO.get(MODELO)
+        verificar(MODELO.endswith(":cloud") or janela is not None,
+                  f"o MODELO por omissao ({MODELO}) e local e tem janela declarada")
+        if janela:
+            # ~4 caracteres por token e a regra grosseira do costume; o prompt
+            # SISTEMA vai junto, por isso conta-se com ele.
+            tokens = (len(texto_foto) + len(SISTEMA_OBSERVA)) / 4
+            verificar(tokens < janela * 0.5,
+                      f"e a fotografia mais o SISTEMA cabem com folga "
+                      f"(~{tokens:.0f} tokens em {janela})")
 
         acima = next(d for d in dados["regua"]["degraus"] if d["preco"] > dados["preco"])
         abaixo = next(d for d in dados["regua"]["degraus"] if d["preco"] < dados["preco"])
