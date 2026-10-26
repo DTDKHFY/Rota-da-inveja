@@ -1,6 +1,6 @@
 /* Service worker do Sistema: guarda o app no celular para abrir sem internet.
    Os dados do usuário não passam por aqui: ficam no armazenamento do navegador. */
-const VERSION = "sistema-v29";
+const VERSION = "sistema-v30";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png"];
 const CDN = ["cdnjs.cloudflare.com", "fonts.googleapis.com", "fonts.gstatic.com"];
 
