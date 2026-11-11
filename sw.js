@@ -1,6 +1,6 @@
 /* Service worker do Sistema: guarda o app no celular para abrir sem internet.
    Os dados do usuário não passam por aqui: ficam no armazenamento do navegador. */
-const VERSION = "sistema-v54";
+const VERSION = "sistema-v55";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png"];
 const CDN = ["cdnjs.cloudflare.com", "fonts.googleapis.com", "fonts.gstatic.com"];
 
@@ -24,7 +24,7 @@ self.addEventListener("fetch", (event) => {
   /* a página: tenta a versão nova; sem internet, abre a guardada */
   if (req.mode === "navigate") {
     event.respondWith(
-      fetch(req)
+      fetch(req, { cache: "no-store" })
         .then((res) => { const copy = res.clone(); caches.open(VERSION).then((c) => c.put("./index.html", copy)); return res; })
         .catch(() => caches.match("./index.html"))
     );
