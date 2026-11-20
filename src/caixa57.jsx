@@ -20,15 +20,66 @@ const cxQuant = (arr, q) => { if (!arr.length) return 0; const s = [...arr].sort
 const cxBrl0 = (n) => `R$ ${Math.round(n || 0).toLocaleString("pt-BR")}`;
 const cxMonthLabel = (key) => `${monthShort(key)}/${key.slice(2, 4)}`;
 
-/* lista de inimigos: cada cartão com saldo devedor e cada dívida do formato antigo */
+/* DÍVIDA ≠ FATURA. Dívida é o saldo que gera juros: rotativo (o que sobrou de fatura paga em parte),
+   parcelamento de fatura, dívida antiga cadastrada e fatura vencida sem pagamento (vira rotativo).
+   Compra nova no cartão é gasto do mês e compromisso da fatura: só vira dívida se não for paga inteira. */
 function cxDebts(fin, todayKey) {
   const list = [];
+  let faturaMes = 0, commitFuture = 0;
+  const monthEnd = `${todayKey.slice(0, 7)}-${String(daysIn(todayKey.slice(0, 7))).padStart(2, "0")}`;
   (fin.cards || []).forEach((c) => {
+    const paid = c.paid || {};
     const sm = cardSummary(fin, c, todayKey);
-    if (sm.used > 0.005) list.push({ id: `card:${c.id}`, name: c.name, balance: sm.used, rate: c.rate == null ? null : Number(c.rate), card: true });
+    const byInv = {};
+    sm.invoices.forEach((i) => { byInv[i.key] = i; });
+    const unpaid = fin.entries.filter((e) => e.cardId === c.id && !e.cardPayment && paid[e.invoice] == null);
+    const debtEntries = unpaid.filter((e) => e.oldDebt || e.carry);
+    const inv = {};
+    let bal = 0;
+    debtEntries.forEach((e) => { bal += e.amount; inv[e.invoice] = round2((inv[e.invoice] || 0) + e.amount); });
+    /* compras normais: na fatura vencida viram dívida; nas outras, são compromisso */
+    const normalByInv = {};
+    unpaid.filter((e) => !e.oldDebt && !e.carry).forEach((e) => { normalByInv[e.invoice] = round2((normalByInv[e.invoice] || 0) + e.amount); });
+    Object.keys(normalByInv).forEach((k) => {
+      const adv = (byInv[k] && byInv[k].advanced) || 0;
+      const v = Math.max(0, round2(normalByInv[k] - adv));
+      if (!(v > 0)) return;
+      const i = byInv[k];
+      if (i && i.overdue) { bal += v; inv[k] = round2((inv[k] || 0) + v); }
+      else if (i && i.due <= monthEnd) faturaMes = round2(faturaMes + v);
+      else commitFuture = round2(commitFuture + v);
+    });
+    bal = round2(bal);
+    if (bal > 0.005) list.push({ id: `card:${c.id}`, name: c.name, balance: bal, rate: c.rate == null ? null : Number(c.rate), card: true, inv });
   });
-  (fin.debts || []).filter((d) => d.balance > 0.005).forEach((d) => list.push({ id: d.id, name: d.name, balance: d.balance, rate: d.rate == null ? null : Number(d.rate), payment: d.payment || 0 }));
-  return list.map((d) => ({ ...d, interestMonth: round2(d.balance * ((d.rate || 0) / 100)) }));
+  (fin.debts || []).filter((d) => d.balance > 0.005).forEach((d) => list.push({ id: d.id, name: d.name, balance: d.balance, rate: d.rate == null ? null : Number(d.rate), payment: d.payment || 0, inv: { [todayKey.slice(0, 7)]: d.balance } }));
+  return { list: list.map((d) => ({ ...d, interestMonth: round2(d.balance * ((d.rate || 0) / 100)) })), faturaMes, commitFuture };
+}
+
+/* quitação só da dívida: a cada mês paga o orçamento da dívida, maior juro primeiro; o que sobra rende juros */
+function cxSimDebt(debts, startKey, budget) {
+  const cs = debts.map((d) => {
+    const inv = {};
+    Object.keys(d.inv || {}).forEach((k) => { const kk = k < startKey ? startKey : k; inv[kk] = round2((inv[kk] || 0) + d.inv[k]); });
+    return { r: Math.max(0, (d.rate || 0) / 100), inv, carry: 0, last: Object.keys(inv).sort().pop() || startKey };
+  });
+  if (!cs.length) return { months: 0, interest: 0, end: startKey };
+  if (!(budget > 0)) return { stuck: true };
+  const lastKey = cs.map((c) => c.last).sort().pop();
+  let key = startKey, months = 0, interest = 0, prev = Infinity;
+  for (;;) {
+    months++;
+    if (months > 240) return { stuck: true };
+    cs.forEach((c) => { c.due = round2(c.carry + (c.inv[key] || 0)); });
+    let b = budget;
+    [...cs].sort((a, z) => z.r - a.r).forEach((c) => { const p = Math.min(c.due, b); c.due = round2(c.due - p); b = round2(b - p); });
+    cs.forEach((c) => { const i = round2(c.due * c.r); interest += i; c.carry = round2(c.due + i); });
+    const carry = cs.reduce((a, c) => a + c.carry, 0);
+    if (key >= lastKey && carry <= 0.005) break;
+    if (key >= lastKey) { if (carry >= prev - 0.005) return { stuck: true }; prev = carry; }
+    key = addMonthsKey(key, 1);
+  }
+  return { months, interest: round2(interest), end: key };
 }
 
 /* gasto variável por dia (inclui o "livre sem culpa") */
@@ -60,7 +111,8 @@ function caixaModel(fin, todayKey) {
   const fixedPaid = round2(sum(monthEntries.filter((e) => e.recId && e.type === "out")));
   const prov = round2((cmd.provisions || []).reduce((a, p) => a + (Number(p.amount) || 0), 0) / 12);
   const mp = monthPlan(fin, mk, todayKey);
-  const debts = cxDebts(fin, todayKey);
+  const dd = cxDebts(fin, todayKey);
+  const debts = dd.list;
   const debtTotal = round2(debts.reduce((a, d) => a + d.balance, 0));
   const interestMonth = round2(debts.reduce((a, d) => a + d.interestMonth, 0));
   const debtBudget = round2(plan.debtBudget > 0 ? plan.debtBudget : mp.debtMin);
@@ -93,17 +145,18 @@ function caixaModel(fin, todayKey) {
   /* quitação */
   let payoff = null;
   if (debtTotal > 0) {
-    const cardsHave = debts.some((d) => d.card);
-    const legacy = (fin.debts || []).filter((d) => d.balance > 0.005);
-    const cardSim = cardsHave ? simulateCardDebt(fin, todayKey, debtBudget) : { months: 0, interest: 0, end: mk };
-    const legSim = legacy.length ? simulateDebts(legacy, 0) : { months: 0, interest: 0 };
-    const stuck = !!(cardSim.stuck || legSim.stuck);
-    const months = Math.max(cardSim.months || 0, legSim.months || 0);
-    payoff = stuck ? { stuck: true } : { months, end: addMonthsKey(mk, Math.max(0, months - 1)), interest: round2((cardSim.interest || 0) + (legSim.interest || 0)) };
-    const alt = cardsHave ? simulateCardDebt(fin, todayKey, debtBudget + 200) : simulateDebts(legacy, 200);
+    const sim = cxSimDebt(debts, mk, debtBudget);
+    payoff = sim.stuck ? { stuck: true } : { months: sim.months, end: sim.end, interest: sim.interest };
+    const alt = cxSimDebt(debts, mk, debtBudget + 200);
     payoff.plus200 = alt.stuck ? null : alt.months;
   }
-  const peak = Math.max(cmd.debtPeak || 0, debtTotal);
+  const peak = Math.max(cmd.debtPeak2 || 0, debtTotal);
+  /* variação: saldo da dívida guardado mês a mês */
+  const log = cmd.debtLog || {};
+  const prevKey = Object.keys(log).filter((k) => k < mk).sort().pop();
+  const debtDelta = prevKey != null ? round2(debtTotal - log[prevKey]) : null;
+  /* fatura que vence no mês x o que sobra da renda depois de fixas, provisões, dívida e reserva */
+  const faturaRoom = round2(income - fixed - prov - debtBudget - reserveMonthly);
 
   /* fase */
   let phase;
@@ -113,7 +166,7 @@ function caixaModel(fin, todayKey) {
     else phase = 2;
   } else phase = runway != null && runway >= 6 ? 4 : 3;
 
-  return { cmd, mk, day, last, income, incomeSrc, incomeHist, extra, extraPhase, extraFree, inMonth, fixed, fixedPaid, prov, debts, debtTotal, interestMonth, costDay: round2(interestMonth / 30), debtBudget, debtPaid, reserveMonthly, reserveIn, typical, varCap, freeCap, varUsed, freeUsed, unassigned, daysLeft, remaining, range, reserve, essential, runway, saveRate, payoff, peak, phase };
+  return { faturaMes: dd.faturaMes, commitFuture: dd.commitFuture, faturaRoom, debtLog: log, prevKey, debtDelta, cmd, mk, day, last, income, incomeSrc, incomeHist, extra, extraPhase, extraFree, inMonth, fixed, fixedPaid, prov, debts, debtTotal, interestMonth, costDay: round2(interestMonth / 30), debtBudget, debtPaid, reserveMonthly, reserveIn, typical, varCap, freeCap, varUsed, freeUsed, unassigned, daysLeft, remaining, range, reserve, essential, runway, saveRate, payoff, peak, phase };
 }
 
 /* previsão do fechamento: sorteia 2.000 vezes os seus dias reais de gasto para completar o mês */
@@ -240,7 +293,8 @@ function CaixaComando({ m, onSetup }) {
     );
   }
   const ph = CX_PHASES[m.phase];
-  const alert = m.unassigned < -0.005 ? { text: `O plano passa da renda em ${brl(-m.unassigned)}. Corte um envelope.`, red: true }
+  const alert = m.faturaMes > 0.005 && m.income > 0 && m.faturaMes > m.faturaRoom + 0.005 ? { text: `A fatura deste mês (${brl(m.faturaMes)}) passa do que sobra da renda depois de fixas, dívida e reserva (${brl(Math.max(0, m.faturaRoom))}). O que não for pago vira rotativo (média do Banco Central: 15,29% ao mês).`, red: true }
+    : m.unassigned < -0.005 ? { text: `O plano passa da renda em ${brl(-m.unassigned)}. Corte um envelope.`, red: true }
     : m.phase === 0 ? { text: `O pagamento da dívida (${brl(m.debtBudget)}/mês) não cobre os juros (${brl(m.interestMonth)}/mês). A dívida não diminui.`, red: true }
     : m.extraPhase > 0.005 ? { text: `Entrou ${brl(m.extra)} acima da renda de segurança. Mande ${brl(m.extraPhase)} (80%) para ${m.debtTotal > 0 ? "a dívida" : "a reserva"}; ${brl(m.extraFree)} (20%) já foram para o livre.`, red: false }
     : m.unassigned > 0.005 ? { text: `${brl(m.unassigned)} da renda estão sem destino. Mande para ${m.debtTotal > 0 ? "a dívida" : "a reserva"}.`, red: false } : null;
@@ -292,7 +346,12 @@ function CaixaInimigo({ m, finance, today, fin }) {
   const [adding, setAdding] = useState(false);
   const [f, setF] = useState({ name: "", saldo: "", rate: "", parcela: "", n: "" });
   const [msg, setMsg] = useState("");
-  useEffect(() => { if (m.debtTotal > (m.cmd.debtPeak || 0) + 0.005) fin.setCmd({ debtPeak: m.debtTotal }); }, [m.debtTotal]);
+  useEffect(() => {
+    const upd = {};
+    if (m.debtTotal > (m.cmd.debtPeak2 || 0) + 0.005) upd.debtPeak2 = m.debtTotal;
+    if (m.debtLog[m.mk] == null || Math.abs(m.debtLog[m.mk] - m.debtTotal) > 0.005) upd.debtLog = { ...m.debtLog, [m.mk]: m.debtTotal };
+    if (Object.keys(upd).length) fin.setCmd(upd);
+  }, [m.debtTotal, m.mk]);
   const save = () => {
     const saldo = parseMoney(f.saldo), rate = parseMoney(f.rate), parcela = parseMoney(f.parcela), n = Math.round(Number(f.n));
     if (!f.name.trim()) { setMsg("Dê um nome, por exemplo Nubank."); return; }
@@ -348,6 +407,12 @@ function CaixaInimigo({ m, finance, today, fin }) {
       <div className="cx-hit" style={{ ...cxMono, fontSize: 32, fontWeight: 700, marginTop: 6 }}>{brl(m.debtTotal)}</div>
       <div style={{ marginTop: 8 }}><CxBar pct={100 - defeated} color={`linear-gradient(90deg, #8E1F30, ${T.danger})`} h={12} /></div>
       <div style={{ display: "flex", justifyContent: "space-between", marginTop: 5, fontSize: 12.5, color: T.muted }}><span>maior saldo: {brl(m.peak)}</span><span style={cxMono}>−{defeated}% derrotado</span></div>
+      {m.debtDelta != null && Math.abs(m.debtDelta) > 0.005 && (
+        <div style={{ marginTop: 6, fontSize: 13.5 }}>Desde {monthShort(m.prevKey)}: <b style={{ ...cxMono, color: m.debtDelta > 0 ? T.danger : T.good }}>{m.debtDelta > 0 ? "subiu" : "caiu"} {brl(Math.abs(m.debtDelta))}</b></div>
+      )}
+      {(m.faturaMes > 0 || m.commitFuture > 0) && (
+        <div style={{ marginTop: 6, fontSize: 12.5, color: T.muted, lineHeight: 1.4 }}>Fora da dívida (compras do cartão, sem juros se pagas inteiras): fatura do mês {brl(m.faturaMes)}{m.commitFuture > 0 ? ` · parcelas futuras ${brl(m.commitFuture)}` : ""}.</div>
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 7, marginTop: 12 }}>
         <CxTile small label="Por dia" value={brl(m.costDay)} sub="em juros" color={T.bad || T.danger} pulse />
@@ -384,6 +449,7 @@ function CaixaInimigo({ m, finance, today, fin }) {
       {m.debts.length > 1 && (
         <div style={{ marginTop: 10, fontSize: 13.5, color: T.muted }}>Quem atacar primeiro (maior juro): {[...m.debts].sort((a, b) => (b.rate || 0) - (a.rate || 0)).map((d) => d.name).join(" → ")}</div>
       )}
+      <div style={{ marginTop: 10, fontSize: 12, color: T.muted, lineHeight: 1.4 }}>Dívida = saldo que gera juros: rotativo, parcelamento, dívida antiga e fatura vencida. Compra nova no cartão é gasto do mês; só vira dívida se a fatura não for paga inteira.</div>
       {!adding && <button onClick={() => setAdding(true)} style={{ ...cxGhost, marginTop: 12, minHeight: 44 }}>+ Cadastrar outra dívida</button>}
       {form}
     </Section>
