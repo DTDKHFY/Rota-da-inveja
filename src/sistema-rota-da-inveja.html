@@ -6519,7 +6519,7 @@ function ObjectivesTab({ state, weeksLeft, monthName, nextMonthName, daysLeft, a
    Modelo em claude/caixa-modelo.md (Project). Tudo aqui é cálculo sobre os dados que já existem
    (renda, contas fixas, cartões, dívidas, lançamentos); o único dado novo é finance.cmd. */
 const cxId = () => Date.now() + Math.random();
-const CMD_DEFAULTS = { varGoal: 0, free: 0, hours: 180, bigLimit: 100, provisions: [], settled: [], debtPeak: 0 };
+const CMD_DEFAULTS = { incomeMode: "variavel", incomeFloor: 0, varGoal: 0, free: 0, hours: 180, bigLimit: 100, provisions: [], settled: [], debtPeak: 0 };
 const cmdOf = (fin) => ({ ...CMD_DEFAULTS, ...((fin && fin.cmd) || {}) });
 const CX_PHASES = [
   { id: 0, name: "Sangria", hint: "o pagamento não cobre os juros: estancar" },
@@ -6561,9 +6561,18 @@ function caixaModel(fin, todayKey) {
   const day = Number(todayKey.slice(8));
   const last = daysIn(mk);
   const plan = fin.plan || {};
-  const income = plan.income || 0;
   const monthEntries = fin.entries.filter((e) => e.date.slice(0, 7) === mk);
   const inMonth = round2(sum(monthEntries.filter((e) => e.type === "in")));
+  /* renda variável: o plano usa a renda de segurança (menor dos últimos 3 meses ou o mínimo informado);
+     o que entrar acima disso é extra: 80% para a fase, 20% para o livre */
+  const incomeHist = [1, 2, 3].map((n) => { const k = addMonthsKey(mk, -n); return { k, v: round2(sum(fin.entries.filter((e) => e.type === "in" && e.date.slice(0, 7) === k))) }; }).filter((x) => x.v > 0);
+  let income, incomeSrc;
+  if (cmd.incomeMode === "fixa") { income = plan.income || 0; incomeSrc = "renda fixa informada"; }
+  else if (cmd.incomeFloor > 0) { income = cmd.incomeFloor; incomeSrc = "mínimo garantido que você informou"; }
+  else if (incomeHist.length) { const lo = incomeHist.reduce((a, x) => (x.v < a.v ? x : a)); income = lo.v; incomeSrc = `menor dos últimos ${incomeHist.length === 1 ? "mês" : `${incomeHist.length} meses`} (${monthShort(lo.k)})`; }
+  else { income = plan.income || 0; incomeSrc = income > 0 ? "estimativa que você informou" : ""; }
+  const extra = cmd.incomeMode === "fixa" ? 0 : round2(Math.max(0, inMonth - income));
+  const extraPhase = round2(extra * 0.8), extraFree = round2(extra - extraPhase);
   const fixed = round2((fin.recurring || []).filter((r) => r.type === "out").reduce((a, r) => a + r.amount, 0));
   const fixedPaid = round2(sum(monthEntries.filter((e) => e.recId && e.type === "out")));
   const prov = round2((cmd.provisions || []).reduce((a, p) => a + (Number(p.amount) || 0), 0) / 12);
@@ -6580,7 +6589,7 @@ function caixaModel(fin, todayKey) {
   const pastVar = [1, 2, 3].map((n) => { const k = addMonthsKey(mk, -n); return sum(fin.entries.filter((e) => isVariableOut(e) && e.date.slice(0, 7) === k)); }).filter((v) => v > 0);
   const typical = pastVar.length ? round2(pastVar.reduce((a, v) => a + v, 0) / pastVar.length) : 0;
   const varCap = cmd.varGoal > 0 ? cmd.varGoal : (typical > 0 ? round2(typical * 0.8) : 0);
-  const freeCap = cmd.free || 0;
+  const freeCap = round2((cmd.free || 0) + extraFree);
   const varUsed = round2(sum(monthEntries.filter((e) => isVariableOut(e) && !e.free)));
   const freeUsed = round2(sum(monthEntries.filter((e) => isVariableOut(e) && e.free)));
   const unassigned = round2(income - fixed - prov - debtBudget - reserveMonthly - varCap - freeCap);
@@ -6621,7 +6630,7 @@ function caixaModel(fin, todayKey) {
     else phase = 2;
   } else phase = runway != null && runway >= 6 ? 4 : 3;
 
-  return { cmd, mk, day, last, income, inMonth, fixed, fixedPaid, prov, debts, debtTotal, interestMonth, costDay: round2(interestMonth / 30), debtBudget, debtPaid, reserveMonthly, reserveIn, typical, varCap, freeCap, varUsed, freeUsed, unassigned, daysLeft, remaining, range, reserve, essential, runway, saveRate, payoff, peak, phase };
+  return { cmd, mk, day, last, income, incomeSrc, incomeHist, extra, extraPhase, extraFree, inMonth, fixed, fixedPaid, prov, debts, debtTotal, interestMonth, costDay: round2(interestMonth / 30), debtBudget, debtPaid, reserveMonthly, reserveIn, typical, varCap, freeCap, varUsed, freeUsed, unassigned, daysLeft, remaining, range, reserve, essential, runway, saveRate, payoff, peak, phase };
 }
 
 /* previsão do fechamento: sorteia 2.000 vezes os seus dias reais de gasto para completar o mês */
@@ -6740,7 +6749,9 @@ function CaixaComando({ m, onSetup }) {
   if (!(m.income > 0)) {
     return (
       <Section title="Comando" accent={T.accent}>
-        <div style={{ fontSize: 15, lineHeight: 1.45 }}>Informe a sua <b>renda líquida do mês</b> para o Caixa calcular quanto você pode gastar por dia, o custo da dívida e a sua fase.</div>
+        <div style={{ fontSize: 15, lineHeight: 1.45 }}>{m.cmd.incomeMode === "fixa"
+          ? <>Informe a sua <b>renda líquida do mês</b> para o Caixa calcular quanto você pode gastar por dia, o custo da dívida e a sua fase.</>
+          : <>Sua renda varia, então o plano usa a <b>renda de segurança</b>: o menor valor dos últimos 3 meses. Registre as entradas (salário, extras) no <b>+</b> ou informe agora o mínimo que entra com certeza.</>}</div>
         <button onClick={onSetup} style={{ ...btnPrimary, marginTop: 12, width: "100%", minHeight: 46 }}>Configurar o comando</button>
       </Section>
     );
@@ -6748,6 +6759,7 @@ function CaixaComando({ m, onSetup }) {
   const ph = CX_PHASES[m.phase];
   const alert = m.unassigned < -0.005 ? { text: `O plano passa da renda em ${brl(-m.unassigned)}. Corte um envelope.`, red: true }
     : m.phase === 0 ? { text: `O pagamento da dívida (${brl(m.debtBudget)}/mês) não cobre os juros (${brl(m.interestMonth)}/mês). A dívida não diminui.`, red: true }
+    : m.extraPhase > 0.005 ? { text: `Entrou ${brl(m.extra)} acima da renda de segurança. Mande ${brl(m.extraPhase)} (80%) para ${m.debtTotal > 0 ? "a dívida" : "a reserva"}; ${brl(m.extraFree)} (20%) já foram para o livre.`, red: false }
     : m.unassigned > 0.005 ? { text: `${brl(m.unassigned)} da renda estão sem destino. Mande para ${m.debtTotal > 0 ? "a dívida" : "a reserva"}.`, red: false } : null;
   return (
     <section style={{ marginTop: 6 }}>
@@ -6909,7 +6921,7 @@ function CaixaCascata({ m, onSetup }) {
   return (
     <Section title="Cascata do mês">
       <div data-pn="" className="cx-rise" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "11px 13px", border: `1px solid ${T.border}`, background: T.panel }}>
-        <div><div style={cxLbl}>Renda do mês</div><div style={{ ...cxMono, fontSize: 22, fontWeight: 700 }}>{brl(m.income)}</div><div style={{ fontSize: 12, color: T.muted }}>entrou até hoje: {brl(m.inMonth)}</div></div>
+        <div style={{ minWidth: 0 }}><div style={cxLbl}>{m.cmd.incomeMode === "fixa" ? "Renda do mês" : "Renda de segurança"}</div><div style={{ ...cxMono, fontSize: 22, fontWeight: 700 }}>{brl(m.income)}</div><div style={{ fontSize: 12, color: T.muted }}>{m.incomeSrc ? `${m.incomeSrc} · ` : ""}entrou: {brl(m.inMonth)}{m.extra > 0 ? ` · extra ${brl(m.extra)}` : ""}</div></div>
         <div style={{ textAlign: "right" }}><div style={cxLbl}>Sem destino</div><div style={{ ...cxMono, fontSize: 22, fontWeight: 700, color: Math.abs(m.unassigned) < 0.01 ? T.good : m.unassigned < 0 ? T.danger : T.gold }}>{Math.abs(m.unassigned) < 0.01 ? "R$ 0 ✓" : brl(m.unassigned)}</div></div>
       </div>
       <div style={{ position: "relative", marginTop: 12, paddingLeft: 30 }}>
@@ -7062,14 +7074,15 @@ function CaixaDerrotados({ m, fin, today }) {
 function CaixaAjustes({ m, finance, fin, onClose }) {
   const plan = finance.plan || {};
   const fmt = (v) => (v > 0 ? String(v).replace(".", ",") : "");
-  const [v, setV] = useState({ income: fmt(plan.income), debt: fmt(plan.debtBudget), reserve: fmt(plan.reserveMonthly), varGoal: fmt(m.cmd.varGoal), free: fmt(m.cmd.free), hours: String(m.cmd.hours || 180), big: String(m.cmd.bigLimit || 100) });
+  const [mode, setMode] = useState(m.cmd.incomeMode || "variavel");
+  const [v, setV] = useState({ floor: fmt(m.cmd.incomeFloor), income: fmt(plan.income), debt: fmt(plan.debtBudget), reserve: fmt(plan.reserveMonthly), varGoal: fmt(m.cmd.varGoal), free: fmt(m.cmd.free), hours: String(m.cmd.hours || 180), big: String(m.cmd.bigLimit || 100) });
   const [prov, setProv] = useState(m.cmd.provisions || []);
   const [np, setNp] = useState({ name: "", amount: "" });
   const [done, setDone] = useState("");
   const save = () => {
     const n = (k) => { const x = parseMoney(v[k]); return x > 0 ? x : 0; };
     fin.setPlan({ income: n("income"), debtBudget: n("debt"), reserveMonthly: n("reserve") });
-    fin.setCmd({ varGoal: n("varGoal"), free: n("free"), hours: Math.max(1, Math.round(Number(v.hours) || 180)), bigLimit: Math.max(1, n("big") || 100), provisions: prov });
+    fin.setCmd({ incomeMode: mode, incomeFloor: n("floor"), varGoal: n("varGoal"), free: n("free"), hours: Math.max(1, Math.round(Number(v.hours) || 180)), bigLimit: Math.max(1, n("big") || 100), provisions: prov });
     setDone("Salvo."); if (onClose) setTimeout(onClose, 400);
   };
   const field = (t, k, hint) => (
@@ -7080,7 +7093,17 @@ function CaixaAjustes({ m, finance, fin, onClose }) {
   );
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 12 }}>
-      {field("Renda líquida do mês", "income", "Italac + escritório + outras, já descontado")}
+      <div role="group" aria-label="Tipo de renda" style={{ display: "flex", gap: 6 }}>
+        {[["variavel", "Renda variável"], ["fixa", "Renda fixa"]].map(([k, t]) => (
+          <button key={k} onClick={() => setMode(k)} aria-pressed={mode === k} style={{ flex: 1, minHeight: 44, background: mode === k ? T.panel2 : "transparent", border: `1px solid ${mode === k ? T.accent : T.border}`, color: mode === k ? T.text : T.muted, fontFamily: F.ui, fontSize: 14, fontWeight: 700, cursor: "pointer" }}>{t}</button>
+        ))}
+      </div>
+      {mode === "fixa"
+        ? field("Renda líquida do mês", "income", "Italac + escritório + outras, já descontado")
+        : <>
+            {field("Mínimo que entra com certeza (opcional)", "floor", m.incomeHist.length ? `Últimos meses: ${m.incomeHist.map((x) => `${monthShort(x.k)} ${brl(x.v)}`).join(" · ")}. Vazio = usa o menor deles.` : "Ex.: salário-base. Vazio = usa o menor mês registrado.")}
+            {!m.incomeHist.length && field("Estimativa enquanto não há histórico", "income", "Seja conservador: use um mês fraco.")}
+          </>}
       {field("Pagamento da dívida por mês", "debt", m.interestMonth > 0 ? `Juros hoje: ${brl(m.interestMonth)}/mês. Abaixo disso a dívida não cai.` : "Quanto vai para a dívida todo mês")}
       {field("Reserva por mês", "reserve", m.debtTotal > 0 ? "Com dívida de cartão: pouco, só até 1 mês de custo." : "Para a Caixinha")}
       {field("Meta de variáveis no mês", "varGoal", m.typical > 0 ? `Seu típico: ${brl(m.typical)}. Meta ambiciosa: ${brl(round2(m.typical * 0.8))} (−20%). Vazio = automático.` : "Mercado, combustível, comida fora. Vazio = automático quando houver histórico.")}
