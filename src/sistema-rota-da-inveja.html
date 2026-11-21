@@ -7303,6 +7303,7 @@ async function ghPutFile(doc, sha) {
 }
 
 /* liga o app ao repositório: busca ao abrir, ao voltar e a cada minuto; envia 4 s depois de cada mudança */
+const syncHash = (o) => { let str = ""; try { str = JSON.stringify(o); } catch (e) { return ""; } let h = 5381; for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0; return `${str.length}:${h >>> 0}`; };
 function useGithubSync(stateRef, loaded, state, applyRemoteRef) {
   const skip = useRef(false), busy = useRef(false), timer = useRef(null);
   const push = (async (force) => {
@@ -7312,10 +7313,10 @@ function useGithubSync(stateRef, loaded, state, applyRemoteRef) {
     busy.current = true; syncStatus("enviando");
     let retry = false;
     try {
-      const doc = { v: 1, by: m.device || "app", updatedAt: m.dirtyAt || Date.now(), state: stateRef.current };
+      const doc = { v: 1, by: m.device || "app", updatedAt: m.dirtyAt || Date.now(), state: stateRef.current }; Object.defineProperty(doc, "__h", { value: syncHash(doc.state), enumerable: false });
       const res = await ghPutFile(doc, m.sha);
       if (res.conflict) retry = true;
-      else { syncSave({ sha: res.sha, dirty: false, lastPushAt: Date.now() }); syncStatus("ok"); }
+      else { syncSave({ sha: res.sha, dirty: syncHash(stateRef.current) !== doc.__h, hash: doc.__h, lastPushAt: Date.now() }); syncStatus("ok"); }
     } catch (e) { syncStatus("erro", String(e.message || e)); }
     busy.current = false;
     if (retry) await pull(); /* alguém mudou o arquivo: busca, resolve e reenvia */
@@ -7338,7 +7339,7 @@ function useGithubSync(stateRef, loaded, state, applyRemoteRef) {
           syncSave({ sha: f.sha, lastPullAt: Date.now() }); then = "push";
         } else if (doc.state && typeof doc.state === "object") {
           if (m.dirty) { try { localStorage.setItem("rb.sync.copia", JSON.stringify({ at: Date.now(), de: "aparelho", state: stateRef.current })); } catch (e) { /* ok */ } }
-          skip.current = true;
+          skip.current = Date.now();
           applyRemoteRef.current && applyRemoteRef.current(doc.state, doc.by, m.device);
           syncSave({ sha: f.sha, dirty: false, lastPullAt: Date.now(), lastBy: doc.by || "" });
           syncStatus("ok");
@@ -7351,9 +7352,12 @@ function useGithubSync(stateRef, loaded, state, applyRemoteRef) {
   /* cada mudança local marca "pendente" e agenda o envio */
   useEffect(() => {
     if (!state || !loaded.current) return;
-    if (skip.current) { skip.current = false; return; }
+    if (skip.current && Date.now() - skip.current < 1500) { skip.current = 0; syncSave({ hash: syncHash(state) }); return; }
+    skip.current = 0;
     if (!syncOn()) return;
-    syncSave({ dirty: true, dirtyAt: Date.now() });
+    const h = syncHash(state);
+    if (h === syncMeta().hash) return;
+    if (!syncMeta().dirty) syncSave({ dirty: true, dirtyAt: Date.now() });
     clearTimeout(timer.current);
     timer.current = setTimeout(() => push(), 4000);
   }, [state]);
