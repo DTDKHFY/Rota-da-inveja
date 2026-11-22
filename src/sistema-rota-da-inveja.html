@@ -1524,7 +1524,12 @@ function App() {
     });
   }
   const setFinalShort = (fid, short) => setState((s) => ({ ...s, finals: s.finals.map((f) => (f.id === fid ? { ...f, short: String(short || "").trim().slice(0, 22) || undefined } : f)) }));
-  const finalFx = { toggleMilestone, addMilestone, removeMilestone, setFinalDue, setFinalShort };
+  const setObs = (key, id, text, msId) => setState((s) => {
+    const t = String(text || "").trim().slice(0, 400) || undefined;
+    if (key === "finals" && msId != null) return { ...s, finals: s.finals.map((f) => (f.id === id ? { ...f, milestones: (f.milestones || []).map((m) => (m.id === msId ? { ...m, obs: t } : m)) } : f)) };
+    return { ...s, [key]: (s[key] || []).map((g) => (g.id === id ? { ...g, obs: t } : g)) };
+  });
+  const finalFx = { toggleMilestone, addMilestone, removeMilestone, setFinalDue, setFinalShort, setObs };
 
   function restartRoute(start, wipeGoals) {
     setState((s) => {
@@ -5648,7 +5653,40 @@ function MapSheet({ title, kicker, color, onClose, children, backLabel }) {
   );
 }
 
-function MapGoalRow({ g, finals, onToggle, onRemove }) {
+function ObsLine({ text, onSave, small }) {
+  const [open, setOpen] = useState(false);
+  const [edit, setEdit] = useState(false);
+  const [val, setVal] = useState(text || "");
+  useEffect(() => { if (!edit) setVal(text || ""); }, [text, edit]);
+  const fs = small ? 12 : 12.5;
+  if (edit) {
+    return (
+      <div style={{ marginTop: 6 }} onClick={(e) => e.stopPropagation()}>
+        <textarea value={val} onChange={(e) => setVal(e.target.value.slice(0, 400))} rows={4} aria-label="Observação" placeholder="Feito quando… · Como… · Por quê…"
+          style={{ ...inputStyle, width: "100%", fontSize: 14, lineHeight: 1.4, resize: "vertical", minHeight: 84 }} />
+        <div style={{ display: "flex", gap: 8, marginTop: 6, alignItems: "center" }}>
+          <button onClick={() => { onSave(val); setEdit(false); setOpen(true); }} style={{ ...btnPrimary, padding: "8px 14px" }}>Salvar</button>
+          <button onClick={() => { setVal(text || ""); setEdit(false); }} style={{ background: "none", border: `1px solid ${T.border}`, color: T.muted, padding: "8px 12px", cursor: "pointer", fontFamily: F.ui }}>Cancelar</button>
+          <span style={{ fontSize: 11, color: T.muted, marginLeft: "auto" }}>{val.length}/400</span>
+        </div>
+      </div>
+    );
+  }
+  if (!text) {
+    return onSave ? <button onClick={() => setEdit(true)} style={{ background: "none", border: "none", color: T.muted, fontSize: fs, padding: "6px 0 0", cursor: "pointer", fontFamily: F.ui, textAlign: "left" }}>+ observação</button> : null;
+  }
+  return (
+    <div style={{ marginTop: 4 }}>
+      <button onClick={() => setOpen(!open)} aria-expanded={open} aria-label={open ? "Fechar observação" : "Abrir observação"}
+        style={{ display: "block", width: "100%", background: "none", border: "none", padding: "2px 0", textAlign: "left", cursor: "pointer", color: T.muted, fontSize: fs, lineHeight: 1.4, fontFamily: "inherit",
+          ...(open ? { whiteSpace: "pre-wrap", color: T.text } : { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }) }}>
+        📝 {text}
+      </button>
+      {open && onSave && <button onClick={() => setEdit(true)} style={{ background: "none", border: "none", color: T.accentSoft, fontSize: 12, padding: "4px 0", cursor: "pointer", fontFamily: F.ui, textDecoration: "underline" }}>editar observação</button>}
+    </div>
+  );
+}
+function MapGoalRow({ g, finals, onToggle, onRemove, onObs }) {
   const [del, setDel] = useState(false);
   const val = goalXP(g, false);
   const link = g.goalId ? (finals || []).find((f) => f.id === g.goalId) : null;
@@ -5661,6 +5699,7 @@ function MapGoalRow({ g, finals, onToggle, onRemove }) {
         <div style={{ fontSize: 15, lineHeight: 1.25, color: g.done ? T.muted : T.text, textDecoration: g.done ? "line-through" : "none" }}>{g.title}</div>
         <div style={{ fontSize: 12, color: T.muted, marginTop: 3 }}>{goalTags(g) || "sem atributo"}{link ? ` · serve a ${link.title}` : ""}</div>
         {g.ifThen && <div style={{ fontSize: 12, color: T.accentSoft, marginTop: 2 }}>↳ {g.ifThen}</div>}
+        <ObsLine text={g.obs} onSave={onObs} />
       </div>
       <div style={{ textAlign: "right", flex: "0 0 auto" }}>
         <div style={{ fontWeight: 700, fontSize: 13, color: RANK_COLOR[g.diff] }}>{g.diff}</div>
@@ -6306,7 +6345,7 @@ function RouteMap({ state, nfDays, toggleItem, addItem, removeItem, fx, bumpFixe
             <MapRing value={wDone} total={wl.length || 1} label={`${wDone}/${wl.length} metas`} color="#ffb02e" />
             <div style={{ fontSize: 13, color: T.muted, lineHeight: 1.45 }}>Cada meta cumprida acende uma lanterna em volta da tocha. Falha até sábado: −{Math.round(PENALTY_RATE * 100)}% do XP dela.</div>
           </div>
-          {wl.length ? wl.map((g) => <MapGoalRow key={g.id} g={g} finals={finals} onToggle={() => toggleItem("weeklies", g.id)} onRemove={() => removeItem("weeklies", g.id)} />)
+          {wl.length ? wl.map((g) => <MapGoalRow key={g.id} g={g} finals={finals} onToggle={() => toggleItem("weeklies", g.id)} onRemove={() => removeItem("weeklies", g.id)} onObs={fx && fx.setObs ? (t) => fx.setObs("weeklies", g.id, t) : null} />)
             : <div style={{ fontSize: 14, color: T.muted, marginTop: 10 }}>Nenhuma meta nesta semana. Cadastre de 3 a 5.</div>}
           <button onClick={() => setOpen("new:semana")} style={{ ...btnPrimary, width: "100%", marginTop: 12 }}>+ Nova meta da semana</button>
           <WeekPlanList plan={state.weekPlan} />
@@ -6320,7 +6359,7 @@ function RouteMap({ state, nfDays, toggleItem, addItem, removeItem, fx, bumpFixe
               <div style={{ fontSize: 13, color: T.muted, lineHeight: 1.45 }}>Bandeira verde: todas cumpridas · âmbar: em andamento · vermelha: nenhuma. No fim do mês, a não cumprida custa −{Math.round(PENALTY_RATE * 100)}% do XP dela.</div>
             </div>
           )}
-          {selMonth.goals.map((g) => <MapGoalRow key={g.id} g={g} finals={finals} onToggle={() => toggleItem("monthlies", g.id)} onRemove={() => removeItem("monthlies", g.id)} />)}
+          {selMonth.goals.map((g) => <MapGoalRow key={g.id} g={g} finals={finals} onToggle={() => toggleItem("monthlies", g.id)} onRemove={() => removeItem("monthlies", g.id)} onObs={fx && fx.setObs ? (t) => fx.setObs("monthlies", g.id, t) : null} />)}
           {!selMonth.goals.length && <div style={{ fontSize: 14, color: T.muted }}>Nenhuma meta neste acampamento ainda.</div>}
           {monthMarcos(selMonth.key).length > 0 && (<>
             <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: 1, color: T.accentSoft, margin: "16px 0 4px" }}>MARCOS DOS OBJETIVOS NESTE MÊS</div>
@@ -6427,7 +6466,7 @@ function WeekPlanList({ plan }) {
           {w.items.map((g) => (
             <div key={g.id} style={{ display: "flex", gap: 8, alignItems: "baseline", fontSize: 14, padding: "4px 0", color: T.text, lineHeight: 1.35 }}>
               <span style={{ color: RANK_COLOR[g.diff] || T.muted, fontWeight: 700, minWidth: 14 }}>{g.diff}</span>
-              <span style={{ flex: 1 }}>{g.title}</span>
+              <span style={{ flex: 1 }}>{g.title}{g.obs && <span style={{ display: "block", fontSize: 12, color: T.muted, marginTop: 2 }}>📝 {g.obs}</span>}</span>
             </div>
           ))}
         </div>
@@ -6545,6 +6584,7 @@ function ObjectivesTab({ state, weeksLeft, monthName, nextMonthName, daysLeft, a
           onAdd={(t, d, a, x, e) => addItem("weeklies", t, d, a, x, e)}
           finals={state.finals}
           onRemove={(id) => removeItem("weeklies", id)}
+          fx={fx} obsKey="weeklies"
         />
         <WeekPlanList plan={state.weekPlan} />
       </section>
@@ -6561,6 +6601,7 @@ function ObjectivesTab({ state, weeksLeft, monthName, nextMonthName, daysLeft, a
           onAdd={(t, d, a, x, e) => addItem("monthlies", t, d, a, x, e)}
           finals={state.finals}
           onRemove={(id) => removeItem("monthlies", id)}
+          fx={fx} obsKey="monthlies"
         />
       </Block>
 
@@ -6575,7 +6616,7 @@ function ObjectivesTab({ state, weeksLeft, monthName, nextMonthName, daysLeft, a
           glow={CAT.final.glow}
           onToggle={(id) => toggleItem("finals", id, true)}
           onAdd={(t, d, a, x, e) => addItem("finals", t, "S", a, x, e)}
-          fx={fx} routeEnd={state.deadline} reviewTop={<FinalTimeline state={state} />}
+          fx={fx} obsKey="finals" routeEnd={state.deadline} reviewTop={<FinalTimeline state={state} />}
           onRemove={(id) => removeItem("finals", id)}
         />
       </Block>
@@ -9983,6 +10024,7 @@ function FinalDetail({ f, fx, routeEnd, color }) {
           Histórico: {f.postponed.map((p) => `${fmtDM(p.from)} → ${fmtDM(p.to)}${p.cost ? ` (−${p.cost})` : ""}`).join(" · ")}
         </div>
       )}
+      {fx.setObs && <ObsLine text={f.obs} onSave={(t) => fx.setObs("finals", f.id, t)} />}
       <div style={{ fontSize: 12, fontWeight: 700, color: T.gold, letterSpacing: 0.4, margin: "12px 0 4px" }}>MARCOS · {st.msDone}/{st.msTotal}</div>
       {(f.milestones || []).map((m) => {
         const late = !m.done && m.due && m.due < today;
@@ -9990,7 +10032,10 @@ function FinalDetail({ f, fx, routeEnd, color }) {
           <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 0", borderTop: `1px solid ${T.border}55` }}>
             <button onClick={() => fx.toggleMilestone(f.id, m.id)} disabled={f.done} aria-label={`${m.done ? "Desmarcar" : "Concluir"} marco: ${m.title}`} aria-pressed={!!m.done}
               style={{ width: 22, height: 22, minWidth: 22, border: `1px solid ${m.done ? color : T.muted}`, background: m.done ? color : "transparent", color: m.done ? T.onAccent : "transparent", cursor: "pointer", fontSize: 13 }}>✓</button>
-            <span style={{ flex: 1, fontSize: 13, color: m.done ? T.muted : T.text, textDecoration: m.done ? "line-through" : "none" }}>{m.title}</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 13, color: m.done ? T.muted : T.text, textDecoration: m.done ? "line-through" : "none" }}>{m.title}</div>
+              {(m.obs || fx.setObs) && <ObsLine small text={m.obs} onSave={fx.setObs ? (t) => fx.setObs("finals", f.id, t, m.id) : null} />}
+            </div>
             {m.due && <span style={{ fontSize: 12, color: late ? T.danger : T.muted, whiteSpace: "nowrap" }}>{late ? "atrasado · " : ""}{fmtDM(m.due)}</span>}
             {!m.done && <button onClick={() => fx.removeMilestone(f.id, m.id)} aria-label={`Remover marco: ${m.title}`} style={{ background: "none", border: "none", color: T.muted, cursor: "pointer", padding: 4 }}>✕</button>}
           </div>
@@ -10010,7 +10055,7 @@ function FinalDetail({ f, fx, routeEnd, color }) {
   );
 }
 
-function GoalList({ title, hint, items, isFinal, attrNames, onToggle, onAdd, onRemove, accent, glow, finals, fx, routeEnd, reviewTop }) {
+function GoalList({ title, hint, items, isFinal, attrNames, onToggle, onAdd, onRemove, accent, glow, finals, fx, routeEnd, reviewTop, obsKey }) {
   const [txt, setTxt] = useState("");
   const [goalId, setGoalId] = useState("");
   const [dueNew, setDueNew] = useState("");
@@ -10060,6 +10105,7 @@ function GoalList({ title, hint, items, isFinal, attrNames, onToggle, onAdd, onR
               <div style={{ fontSize: 14, textDecoration: g.done ? "line-through" : "none", color: g.done ? T.muted : T.text }}>{g.title}</div>
               {g.ifThen && <div style={{ fontSize: 12, color: T.accentSoft, marginTop: 2, lineHeight: 1.35 }}>↳ {g.ifThen}</div>}
               {link && <div style={{ fontSize: 12, color: CAT.final.color, marginTop: 2 }}>◆ serve a: {link.title}</div>}
+              <ObsLine text={g.obs} onSave={fx && fx.setObs && obsKey ? (t) => fx.setObs(obsKey, g.id, t) : null} />
               {st && !g.done && (
                 <div style={{ fontSize: 12, marginTop: 3, display: "flex", gap: 8, flexWrap: "wrap" }}>
                   <span style={{ color: dueCol, fontWeight: 700 }}>{st.overdue ? `☠ vencido há ${-st.left} d (${fmtDM(st.eff)})` : `⏳ ${st.left === 0 ? "vence hoje" : `faltam ${st.left} d`} · ${fmtDM(st.eff)}`}</span>
