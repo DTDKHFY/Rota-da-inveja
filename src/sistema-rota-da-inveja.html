@@ -3083,6 +3083,12 @@ function mapLayout(n) {
 /* a trilha entre dois pontos: a mesma curva que o desenho usa */
 const mapCurve = (a, b) => [a, { x: a.x + (b.x - a.x) * 0.85, y: a.y }, { x: b.x, y: a.y - (a.y - b.y) * 0.3 }, b];
 const bezAt = (c, t) => { const u = 1 - t; return { x: u * u * u * c[0].x + 3 * u * u * t * c[1].x + 3 * u * t * t * c[2].x + t * t * t * c[3].x, y: u * u * u * c[0].y + 3 * u * u * t * c[1].y + 3 * u * t * t * c[2].y + t * t * t * c[3].y }; };
+function routeProgress(finals) {
+  const fs = finals || [];
+  if (!fs.length) return 0;
+  const per = fs.map((f) => { if (f.done) return 1; const ms = f.milestones || []; return ms.filter((m) => m.done).length / (ms.length + 1); });
+  return per.reduce((a, b) => a + b, 0) / fs.length;
+}
 /* a tocha anda um pouco por dia: Dia 1 na base, o fim de cada mês no acampamento dele, o fim da rota no portão */
 function mapWalk(lay, months, start, deadline, today) {
   const stops = [lay.base, ...lay.camps, lay.gate];
@@ -6192,7 +6198,7 @@ function RouteMap({ state, nfDays, toggleItem, addItem, removeItem, fx, bumpFixe
   const months = [];
   let mk = start.slice(0, 7);
   const endM = state.deadline.slice(0, 7);
-  while (mk <= endM && months.length < 8) {
+  while (mk <= endM && months.length < 13) {
     const [y, m] = mk.split("-").map(Number);
     months.push({ key: mk, name: MONTHS_PT[m - 1], short: MONTH_SHORT[m - 1] });
     mk = m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, "0")}`;
@@ -6208,8 +6214,16 @@ function RouteMap({ state, nfDays, toggleItem, addItem, removeItem, fx, bumpFixe
     return { ...m, ...lay.camps[i], goals: gl, done: d, flag: !gl.length ? (past ? "#6b7280" : "#9ca3af") : d === gl.length ? "#22c55e" : d ? "#f59e0b" : "#ef4444" };
   });
   const ci = Math.max(0, months.findIndex((m) => m.key === thisMonth));
-  const walk = mapWalk(lay, months, start, state.deadline, today);
+  const totalDays = Math.max(1, daysBetween(start, state.deadline) + 1);
+  const rp = routeProgress(state.finals);
+  const tp = today < start ? 0 : Math.min(1, (daysBetween(start, today) + 1) / totalDays);
+  const torchDay = rp <= 0 ? addDays(start, -1) : addDays(start, Math.max(0, Math.round(rp * totalDays) - 1));
+  const walk = mapWalk(lay, months, start, state.deadline, torchDay);
   const torch = walk.pos;
+  const clock = mapWalk(lay, months, start, state.deadline, today).pos;
+  const rpP = Math.round(rp * 100), tpP = Math.round(tp * 100), gap = rpP - tpP;
+  const nextQ = Math.min(4, Math.floor(tp * 4) + 1);
+  const nextQDate = addDays(start, Math.round((nextQ / 4) * totalDays) - 1);
   const chipRight = torch.x < 215;
   const wl = state.weeklies;
   const wDone = wl.filter((g) => g.done).length;
@@ -6249,20 +6263,28 @@ function RouteMap({ state, nfDays, toggleItem, addItem, removeItem, fx, bumpFixe
   return (
     <div style={{ marginTop: 8 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "4px 0 8px" }}>
-        <div style={{ flex: 1, fontSize: 13, color: T.muted }}>Semana {weekNo} · {wDone}/{wl.length} metas · fim da rota em {daysLeft} d</div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: T.text }}>
+            Rota {rpP}% · tempo {tpP}% · <span style={{ color: gap >= 0 ? T.good : T.danger }}>{gap > 0 ? `${gap} pts à frente` : gap < 0 ? `${-gap} pts atrás` : "no ritmo"}</span>
+          </div>
+          <div style={{ fontSize: 12, color: T.muted, marginTop: 2 }}>Meta {nextQ * 25}% até {fmtDM(nextQDate)} · semana {weekNo} · {wDone}/{wl.length} metas</div>
+        </div>
         <button onClick={onList} style={{ background: "none", border: `1px solid ${T.border}`, color: T.accentSoft, padding: "6px 10px", fontSize: 13, cursor: "pointer", fontFamily: F.ui }}>☰ Lista</button>
       </div>
       <MapScene params={params}>
         {camps.map((c, i) => (
-          <div key={c.key} className="mp-rise" style={chipStyle(c.left ? c.x - 66 : c.x + 18, c.y - 30, { color: "#eef2f7", background: "rgba(11,5,7,.72)", animationDelay: `${0.3 + i * 0.25}s` })}>
-            {c.short} {c.goals.length ? `${c.done}/${c.goals.length}` : "·"}
+          <div key={c.key} className="mp-rise" style={chipStyle(c.left ? c.x - 66 : c.x + 18, c.y - (months.length > 8 ? 22 : 30), { color: "#eef2f7", background: "rgba(11,5,7,.72)", animationDelay: `${0.3 + Math.min(i, 8) * 0.2}s`, ...(months.length > 8 ? { fontSize: 10, padding: "0 4px" } : {}) })}>
+            {c.short}{months.length > 12 && c.key === months[months.length - 1].key ? ` ${c.key.slice(2, 4)}` : ""} {c.goals.length ? `${c.done}/${c.goals.length}` : "·"}
           </div>
         ))}
         <div className="mp-rise" style={chipStyle(lay.gate.x + 22, lay.gate.y - 18, { color: "#111", background: "#facc15", animationDelay: "1.6s" })}>FIM DA ROTA · {fmtDM(state.deadline)}</div>
         <div className="mp-rise" style={chipStyle(140, 124, { color: "#0b1a33", background: "rgba(255,255,255,.86)", animationDelay: "1.9s" })}>CUME · {finals.filter((f) => !f.done).length} OBJETIVO(S)</div>
-        <div className="mp-rise" style={chipStyle(torch.x + (chipRight ? 16 : -150), torch.y + 14, { color: "#0b1a33", background: "rgba(255,246,200,.92)", animationDelay: "1.2s" })}>VOCÊ · SEMANA {weekNo} · {wDone}/{wl.length}</div>
+        {Math.hypot(clock.x - torch.x, clock.y - torch.y) > 18 && (
+          <div className="mp-rise" aria-hidden="true" style={chipStyle(clock.x - 22, clock.y - 9, { color: "#e5e7eb", background: "rgba(11,5,7,.62)", border: "1px dashed #e5e7eb", fontSize: 10, animationDelay: "1.4s" })}>⌛ HOJE</div>
+        )}
+        <div className="mp-rise" style={chipStyle(torch.x + (chipRight ? 16 : -150), torch.y + 14, { color: "#0b1a33", background: "rgba(255,246,200,.92)", animationDelay: "1.2s" })}>VOCÊ · {rpP}% · SEMANA {weekNo} · {wDone}/{wl.length}</div>
         {camps.map((c) => (
-          <button key={`h${c.key}`} className="mp-hot" onClick={() => setOpen(`m:${c.key}`)} aria-label={`Abrir ${c.name}`} style={{ ...pct(c.x, c.y - 10), width: "12%", height: "8%" }} />
+          <button key={`h${c.key}`} className="mp-hot" onClick={() => setOpen(`m:${c.key}`)} aria-label={`Abrir ${c.name}`} style={{ ...pct(c.x, c.y - 10), width: "12%", height: months.length > 8 ? "6.8%" : "8%" }} />
         ))}
         <button className="mp-hot" onClick={() => setOpen("week")} aria-label="Abrir as metas desta semana" style={{ ...pct(torch.x, torch.y), width: "12%", height: "7.5%" }} />
         <button className="mp-hot" onClick={() => setOpen("gate")} aria-label="Abrir o fim da rota" style={{ ...pct(lay.gate.x, lay.gate.y - 6), width: "14%", height: "7%" }} />
@@ -7420,7 +7442,7 @@ function useGithubSync(stateRef, loaded, state, applyRemoteRef) {
           try { localStorage.setItem("rb.sync.copia", JSON.stringify({ at: Date.now(), de: "antes da junção", aparelho: stateRef.current, repositorio: doc })); } catch (e) { /* ok */ }
           const base = syncBaseGet();
           const localWins = (m.dirtyAt || 0) >= remoteAt;
-          merged = base ? syncMerge(base, stateRef.current, doc.state, localWins) : (localWins ? stateRef.current : doc.state);
+          merged = syncMerge(base || {}, stateRef.current, doc.state, localWins);
           skip.current = Date.now();
           applyRemoteRef.current && applyRemoteRef.current(merged, doc.by, m.device);
           syncSave({ sha: f.sha, lastPullAt: Date.now(), lastBy: doc.by || "" });
