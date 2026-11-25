@@ -3,7 +3,9 @@
 O site publicado é `../index.html` (versão compilada, ilegível). **Edite sempre `sistema-rota-da-inveja.html`**, nunca o index.html.
 
 ## Arquivos
-- `sistema-rota-da-inveja.html` — fonte da v56 (React 18 + JSX dentro de `<script type="text/babel">`).
+- `sistema-rota-da-inveja.html` — fonte atual (v65; React 18 + JSX dentro de `<script type="text/babel">`).
+- `../arvore/` — pinturas da árvore: `e01…e20.webp` (um estágio a cada 5% da rota) e miniaturas `t01…t20.webp`. Trocar uma pintura = trocar o arquivo e subir a versão do sw.js; o código não muda.
+- `patch65.py` — v65: Trading no Caixa (lucro pela conta × pelas operações) e árvore em 20 estágios.
 - `build.py` — gera o index.html instalável (troca o Babel por JS compilado, manifesto, ícones, service worker).
 - `patch57-pendente.py` — correções pequenas aprovadas para estudo, **não publicadas**: título cortado da Missão Diária, rótulo do campo de hora, chips dos meses, zoom borrado da árvore, seletor de atributo e botão + do Caixa. Aplicar só com o ok do Rafael.
 
